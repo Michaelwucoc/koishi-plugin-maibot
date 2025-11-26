@@ -73,7 +73,7 @@ export function apply(ctx: Context, config: Config) {
         const result = await api.qr2userid(qrCode)
 
         if (!result.QRStatus) {
-          return `❌ 绑定失败：无法从二维码获取用户ID\n错误信息: ${result.UserID === 'MTI1MTEy' ? '无效的二维码' : result.UserID}`
+          return `❌ 绑定失败：无法从二维码获取用户ID\n错误信息: ${result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID}`
         }
 
         const maiUid = result.UserID
