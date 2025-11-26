@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": ["../src/index.ts"],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;AAAA;AAAA;AAAA,8BAAAA;AAAA;AAAA;AAEA,oBAAmB;AAInB,0BAAc,2BANd;AAOA,0BAAc,6BAPd;",
+  "names": ["Loader"]
+}

@@ -1,0 +1,34 @@
+general:
+  $: Allgemeine Einstellungen
+  name: Deutsch
+  paren: ' ({0}) '
+  quote: '„{0}“'
+  comma: ','
+  and: und
+  or: oder
+  day: Tag(en)
+  hour: Stunde(n)
+  minute: Minute(n)
+  second: Sekunde(n)
+internal:
+  $: Interner Text
+  error-encountered: Ein unbekannter Fehler ist aufgetreten.
+  low-authority: Keine Berechtigung
+  prompt-argument: 请发送{0}。
+  insufficient-arguments: Es fehlt ein Parameter. Geben Sie „Hilfe“ ein, um die Verwendung zu sehen.
+  redunant-arguments: Es sind zu viele Parameter vorhanden. Geben Sie „Hilfe“ ein, um die Verwendung anzuzeigen.
+  invalid-argument: Der Parameter {0} ist ungültig. {1}
+  unknown-option: Es sind eine unbekannte Option {0} vorhanden. Geben Sie „Hilfe“ ein, um die Verwendung anzuzeigen.
+  invalid-option: Die Option {0} ist ungültig. {1}
+  check-syntax: Geben Sie „Hilfe“ ein, um die Verwendung anzuzeigen.
+  invalid-number: Bitte geben Sie eine Zahl an.
+  invalid-integer: Bitte geben Sie eine ganzeZahl an.
+  invalid-posint: Bitte geben Sie eine positive Ganzzahl an.
+  invalid-natural: Bitte geben Sie eine nicht negative Ganzzahl an.
+  invalid-date: Bitte geben Sie eine gültige Zeit ein.
+  invalid-user: Bitte geben Sie einen gültigen Benutzer an.
+  invalid-channel: Bitte geben Sie einen gültigen Kanal an.
+  suggest-hint: Ist das, wonach Sie suchen, {0}?
+  suggest-command: Senden Sie einen Punkt, um den Vorschlag anzuwenden.
+commands:
+  $: Befehlssystem

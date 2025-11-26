@@ -1,0 +1,198 @@
+import axios, { AxiosInstance } from 'axios'
+
+export interface ApiConfig {
+  baseURL: string
+  timeout?: number
+}
+
+export class MaiBotAPI {
+  private client: AxiosInstance
+
+  constructor(config: ApiConfig) {
+    this.client = axios.create({
+      baseURL: config.baseURL || 'http://localhost:5566',
+      timeout: config.timeout || 30000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+  }
+
+  /**
+   * 二维码转用户ID
+   */
+  async qr2userid(qrText: string): Promise<{ QRStatus: boolean; UserID: string }> {
+    const response = await this.client.post(`/api/qr2userid/${qrText}`)
+    return response.data
+  }
+
+  /**
+   * 用户状态预览
+   */
+  async preview(maiUid: string): Promise<{
+    UserID: string
+    BanState: string
+    IsLogin: string
+    LastLoginDate: string
+    LastPlayDate: string
+    Rating: string
+    UserName: string
+  }> {
+    const response = await this.client.get('/api/preview', {
+      params: { mai_uid: maiUid },
+    })
+    return response.data
+  }
+
+  /**
+   * 用户登出
+   */
+  async logout(
+    maiUid: string,
+    regionId: string,
+    clientId: string,
+    placeId: string,
+    token: string
+  ): Promise<{ LogoutStatus: boolean }> {
+    const response = await this.client.post('/api/logout', {
+      token,
+    }, {
+      params: {
+        mai_uid: maiUid,
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 获取1.5倍票
+   */
+  async get15Ticket(
+    maiUid: string,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName: string,
+    regionName: string,
+    token: string
+  ): Promise<{
+    LoginStatus: boolean
+    LogoutStatus: boolean
+    UserAllStatus: boolean
+    UserLogStatus: boolean
+  }> {
+    const response = await this.client.post('/api/get_15_ticket', {
+      token,
+    }, {
+      params: {
+        mai_uid: maiUid,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 上传水鱼 B50
+   */
+  async uploadB50(maiUid: string, fishToken: string): Promise<{
+    UploadStatus: boolean
+    msg: string
+    task_id: string
+  }> {
+    const response = await this.client.post('/api/upload_b50', null, {
+      params: {
+        mai_uid: maiUid,
+        fish_token: fishToken,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 查询水鱼 B50 任务状态
+   */
+  async getB50TaskStatus(maiUid: string): Promise<{
+    code: number
+    alive_task_id: string
+    alive_task_time: string
+  }> {
+    const response = await this.client.get('/api/get_b50_task_status', {
+      params: { mai_uid: maiUid },
+    })
+    return response.data
+  }
+
+  /**
+   * 根据ID查询水鱼 B50 任务
+   */
+  async getB50TaskById(taskId: string): Promise<{
+    code: number
+    alive_task_id: string
+    alive_task_time: string
+    alive_task_end_time?: string
+    error?: string
+    done: boolean
+  }> {
+    const response = await this.client.get('/api/get_b50_task_byid', {
+      params: { taskid: taskId },
+    })
+    return response.data
+  }
+
+  /**
+   * 上传落雪 B50
+   */
+  async uploadLxB50(maiUid: string, lxnsCode: string): Promise<{
+    UploadStatus: boolean
+    msg: string
+    task_id: string
+  }> {
+    const response = await this.client.post('/api/upload_lx_b50', null, {
+      params: {
+        mai_uid: maiUid,
+        lxns_code: lxnsCode,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 查询落雪 B50 任务状态
+   */
+  async getLxB50TaskStatus(maiUid: string): Promise<{
+    code: number
+    alive_task_id: string
+    alive_task_time: string
+  }> {
+    const response = await this.client.get('/api/get_lx_b50_task_status', {
+      params: { mai_uid: maiUid },
+    })
+    return response.data
+  }
+
+  /**
+   * 根据ID查询落雪 B50 任务
+   */
+  async getLxB50TaskById(taskId: string): Promise<{
+    code: number
+    alive_task_id: string
+    alive_task_time: string
+    alive_task_end_time?: string
+    error?: string
+    done: boolean
+  }> {
+    const response = await this.client.get('/api/get_lx_b50_task_byid', {
+      params: { taskid: taskId },
+    })
+    return response.data
+  }
+}
+

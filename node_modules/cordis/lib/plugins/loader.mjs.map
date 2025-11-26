@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": ["../../src/plugins/loader.ts"],
+  "mappings": ";AAAA,cAAc;",
+  "names": []
+}

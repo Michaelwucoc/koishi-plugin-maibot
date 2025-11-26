@@ -1,0 +1,38 @@
+general:
+  $: General Settings
+  name: English
+  paren: ' ({0}) '
+  quote: '"{0}"'
+  comma: '，'
+  and: and
+  or: or
+  day: day
+  hour: hour
+  minute: minute
+  second: second
+internal:
+  $: Internal Text
+  error-encountered: An unknown error has occurred.
+  low-authority: Low authority.
+  prompt-argument: 请发送{0}。
+  insufficient-arguments: Insufficient arguments, type help to see usage.
+  redunant-arguments: Redunant arguments, type help to see usage.
+  invalid-argument: Invalid argument {0}, {1}
+  unknown-option: Unknown option {0}, type help to see usage.
+  invalid-option: Invalid option {0}, {1}
+  check-syntax: Type help to see usage.
+  invalid-number: Expect a number.
+  invalid-integer: Expect an integer.
+  invalid-posint: Expect a positive integer.
+  invalid-natural: Expect a non-negative integer.
+  invalid-date: Expect a valid date.
+  invalid-user: Expect a valid user.
+  invalid-channel: Expect a valid channel.
+  invalid-image: Expect an image.
+  invalid-audio: Expect an audio.
+  invalid-video: Expect a video.
+  invalid-file: Expect a file.
+  suggest-hint: Do you mean {0}?
+  suggest-command: Send a period to apply the suggestion.
+commands:
+  $: Command System

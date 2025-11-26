@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": ["../src/cli.ts"],
+  "mappings": ";;;AAEA,SAAS,aAAa;AAEtB,MAAM,EAAE,MAAM,SAAS,CAAC;",
+  "names": []
+}

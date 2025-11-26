@@ -1,0 +1,34 @@
+general:
+  $: 一般設定
+  name: 日本語
+  paren: '（{0}）'
+  quote: '「{0}」'
+  comma: '、'
+  and: と
+  or: や
+  day: 日
+  hour: 時間
+  minute: 分
+  second: 秒
+internal:
+  $: 核心文本
+  error-encountered: 不明なエラーが発生しました。
+  low-authority: 実行できる権限が付与されていません
+  prompt-argument: 请发送{0}。
+  insufficient-arguments: パラメータが不足しています、「help」を送信して使い方を確認してください。
+  redunant-arguments: パラメータ数が多すぎます、「help」を送信して使い方を確認してください。
+  invalid-argument: 無効なパラメータ「{0}」、{1}
+  unknown-option: 未知なオプション「{0}」、「help」を送信して使い方を確認してください。
+  invalid-option: 無効なオプション「{0}」、{1}
+  check-syntax: '「help」を送信して使い方を検索してください。'
+  invalid-number: 数字を指定してください。
+  invalid-integer: 整数を指定してください。
+  invalid-posint: 正の整数を指定してください。
+  invalid-natural: 自然数を指定してください。
+  invalid-date: 日付を指定してください。
+  invalid-user: ユーザー名を指定してください。
+  invalid-channel: チャンネル名を指定してください。
+  suggest-hint: '「{0}」を実行したいですか？'
+  suggest-command: 句点を送信してコマンドを実行します。
+commands:
+  $: 指令系统

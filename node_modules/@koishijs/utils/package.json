@@ -1,0 +1,36 @@
+{
+  "name": "@koishijs/utils",
+  "description": "Utilities for Koishi",
+  "version": "7.3.2",
+  "main": "lib/index.cjs",
+  "module": "lib/index.mjs",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "src"
+  ],
+  "author": "Shigma <shigma10826@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/koishijs/koishi.git",
+    "directory": "packages/utils"
+  },
+  "bugs": {
+    "url": "https://github.com/koishijs/koishi/issues"
+  },
+  "homepage": "https://koishi.chat/api/utils.html",
+  "keywords": [
+    "bot",
+    "chatbot",
+    "koishi",
+    "utilities"
+  ],
+  "devDependencies": {
+    "@sinonjs/fake-timers": "^6.0.1"
+  },
+  "dependencies": {
+    "cosmokit": "^1.7.2",
+    "inaba": "^1.1.1"
+  }
+}
