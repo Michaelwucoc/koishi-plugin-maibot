@@ -1,6 +1,7 @@
 import { Context, Schema, Session } from 'koishi'
 import { MaiBotAPI } from './api'
 import { extendDatabase, UserBinding } from './database'
+import { DEFAULT_MACHINE_INFO, DEFAULT_TURNSTILE_TOKEN } from './constants'
 
 export const name = 'maibot'
 
@@ -27,27 +28,11 @@ function maskUserId(uid: string): string {
   return `${start}***${end}`
 }
 
-const DEFAULT_MACHINE_INFO = {
-  clientId: 'A63E01E1423',
-  regionId: 28,
-  placeId: 2044,
-  placeName: 'M 娱乐空间南宁兴宁店',
-  regionName: '广西',
-}
-
-const DEFAULT_TURNSTILE_TOKEN = '1145141919810MyFirstPhone'
-
 function buildMention(session: Session): string {
-  if (session.platform === 'onebot' && session.userId) {
-    return `[CQ:at,qq=${session.userId}]`
+  if (session.userId) {
+    return `<at id="${session.userId}"/>`
   }
-  if (session.platform === 'discord' && session.userId) {
-    return `<@${session.userId}>`
-  }
-  if (session.platform === 'telegram' && session.username) {
-    return `@${session.username}`
-  }
-  return `@${session.author?.nickname || session.username || session.userId || '玩家'}`
+  return `@${session.author?.nickname || session.username || '玩家'}`
 }
 
 async function promptYes(session: Session, message: string, timeout = 10000): Promise<boolean> {
