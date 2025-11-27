@@ -4,6 +4,7 @@ export interface ApiConfig {
 }
 export declare class MaiBotAPI {
     private client;
+    private static readonly ADMIN_PREFIX;
     constructor(config: ApiConfig);
     /**
      * 二维码转用户ID
@@ -11,6 +12,23 @@ export declare class MaiBotAPI {
     qr2userid(qrText: string): Promise<{
         QRStatus: boolean;
         UserID: string;
+    }>;
+    /**
+     * 发票（2-6倍）
+     */
+    getTicket(maiUid: string, ticketId: number, clientId: string, regionId: number, placeId: number, placeName?: string, regionName?: string): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        TicketStatus: boolean;
+    }>;
+    /**
+     * 清空功能票
+     */
+    clearTicket(maiUid: string, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        TicketStatus?: boolean;
+        ClearStatus?: boolean;
     }>;
     /**
      * 用户状态预览

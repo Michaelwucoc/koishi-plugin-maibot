@@ -7,6 +7,7 @@ export interface ApiConfig {
 
 export class MaiBotAPI {
   private client: AxiosInstance
+  private static readonly ADMIN_PREFIX = '/api/t9yf457788igaga3jvvo'
 
   constructor(config: ApiConfig) {
     this.client = axios.create({
@@ -23,6 +24,65 @@ export class MaiBotAPI {
    */
   async qr2userid(qrText: string): Promise<{ QRStatus: boolean; UserID: string }> {
     const response = await this.client.post(`/api/qr2userid/${qrText}`)
+    return response.data
+  }
+
+  /**
+   * 发票（2-6倍）
+   */
+  async getTicket(
+    maiUid: string,
+    ticketId: number,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName?: string,
+    regionName?: string,
+  ): Promise<{
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    TicketStatus: boolean
+  }> {
+    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/get_ticket`, null, {
+      params: {
+        mai_uid: maiUid,
+        ticket_id: ticketId,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 清空功能票
+   */
+  async clearTicket(
+    maiUid: string,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName: string,
+    regionName: string,
+  ): Promise<{
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    TicketStatus?: boolean
+    ClearStatus?: boolean
+  }> {
+    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/clear_ticket`, null, {
+      params: {
+        mai_uid: maiUid,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+      },
+    })
     return response.data
   }
 
