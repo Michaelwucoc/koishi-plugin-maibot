@@ -1,4 +1,4 @@
-import { Context, Schema } from 'koishi'
+import { Context, Schema, Session } from 'koishi'
 import { MaiBotAPI } from './api'
 import { extendDatabase, UserBinding } from './database'
 
@@ -27,6 +27,39 @@ function maskUserId(uid: string): string {
   return `${start}***${end}`
 }
 
+const DEFAULT_MACHINE_INFO = {
+  clientId: 'A63E01E1423',
+  regionId: 28,
+  placeId: 2044,
+  placeName: 'M 娱乐空间南宁兴宁店',
+  regionName: '广西',
+}
+
+const DEFAULT_TURNSTILE_TOKEN = '1145141919810MyFirstPhone'
+
+function buildMention(session: Session): string {
+  if (session.platform === 'onebot' && session.userId) {
+    return `[CQ:at,qq=${session.userId}]`
+  }
+  if (session.platform === 'discord' && session.userId) {
+    return `<@${session.userId}>`
+  }
+  if (session.platform === 'telegram' && session.username) {
+    return `@${session.username}`
+  }
+  return `@${session.author?.nickname || session.username || session.userId || '玩家'}`
+}
+
+async function promptYes(session: Session, message: string, timeout = 10000): Promise<boolean> {
+  await session.send(`${message}\n在${timeout / 1000}秒内输入 Y 确认，其它输入取消`)
+  try {
+    const answer = await session.prompt(timeout)
+    return answer?.trim().toUpperCase() === 'Y'
+  } catch {
+    return false
+  }
+}
+
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -36,6 +69,67 @@ export function apply(ctx: Context, config: Config) {
     baseURL: config.apiBaseURL,
     timeout: config.apiTimeout,
   })
+  const logger = ctx.logger('maibot')
+
+  const scheduleB50Notification = (session: Session, taskId: string) => {
+    const bot = session.bot
+    const channelId = session.channelId
+    if (!bot || !channelId) {
+      logger.warn('无法追踪B50任务完成状态：bot或channel信息缺失')
+      return
+    }
+
+    const mention = buildMention(session)
+    const guildId = session.guildId
+    const maxAttempts = 20
+    const interval = 15_000
+    let attempts = 0
+
+    const poll = async () => {
+      attempts += 1
+      try {
+        const detail = await api.getB50TaskById(taskId)
+        if (!detail.done && attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
+          return
+        }
+
+        if (detail.done) {
+          const statusText = detail.error
+            ? `❌ 任务失败：${detail.error}`
+            : '✅ 任务已完成'
+          const finishTime = detail.alive_task_end_time
+            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time)).toLocaleString('zh-CN')}`
+            : ''
+          await bot.sendMessage(
+            channelId,
+            `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
+            guildId,
+          )
+          return
+        }
+
+        await bot.sendMessage(
+          channelId,
+          `${mention} 水鱼B50任务 ${taskId} 在预设时间内仍未完成，请稍后使用 /mai查询B50 手动确认`,
+          guildId,
+        )
+      } catch (error) {
+        logger.warn('轮询B50任务状态失败', error)
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
+          return
+        }
+        await bot.sendMessage(
+          channelId,
+          `${mention} 水鱼B50任务 ${taskId} 状态查询多次失败，请使用 /mai查询B50 手动确认`,
+          guildId,
+        )
+      }
+    }
+
+    ctx.setTimeout(poll, interval)
+  }
 
   /**
    * 绑定用户
@@ -208,6 +302,47 @@ export function apply(ctx: Context, config: Config) {
     })
 
   /**
+   * 逃离小黑屋（登出）
+   * 用法: /mai逃离小黑屋 <turnstileToken>
+   */
+  ctx.command('mai逃离小黑屋', '登出MaiDX以逃离小黑屋')
+    .alias('mai逃离')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const result = await api.logout(
+          binding.maiUid,
+          DEFAULT_MACHINE_INFO.regionId.toString(),
+          DEFAULT_MACHINE_INFO.clientId,
+          DEFAULT_MACHINE_INFO.placeId.toString(),
+          DEFAULT_TURNSTILE_TOKEN,
+        )
+
+        if (!result.LogoutStatus) {
+          return '❌ 登出失败，服务端未返回成功状态，请稍后重试'
+        }
+
+        return `✅ 已尝试为您登出账号，建议稍等片刻再登录\n用户ID: ${maskUserId(binding.maiUid)}`
+      } catch (error: any) {
+        logger.error('逃离小黑屋失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 登出失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
    * 绑定水鱼Token
    * 用法: /mai绑定水鱼 <fishToken>
    */
@@ -245,6 +380,77 @@ export function apply(ctx: Context, config: Config) {
       } catch (error: any) {
         ctx.logger('maibot').error('绑定水鱼Token失败:', error)
         return `❌ 绑定失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 发票（2-6倍票）
+   * 用法: /mai发票 [倍数]，默认2
+   */
+  ctx.command('mai发票 [multiple:number]', '为账号发放功能票（2-6倍）')
+    .action(async ({ session }, multipleInput) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const multiple = multipleInput ? Number(multipleInput) : 2
+      if (!Number.isInteger(multiple) || multiple < 2 || multiple > 6) {
+        return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票`
+        const confirmFirst = await promptYes(session, `${baseTip}\n操作具有风险，请谨慎`)
+        if (!confirmFirst) {
+          return '操作已取消（第一次确认未通过）'
+        }
+
+        const confirmSecond = await promptYes(session, '二次确认：若理解风险，请再次输入 Y 执行')
+        if (!confirmSecond) {
+          return '操作已取消（第二次确认未通过）'
+        }
+
+        if (multiple >= 3) {
+          const confirmThird = await promptYes(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
+          if (!confirmThird) {
+            return '操作已取消（第三次确认未通过）'
+          }
+        }
+
+        await session.send('⏳ 已开始请求发票，服务器响应可能需要约10秒，请耐心等待...')
+
+        const ticketResult = await api.getTicket(
+          binding.maiUid,
+          multiple,
+          DEFAULT_MACHINE_INFO.clientId,
+          DEFAULT_MACHINE_INFO.regionId,
+          DEFAULT_MACHINE_INFO.placeId,
+          DEFAULT_MACHINE_INFO.placeName,
+          DEFAULT_MACHINE_INFO.regionName,
+        )
+
+        if (
+          ticketResult.LoginStatus === false ||
+          ticketResult.LogoutStatus === false ||
+          ticketResult.TicketStatus === false
+        ) {
+          return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试'
+        }
+
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+      } catch (error: any) {
+        logger.error('发票失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 发票失败: ${error?.message || '未知错误'}`
       }
     })
 
@@ -292,6 +498,8 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
 
+        scheduleB50Notification(session, result.task_id)
+
         return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
@@ -299,6 +507,52 @@ export function apply(ctx: Context, config: Config) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 清空功能票
+   * 用法: /mai清票
+   */
+  ctx.command('mai清票', '清空账号的所有功能票')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const confirm = await promptYes(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票，确认继续？`)
+        if (!confirm) {
+          return '操作已取消'
+        }
+
+        const result = await api.clearTicket(
+          binding.maiUid,
+          DEFAULT_MACHINE_INFO.clientId,
+          DEFAULT_MACHINE_INFO.regionId,
+          DEFAULT_MACHINE_INFO.placeId,
+          DEFAULT_MACHINE_INFO.placeName,
+          DEFAULT_MACHINE_INFO.regionName,
+        )
+
+        if (result.ClearStatus === false || result.TicketStatus === false) {
+          return '❌ 清票失败：服务器未返回成功状态，请稍后再试'
+        }
+
+        return `✅ 已清空 ${maskUserId(binding.maiUid)} 的所有功能票`
+      } catch (error: any) {
+        logger.error('清票失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 清票失败: ${error?.message || '未知错误'}`
       }
     })
 
