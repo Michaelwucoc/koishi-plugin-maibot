@@ -1,8 +1,8 @@
 export const DEFAULT_MACHINE_INFO = {
-  clientId: 'A63E01E1423',
+  clientId: 'A63E01E1459',
   regionId: 28,
-  placeId: 2044,
-  placeName: 'M+娱乐空间南宁兴宁店',
+  placeId: 2120,
+  placeName: 'SUPER101潮漫北流店',
   regionName: '广西',
 }
 
