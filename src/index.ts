@@ -105,7 +105,7 @@ export function apply(ctx: Context, config: Config) {
             ? `❌ 任务失败：${detail.error}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
-            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time)).toLocaleString('zh-CN')}`
+            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}`
             : ''
           await bot.sendMessage(
             channelId,
@@ -491,7 +491,7 @@ export function apply(ctx: Context, config: Config) {
         try {
           const taskStatus = await api.getB50TaskStatus(binding.maiUid)
           if (taskStatus.code === 0 && taskStatus.alive_task_id) {
-            return `⚠️ 已有任务正在进行中\n任务ID: ${taskStatus.alive_task_id}\n开始时间: ${new Date(parseInt(taskStatus.alive_task_time)).toLocaleString('zh-CN')}\n\n使用 /mai查询B50 查看任务状态`
+            return `⚠️ 已有任务正在进行中\n任务ID: ${taskStatus.alive_task_id}\n开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n\n使用 /mai查询B50 查看任务状态`
           }
         } catch (error) {
           // 如果没有任务或查询失败，继续上传
@@ -596,12 +596,12 @@ export function apply(ctx: Context, config: Config) {
 
         let statusInfo = `📊 B50上传任务状态\n\n` +
                         `任务ID: ${taskStatus.alive_task_id}\n` +
-                        `开始时间: ${new Date(parseInt(taskStatus.alive_task_time)).toLocaleString('zh-CN')}\n`
+                        `开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n`
 
         if (taskDetail.done) {
           statusInfo += `状态: ✅ 已完成\n`
           if (taskDetail.alive_task_end_time) {
-            statusInfo += `完成时间: ${new Date(parseInt(taskDetail.alive_task_end_time)).toLocaleString('zh-CN')}\n`
+            statusInfo += `完成时间: ${new Date(parseInt(taskDetail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}\n`
           }
           if (taskDetail.error) {
             statusInfo += `错误信息: ${taskDetail.error}\n`
