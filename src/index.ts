@@ -88,7 +88,8 @@ export function apply(ctx: Context, config: Config) {
     const mention = buildMention(session)
     const guildId = session.guildId
     const maxAttempts = 20
-    const interval = 15_000
+    const interval = 1_000  // 减少到5秒轮询一次，更快响应
+    const initialDelay = 2_000  // 首次延迟3秒后开始检查
     let attempts = 0
 
     const poll = async () => {
@@ -134,7 +135,8 @@ export function apply(ctx: Context, config: Config) {
       }
     }
 
-    ctx.setTimeout(poll, interval)
+    // 首次延迟3秒后开始检查，之后每5秒轮询一次
+    ctx.setTimeout(poll, initialDelay)
   }
 
   /**
