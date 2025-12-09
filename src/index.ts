@@ -1,18 +1,35 @@
 import { Context, Schema, Session } from 'koishi'
 import { MaiBotAPI } from './api'
 import { extendDatabase, UserBinding } from './database'
-import { DEFAULT_MACHINE_INFO, DEFAULT_TURNSTILE_TOKEN } from './constants'
 
 export const name = 'maibot'
+
+export interface MachineInfo {
+  clientId: string
+  regionId: number
+  placeId: number
+  placeName: string
+  regionName: string
+}
 
 export interface Config {
   apiBaseURL: string
   apiTimeout?: number
+  machineInfo: MachineInfo
+  turnstileToken: string
 }
 
 export const Config: Schema<Config> = Schema.object({
   apiBaseURL: Schema.string().default('http://localhost:5566').description('API服务地址'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
+  machineInfo: Schema.object({
+    clientId: Schema.string().required().description('客户端ID'),
+    regionId: Schema.number().required().description('区域ID'),
+    placeId: Schema.number().required().description('场所ID'),
+    placeName: Schema.string().required().description('场所名称'),
+    regionName: Schema.string().required().description('区域名称'),
+  }).required().description('机台信息（必填）'),
+  turnstileToken: Schema.string().required().description('Turnstile Token（必填）'),
 })
 
 /**
@@ -55,6 +72,10 @@ export function apply(ctx: Context, config: Config) {
     timeout: config.apiTimeout,
   })
   const logger = ctx.logger('maibot')
+
+  // 使用配置中的值
+  const machineInfo = config.machineInfo
+  const turnstileToken = config.turnstileToken
 
   const scheduleB50Notification = (session: Session, taskId: string) => {
     const bot = session.bot
@@ -307,10 +328,10 @@ export function apply(ctx: Context, config: Config) {
         const binding = bindings[0]
         const result = await api.logout(
           binding.maiUid,
-          DEFAULT_MACHINE_INFO.regionId.toString(),
-          DEFAULT_MACHINE_INFO.clientId,
-          DEFAULT_MACHINE_INFO.placeId.toString(),
-          DEFAULT_TURNSTILE_TOKEN,
+          machineInfo.regionId.toString(),
+          machineInfo.clientId,
+          machineInfo.placeId.toString(),
+          turnstileToken,
         )
 
         if (!result.LogoutStatus) {
@@ -414,11 +435,11 @@ export function apply(ctx: Context, config: Config) {
         const ticketResult = await api.getTicket(
           binding.maiUid,
           multiple,
-          DEFAULT_MACHINE_INFO.clientId,
-          DEFAULT_MACHINE_INFO.regionId,
-          DEFAULT_MACHINE_INFO.placeId,
-          DEFAULT_MACHINE_INFO.placeName,
-          DEFAULT_MACHINE_INFO.regionName,
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
         )
 
         if (
@@ -520,11 +541,11 @@ export function apply(ctx: Context, config: Config) {
 
         const result = await api.clearTicket(
           binding.maiUid,
-          DEFAULT_MACHINE_INFO.clientId,
-          DEFAULT_MACHINE_INFO.regionId,
-          DEFAULT_MACHINE_INFO.placeId,
-          DEFAULT_MACHINE_INFO.placeName,
-          DEFAULT_MACHINE_INFO.regionName,
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
         )
 
         if (result.ClearStatus === false || result.TicketStatus === false) {
