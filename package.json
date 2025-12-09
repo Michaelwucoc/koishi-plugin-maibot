@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-maibot",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "舞萌DX游戏高级操作插件 for Koishi - 支持用户绑定、B50更新、1.5倍票获取等功能",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -16,11 +16,15 @@
     "舞萌",
     "maimai-dx"
   ],
-  "author": "",
+  "author": "Michaelwucoc",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/Michaelwucoc/koishi-plugin-maibot.git"
+  },
+  "homepage": "https://github.com/Michaelwucoc/koishi-plugin-maibot#readme",
+  "bugs": {
+    "url": "https://github.com/Michaelwucoc/koishi-plugin-maibot/issues"
   },
   "peerDependencies": {
     "koishi": "^4.15.0"
