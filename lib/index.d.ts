@@ -1,5 +1,6 @@
 import { Context, Schema } from 'koishi';
 export declare const name = "maibot";
+export declare const inject: string[];
 export interface MachineInfo {
     clientId: string;
     regionId: number;

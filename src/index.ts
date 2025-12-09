@@ -3,6 +3,7 @@ import { MaiBotAPI } from './api'
 import { extendDatabase, UserBinding } from './database'
 
 export const name = 'maibot'
+export const inject = ['database']
 
 export interface MachineInfo {
   clientId: string
@@ -388,6 +389,45 @@ export function apply(ctx: Context, config: Config) {
       } catch (error: any) {
         ctx.logger('maibot').error('绑定水鱼Token失败:', error)
         return `❌ 绑定失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 解绑水鱼Token
+   * 用法: /mai解绑水鱼
+   */
+  ctx.command('mai解绑水鱼', '解绑水鱼Token（保留舞萌DX账号绑定）')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 检查是否已绑定水鱼Token
+        if (!binding.fishToken) {
+          return '❌ 您还没有绑定水鱼Token\n使用 /mai绑定水鱼 <token> 进行绑定'
+        }
+
+        // 清除水鱼Token（设置为空字符串）
+        await ctx.database.set('maibot_bindings', { userId }, {
+          fishToken: '',
+        })
+
+        return `✅ 水鱼Token解绑成功！\n已解绑的Token: ${binding.fishToken.substring(0, 8)}***${binding.fishToken.substring(binding.fishToken.length - 4)}\n\n舞萌DX账号绑定仍保留`
+      } catch (error: any) {
+        ctx.logger('maibot').error('解绑水鱼Token失败:', error)
+        return `❌ 解绑失败: ${error?.message || '未知错误'}`
       }
     })
 
