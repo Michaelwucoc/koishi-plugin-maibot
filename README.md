@@ -29,7 +29,16 @@ plugins:
   maibot:
     apiBaseURL: http://localhost:5566  # 你的API服务地址
     apiTimeout: 30000  # 可选，默认30秒
+    machineInfo:  # 必填，机台信息
+      clientId: 你的客户端ID
+      regionId: 你的区域ID
+      placeId: 你的场所ID
+      placeName: 你的场所名称
+      regionName: 你的区域名称
+    turnstileToken: 你的Turnstile Token  # 必填
 ```
+
+**注意**：`machineInfo` 和 `turnstileToken` 为必填配置，需要在配置文件中填写。
 
 ## 使用
 
