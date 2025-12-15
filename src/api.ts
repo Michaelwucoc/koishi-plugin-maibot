@@ -254,5 +254,69 @@ export class MaiBotAPI {
     })
     return response.data
   }
+
+  /**
+   * 发收藏品
+   */
+  async getItem(
+    maiUid: string,
+    itemId: string,
+    itemKind: string,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName: string,
+    regionName: string,
+  ): Promise<{
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    ItemStatus?: boolean
+  }> {
+    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/get_item`, null, {
+      params: {
+        mai_uid: maiUid,
+        item_id: itemId,
+        item_kind: itemKind,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 清收藏品
+   */
+  async clearItem(
+    maiUid: string,
+    itemId: string,
+    itemKind: string,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName: string,
+    regionName: string,
+  ): Promise<{
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    ClearStatus?: boolean
+  }> {
+    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/clear_item`, null, {
+      params: {
+        mai_uid: maiUid,
+        item_id: itemId,
+        item_kind: itemKind,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+      },
+    })
+    return response.data
+  }
 }
 
