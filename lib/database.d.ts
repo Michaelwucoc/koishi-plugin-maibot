@@ -8,6 +8,7 @@ export interface UserBinding {
     userName?: string;
     rating?: string;
     fishToken?: string;
+    lxnsCode?: string;
 }
 declare module 'koishi' {
     interface Tables {

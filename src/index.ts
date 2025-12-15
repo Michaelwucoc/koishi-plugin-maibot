@@ -63,6 +63,48 @@ async function promptYes(session: Session, message: string, timeout = 10000): Pr
   }
 }
 
+const COLLECTION_TYPE_OPTIONS = [
+  { label: '头像框', value: 1 },
+  { label: '称号', value: 2 },
+  { label: '头像', value: 3 },
+  { label: '乌蒙地插一个', value: 4 },
+  { label: '乐曲', value: 5 },
+  { label: '解锁Master', value: 6 },
+  { label: '解锁Re:Master', value: 7 },
+  { label: '解锁黑铺 (未实装)', value: 8 },
+  { label: '旅行伙伴', value: 9 },
+  { label: '搭档', value: 10 },
+  { label: '背景板', value: 11 },
+  { label: '功能票', value: 12 },
+]
+
+async function promptCollectionType(session: Session, timeout = 60000): Promise<number | null> {
+  const optionsText = COLLECTION_TYPE_OPTIONS.map(
+    (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+  ).join('\n')
+  
+  await session.send(
+    `请问你需要什么类型收藏品？\n\n${optionsText}\n\n请输入对应的数字（1-${COLLECTION_TYPE_OPTIONS.length}），或输入0取消`
+  )
+  
+  try {
+    const answer = await session.prompt(timeout)
+    const choice = parseInt(answer?.trim() || '0', 10)
+    
+    if (choice === 0) {
+      return null
+    }
+    
+    if (choice >= 1 && choice <= COLLECTION_TYPE_OPTIONS.length) {
+      return COLLECTION_TYPE_OPTIONS[choice - 1].value
+    }
+    
+    return null
+  } catch {
+    return null
+  }
+}
+
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -137,6 +179,68 @@ export function apply(ctx: Context, config: Config) {
     }
 
     // 首次延迟3秒后开始检查，之后每5秒轮询一次
+    ctx.setTimeout(poll, initialDelay)
+  }
+
+  const scheduleLxB50Notification = (session: Session, taskId: string) => {
+    const bot = session.bot
+    const channelId = session.channelId
+    if (!bot || !channelId) {
+      logger.warn('无法追踪落雪B50任务完成状态：bot或channel信息缺失')
+      return
+    }
+
+    const mention = buildMention(session)
+    const guildId = session.guildId
+    const maxAttempts = 20
+    const interval = 1_000  // 1秒轮询一次，更快响应
+    const initialDelay = 2_000  // 首次延迟2秒后开始检查
+    let attempts = 0
+
+    const poll = async () => {
+      attempts += 1
+      try {
+        const detail = await api.getLxB50TaskById(taskId)
+        if (!detail.done && attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
+          return
+        }
+
+        if (detail.done) {
+          const statusText = detail.error
+            ? `❌ 任务失败：${detail.error}`
+            : '✅ 任务已完成'
+          const finishTime = detail.alive_task_end_time
+            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}`
+            : ''
+          await bot.sendMessage(
+            channelId,
+            `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
+            guildId,
+          )
+          return
+        }
+
+        await bot.sendMessage(
+          channelId,
+          `${mention} 落雪B50任务 ${taskId} 在预设时间内仍未完成，请稍后使用 /mai查询落雪B50 手动确认`,
+          guildId,
+        )
+      } catch (error) {
+        logger.warn('轮询落雪B50任务状态失败', error)
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
+          return
+        }
+        await bot.sendMessage(
+          channelId,
+          `${mention} 落雪B50任务 ${taskId} 状态查询多次失败，请使用 /mai查询落雪B50 手动确认`,
+          guildId,
+        )
+      }
+    }
+
+    // 首次延迟2秒后开始检查，之后每1秒轮询一次
     ctx.setTimeout(poll, initialDelay)
   }
 
@@ -303,6 +407,13 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n🐟 水鱼Token: 未绑定\n使用 /mai绑定水鱼 <token> 进行绑定`
         }
 
+        // 显示落雪代码绑定状态
+        if (binding.lxnsCode) {
+          statusInfo += `\n\n❄️ 落雪代码: 已绑定`
+        } else {
+          statusInfo += `\n\n❄️ 落雪代码: 未绑定\n使用 /mai绑定落雪 <lxns_code> 进行绑定`
+        }
+
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询状态失败:', error)
@@ -427,6 +538,86 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 水鱼Token解绑成功！\n已解绑的Token: ${binding.fishToken.substring(0, 8)}***${binding.fishToken.substring(binding.fishToken.length - 4)}\n\n舞萌DX账号绑定仍保留`
       } catch (error: any) {
         ctx.logger('maibot').error('解绑水鱼Token失败:', error)
+        return `❌ 解绑失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 绑定落雪代码
+   * 用法: /mai绑定落雪 <lxnsCode>
+   */
+  ctx.command('mai绑定落雪 <lxnsCode:text>', '绑定落雪代码用于B50上传')
+    .action(async ({ session }, lxnsCode) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      if (!lxnsCode) {
+        return '请提供落雪代码\n用法：/mai绑定落雪 <lxns_code>\n\n落雪代码长度必须为15'
+      }
+
+      // 验证代码长度
+      if (lxnsCode.length !== 15) {
+        return '❌ 落雪代码长度错误，必须为15个字符'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        // 更新落雪代码
+        await ctx.database.set('maibot_bindings', { userId }, {
+          lxnsCode,
+        })
+
+        return `✅ 落雪代码绑定成功！\n代码: ${lxnsCode.substring(0, 5)}***${lxnsCode.substring(lxnsCode.length - 3)}`
+      } catch (error: any) {
+        ctx.logger('maibot').error('绑定落雪代码失败:', error)
+        return `❌ 绑定失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 解绑落雪代码
+   * 用法: /mai解绑落雪
+   */
+  ctx.command('mai解绑落雪', '解绑落雪代码（保留舞萌DX账号绑定）')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 检查是否已绑定落雪代码
+        if (!binding.lxnsCode) {
+          return '❌ 您还没有绑定落雪代码\n使用 /mai绑定落雪 <lxns_code> 进行绑定'
+        }
+
+        // 清除落雪代码（设置为空字符串）
+        await ctx.database.set('maibot_bindings', { userId }, {
+          lxnsCode: '',
+        })
+
+        return `✅ 落雪代码解绑成功！\n已解绑的代码: ${binding.lxnsCode.substring(0, 5)}***${binding.lxnsCode.substring(binding.lxnsCode.length - 3)}\n\n舞萌DX账号绑定仍保留`
+      } catch (error: any) {
+        ctx.logger('maibot').error('解绑落雪代码失败:', error)
         return `❌ 解绑失败: ${error?.message || '未知错误'}`
       }
     })
@@ -658,6 +849,292 @@ export function apply(ctx: Context, config: Config) {
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询B50任务状态失败:', error)
+        return `❌ 查询失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 发收藏品
+   * 用法: /mai发收藏品
+   */
+  ctx.command('mai发收藏品', '发放收藏品')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 交互式选择收藏品类别
+        const itemKind = await promptCollectionType(session)
+        if (itemKind === null) {
+          return '操作已取消'
+        }
+
+        const selectedType = COLLECTION_TYPE_OPTIONS.find(opt => opt.value === itemKind)
+        await session.send(
+          `已选择：${selectedType?.label} (${itemKind})\n\n` +
+          `请输入收藏品ID（数字）\n` +
+          `如果不知道收藏品ID，请前往 https://sdgb.lemonno.xyz/ 查询\n` +
+          `乐曲解禁请输入乐曲ID\n\n` +
+          `输入0取消操作`
+        )
+
+        const itemIdInput = await session.prompt(60000)
+        if (!itemIdInput || itemIdInput.trim() === '0') {
+          return '操作已取消'
+        }
+
+        const itemId = itemIdInput.trim()
+        // 验证ID是否为数字
+        if (!/^\d+$/.test(itemId)) {
+          return '❌ ID必须是数字，请重新输入'
+        }
+
+        const confirm = await promptYes(
+          session,
+          `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
+        )
+        if (!confirm) {
+          return '操作已取消'
+        }
+
+        await session.send('⏳ 正在发放收藏品，请稍候...')
+
+        const result = await api.getItem(
+          binding.maiUid,
+          itemId,
+          itemKind.toString(),
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
+        )
+
+        if (result.ItemStatus === false || result.LoginStatus === false || result.LogoutStatus === false) {
+          return '❌ 发放失败：服务器未返回成功状态，请稍后再试'
+        }
+
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
+      } catch (error: any) {
+        logger.error('发收藏品失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 发放失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 清收藏品
+   * 用法: /mai清收藏品
+   */
+  ctx.command('mai清收藏品', '清空收藏品')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 交互式选择收藏品类别
+        const itemKind = await promptCollectionType(session)
+        if (itemKind === null) {
+          return '操作已取消'
+        }
+
+        const selectedType = COLLECTION_TYPE_OPTIONS.find(opt => opt.value === itemKind)
+        await session.send(
+          `已选择：${selectedType?.label} (${itemKind})\n\n` +
+          `请输入收藏品ID（数字）\n` +
+          `如果不知道收藏品ID，请前往 https://sdgb.lemonno.xyz/ 查询\n` +
+          `乐曲解禁请输入乐曲ID\n\n` +
+          `输入0取消操作`
+        )
+
+        const itemIdInput = await session.prompt(60000)
+        if (!itemIdInput || itemIdInput.trim() === '0') {
+          return '操作已取消'
+        }
+
+        const itemId = itemIdInput.trim()
+        // 验证ID是否为数字
+        if (!/^\d+$/.test(itemId)) {
+          return '❌ ID必须是数字，请重新输入'
+        }
+
+        const confirm = await promptYes(
+          session,
+          `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
+        )
+        if (!confirm) {
+          return '操作已取消'
+        }
+
+        await session.send('⏳ 正在清空收藏品，请稍候...')
+
+        const result = await api.clearItem(
+          binding.maiUid,
+          itemId,
+          itemKind.toString(),
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
+        )
+
+        if (result.ClearStatus === false || result.LoginStatus === false || result.LogoutStatus === false) {
+          return '❌ 清空失败：服务器未返回成功状态，请稍后再试'
+        }
+
+        return `✅ 已清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
+      } catch (error: any) {
+        logger.error('清收藏品失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 清空失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 上传落雪B50
+   * 用法: /mai上传落雪b50 [lxns_code]
+   */
+  ctx.command('mai上传落雪b50 [lxnsCode:text]', '上传B50数据到落雪')
+    .action(async ({ session }, lxnsCode) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 确定使用的落雪代码
+        let finalLxnsCode: string
+        if (lxnsCode) {
+          // 如果提供了参数，使用参数
+          // 验证落雪代码长度
+          if (lxnsCode.length !== 15) {
+            return '❌ 落雪代码长度错误，必须为15个字符'
+          }
+          finalLxnsCode = lxnsCode
+        } else {
+          // 如果没有提供参数，使用绑定的代码
+          if (!binding.lxnsCode) {
+            return '❌ 请先绑定落雪代码或提供落雪代码参数\n使用 /mai绑定落雪 <lxns_code> 进行绑定\n或使用 /mai上传落雪b50 <lxns_code> 直接提供代码'
+          }
+          finalLxnsCode = binding.lxnsCode
+        }
+
+        // 检查是否有正在进行的任务
+        try {
+          const taskStatus = await api.getLxB50TaskStatus(binding.maiUid)
+          if (taskStatus.code === 0 && taskStatus.alive_task_id) {
+            return `⚠️ 已有任务正在进行中\n任务ID: ${taskStatus.alive_task_id}\n开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n\n使用 /mai查询落雪B50 查看任务状态`
+          }
+        } catch (error) {
+          // 如果没有任务或查询失败，继续上传
+        }
+
+        // 上传落雪B50
+        const result = await api.uploadLxB50(binding.maiUid, finalLxnsCode)
+
+        if (!result.UploadStatus) {
+          return `❌ 上传失败：${result.msg || '未知错误'}`
+        }
+
+        scheduleLxB50Notification(session, result.task_id)
+
+        return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
+      } catch (error: any) {
+        ctx.logger('maibot').error('上传落雪B50失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 上传失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 查询落雪B50任务状态
+   * 用法: /mai查询落雪B50
+   */
+  ctx.command('mai查询落雪B50', '查询落雪B50上传任务状态')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 查询任务状态
+        const taskStatus = await api.getLxB50TaskStatus(binding.maiUid)
+
+        if (taskStatus.code !== 0 || !taskStatus.alive_task_id) {
+          return 'ℹ️ 当前没有正在进行的落雪B50上传任务'
+        }
+
+        // 查询任务详情
+        const taskDetail = await api.getLxB50TaskById(taskStatus.alive_task_id)
+
+        let statusInfo = `📊 落雪B50上传任务状态\n\n` +
+                        `任务ID: ${taskStatus.alive_task_id}\n` +
+                        `开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n`
+
+        if (taskDetail.done) {
+          statusInfo += `状态: ✅ 已完成\n`
+          if (taskDetail.alive_task_end_time) {
+            statusInfo += `完成时间: ${new Date(parseInt(taskDetail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}\n`
+          }
+          if (taskDetail.error) {
+            statusInfo += `错误信息: ${taskDetail.error}\n`
+          }
+        } else {
+          statusInfo += `状态: ⏳ 进行中\n`
+          if (taskDetail.error) {
+            statusInfo += `错误信息: ${taskDetail.error}\n`
+          }
+        }
+
+        return statusInfo
+      } catch (error: any) {
+        ctx.logger('maibot').error('查询落雪B50任务状态失败:', error)
         return `❌ 查询失败: ${error?.message || '未知错误'}`
       }
     })

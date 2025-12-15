@@ -111,5 +111,21 @@ export declare class MaiBotAPI {
         error?: string;
         done: boolean;
     }>;
+    /**
+     * 发收藏品
+     */
+    getItem(maiUid: string, itemId: string, itemKind: string, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        ItemStatus?: boolean;
+    }>;
+    /**
+     * 清收藏品
+     */
+    clearItem(maiUid: string, itemId: string, itemKind: string, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        ClearStatus?: boolean;
+    }>;
 }
 //# sourceMappingURL=api.d.ts.map
