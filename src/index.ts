@@ -694,6 +694,82 @@ export function apply(ctx: Context, config: Config) {
     })
 
   /**
+   * 舞里程发放 / 签到
+   * 用法: /mai舞里程 <里程数>
+   */
+  ctx.command('mai舞里程 <mile:number>', '为账号发放舞里程（maimile）')
+    .action(async ({ session }, mileInput) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const mile = Number(mileInput)
+      if (!Number.isInteger(mile) || mile <= 0) {
+        return '❌ 舞里程必须是大于 0 的整数'
+      }
+
+      // 安全逻辑：必须是 1000 的倍数，且小于 99999
+      if (mile % 1000 !== 0) {
+        return '❌ 舞里程必须是 1000 的倍数，例如：1000 / 2000 / 5000'
+      }
+      if (mile >= 99999) {
+        return '❌ 舞里程过大，请控制在 99999 以下'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程`
+        const confirmFirst = await promptYes(session, `${baseTip}\n操作具有风险，请谨慎`)
+        if (!confirmFirst) {
+          return '操作已取消（第一次确认未通过）'
+        }
+
+        const confirmSecond = await promptYes(session, '二次确认：若理解风险，请再次输入 Y 执行')
+        if (!confirmSecond) {
+          return '操作已取消（第二次确认未通过）'
+        }
+
+        await session.send('⏳ 已开始请求发放舞里程，服务器响应可能需要数秒，请耐心等待...')
+
+        const result = await api.maimile(
+          binding.maiUid,
+          mile,
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
+        )
+
+        if (
+          result.MileStatus === false ||
+          result.LoginStatus === false ||
+          result.LogoutStatus === false
+        ) {
+          return '❌ 发放舞里程失败：服务器返回未成功，请稍后再试'
+        }
+
+        const current = typeof result.CurrentMile === 'number'
+          ? `\n当前舞里程：${result.CurrentMile}`
+          : ''
+
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程${current}`
+      } catch (error: any) {
+        logger.error('发舞里程失败:', error)
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        }
+        return `❌ 发放舞里程失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
    * 上传B50到水鱼
    * 用法: /mai上传B50
    */
