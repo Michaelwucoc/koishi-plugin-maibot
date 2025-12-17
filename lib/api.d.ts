@@ -127,5 +127,14 @@ export declare class MaiBotAPI {
         LogoutStatus?: boolean;
         ClearStatus?: boolean;
     }>;
+    /**
+     * 舞里程签到 / 发舞里程
+     */
+    maimile(maiUid: string, maiMile: number, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        MileStatus?: boolean;
+        CurrentMile?: number;
+    }>;
 }
 //# sourceMappingURL=api.d.ts.map
