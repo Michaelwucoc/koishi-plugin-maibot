@@ -13,6 +13,12 @@ export interface Config {
     apiTimeout?: number;
     machineInfo: MachineInfo;
     turnstileToken: string;
+    maintenanceNotice?: {
+        enabled: boolean;
+        startHour: number;
+        endHour: number;
+        message: string;
+    };
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
