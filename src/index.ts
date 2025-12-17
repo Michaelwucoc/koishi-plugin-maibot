@@ -18,6 +18,12 @@ export interface Config {
   apiTimeout?: number
   machineInfo: MachineInfo
   turnstileToken: string
+  maintenanceNotice?: {
+    enabled: boolean
+    startHour: number
+    endHour: number
+    message: string
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -31,6 +37,17 @@ export const Config: Schema<Config> = Schema.object({
     regionName: Schema.string().required().description('区域名称'),
   }).required().description('机台信息（必填）'),
   turnstileToken: Schema.string().required().description('Turnstile Token（必填）'),
+  maintenanceNotice: Schema.object({
+    enabled: Schema.boolean().default(true).description('是否启用维护时间提示与拦截'),
+    startHour: Schema.number().default(4).description('维护开始时间（小时，0-23）'),
+    endHour: Schema.number().default(7).description('维护结束时间（小时，0-23）'),
+    message: Schema.string().default('❌503 当前为服务器维护时间，本指令暂不可用，请稍后再试。').description('维护时间内的提示文本'),
+  }).description('B50 等指令的维护时间配置（例如凌晨 4:00-7:00 不允许上传）').default({
+    enabled: true,
+    startHour: 4,
+    endHour: 7,
+    message: '当前为凌立服务器维护时间，本指令暂不可用，请稍后再试。',
+  }),
 })
 
 /**
@@ -105,6 +122,41 @@ async function promptCollectionType(session: Session, timeout = 60000): Promise<
   }
 }
 
+function isInMaintenanceWindow(maintenance?: {
+  enabled: boolean
+  startHour: number
+  endHour: number
+}): boolean {
+  if (!maintenance || !maintenance.enabled) return false
+  const now = new Date()
+  const hour = now.getHours()
+  const start = maintenance.startHour
+  const end = maintenance.endHour
+
+  if (start === end) {
+    // 相等视为全天维护
+    return true
+  }
+
+  if (start < end) {
+    // 普通区间，例如 4-7 点
+    return hour >= start && hour < end
+  }
+
+  // 跨零点区间，例如 23-5 点
+  return hour >= start || hour < end
+}
+
+function getMaintenanceMessage(maintenance?: {
+  enabled: boolean
+  startHour: number
+  endHour: number
+  message: string
+}): string | null {
+  if (!isInMaintenanceWindow(maintenance)) return null
+  return maintenance?.message || null
+}
+
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -119,6 +171,7 @@ export function apply(ctx: Context, config: Config) {
   // 使用配置中的值
   const machineInfo = config.machineInfo
   const turnstileToken = config.turnstileToken
+  const maintenanceNotice = config.maintenanceNotice
 
   const scheduleB50Notification = (session: Session, taskId: string) => {
     const bot = session.bot
@@ -159,9 +212,14 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
+        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          msg += `\n${maintenanceMsg}`
+        }
         await bot.sendMessage(
           channelId,
-          `${mention} 水鱼B50任务 ${taskId} 在预设时间内仍未完成，请稍后使用 /mai查询B50 手动确认`,
+          msg,
           guildId,
         )
       } catch (error) {
@@ -170,9 +228,14 @@ export function apply(ctx: Context, config: Config) {
           ctx.setTimeout(poll, interval)
           return
         }
+        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          msg += `\n${maintenanceMsg}`
+        }
         await bot.sendMessage(
           channelId,
-          `${mention} 水鱼B50任务 ${taskId} 状态查询多次失败，请使用 /mai查询B50 手动确认`,
+          msg,
           guildId,
         )
       }
@@ -221,9 +284,14 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
+        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          msg += `\n${maintenanceMsg}`
+        }
         await bot.sendMessage(
           channelId,
-          `${mention} 落雪B50任务 ${taskId} 在预设时间内仍未完成，请稍后使用 /mai查询落雪B50 手动确认`,
+          msg,
           guildId,
         )
       } catch (error) {
@@ -232,9 +300,14 @@ export function apply(ctx: Context, config: Config) {
           ctx.setTimeout(poll, interval)
           return
         }
+        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          msg += `\n${maintenanceMsg}`
+        }
         await bot.sendMessage(
           channelId,
-          `${mention} 落雪B50任务 ${taskId} 状态查询多次失败，请使用 /mai查询落雪B50 手动确认`,
+          msg,
           guildId,
         )
       }
@@ -796,20 +869,19 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 请先绑定水鱼Token\n使用 /mai绑定水鱼 <token> 进行绑定'
         }
 
-        // 检查是否有正在进行的任务
-        try {
-          const taskStatus = await api.getB50TaskStatus(binding.maiUid)
-          if (taskStatus.code === 0 && taskStatus.alive_task_id) {
-            return `⚠️ 已有任务正在进行中\n任务ID: ${taskStatus.alive_task_id}\n开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n\n使用 /mai查询B50 查看任务状态`
-          }
-        } catch (error) {
-          // 如果没有任务或查询失败，继续上传
+        // 维护时间内直接提示，不发起上传请求
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          return maintenanceMsg
         }
 
         // 上传B50
         const result = await api.uploadB50(binding.maiUid, binding.fishToken)
 
         if (!result.UploadStatus) {
+          if (result.msg === '该账号下存在未完成的任务') {
+            return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+          }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
 
@@ -818,6 +890,15 @@ export function apply(ctx: Context, config: Config) {
         return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
+        // 处理请求超时类错误，统一提示
+        if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+          let msg = '水鱼B50任务 上传失败，请稍后再试一次。'
+          const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+          if (maintenanceMsg) {
+            msg += `\n${maintenanceMsg}`
+          }
+          return msg
+        }
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
         }
@@ -1128,20 +1209,19 @@ export function apply(ctx: Context, config: Config) {
           finalLxnsCode = binding.lxnsCode
         }
 
-        // 检查是否有正在进行的任务
-        try {
-          const taskStatus = await api.getLxB50TaskStatus(binding.maiUid)
-          if (taskStatus.code === 0 && taskStatus.alive_task_id) {
-            return `⚠️ 已有任务正在进行中\n任务ID: ${taskStatus.alive_task_id}\n开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n\n使用 /mai查询落雪B50 查看任务状态`
-          }
-        } catch (error) {
-          // 如果没有任务或查询失败，继续上传
+        // 维护时间内直接提示，不发起上传请求
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          return maintenanceMsg
         }
 
         // 上传落雪B50
         const result = await api.uploadLxB50(binding.maiUid, finalLxnsCode)
 
         if (!result.UploadStatus) {
+          if (result.msg === '该账号下存在未完成的任务') {
+            return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+          }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
 
@@ -1150,6 +1230,15 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
       } catch (error: any) {
         ctx.logger('maibot').error('上传落雪B50失败:', error)
+        // 处理请求超时类错误，统一提示
+        if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+          let msg = '落雪B50任务 上传失败，请稍后再试一次。'
+          const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+          if (maintenanceMsg) {
+            msg += `\n${maintenanceMsg}`
+          }
+          return msg
+        }
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
         }
