@@ -70,8 +70,8 @@ export class MaiBotAPI {
   ): Promise<{
     LoginStatus?: boolean
     LogoutStatus?: boolean
-    TicketStatus?: boolean
-    ClearStatus?: boolean
+    UserAllStatus?: boolean
+    UserLogStatus?: boolean
   }> {
     const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/clear_ticket`, null, {
       params: {
