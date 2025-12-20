@@ -24,6 +24,10 @@ export interface Config {
     endHour: number
     message: string
   }
+  alertMessages?: {
+    loginMessage: string  // 上线消息
+    logoutMessage: string  // 下线消息
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -47,6 +51,13 @@ export const Config: Schema<Config> = Schema.object({
     startHour: 4,
     endHour: 7,
     message: '当前为凌立服务器维护时间，本指令暂不可用，请稍后再试。',
+  }),
+  alertMessages: Schema.object({
+    loginMessage: Schema.string().default('{playerid}{at} 你的账号已上线。').description('账号上线时的提示消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
+    logoutMessage: Schema.string().default('{playerid}{at} 你的账号已下线。').description('账号下线时的提示消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
+  }).description('账号状态提醒消息配置').default({
+    loginMessage: '{playerid}{at} 你的账号已上线。',
+    logoutMessage: '{playerid}{at} 你的账号已下线。',
   }),
 })
 
@@ -1301,6 +1312,208 @@ export function apply(ctx: Context, config: Config) {
       } catch (error: any) {
         ctx.logger('maibot').error('查询落雪B50任务状态失败:', error)
         return `❌ 查询失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  // 提醒功能配置
+  const alertMessages = config.alertMessages || {
+    loginMessage: '{playerid}{at} 你的账号已上线。',
+    logoutMessage: '{playerid}{at} 你的账号已下线。',
+  }
+
+  /**
+   * 账号状态提醒功能
+   * 每1分钟检查一次所有启用播报的用户状态
+   */
+  const checkLoginStatus = async () => {
+    try {
+      // 获取所有启用播报的用户
+      const bindings = await ctx.database.get('maibot_bindings', {
+        alertEnabled: true,
+      })
+
+      for (const binding of bindings) {
+        try {
+          // 获取当前登录状态
+          const preview = await api.preview(binding.maiUid)
+          const currentLoginStatus = preview.IsLogin === 'true'
+
+          // 获取上一次登录状态（如果不存在，初始化为当前状态）
+          const lastLoginStatus = binding.lastLoginStatus ?? currentLoginStatus
+
+          // 如果状态发生变化
+          if (lastLoginStatus !== currentLoginStatus) {
+            // 更新数据库中的状态和用户名（如果获取到了）
+            const updateData: any = {
+              lastLoginStatus: currentLoginStatus,
+            }
+            if (preview.UserName) {
+              updateData.userName = preview.UserName
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, updateData)
+
+            // 发送提醒消息
+            if (binding.guildId && binding.channelId) {
+              // 尝试使用第一个可用的bot发送消息
+              for (const bot of ctx.bots) {
+                try {
+                  const mention = `<at id="${binding.userId}"/>`
+                  // 获取玩家名（优先使用最新的，否则使用缓存的）
+                  const playerName = preview.UserName || binding.userName || '玩家'
+                  
+                  // 获取消息模板
+                  const messageTemplate = currentLoginStatus
+                    ? alertMessages.loginMessage
+                    : alertMessages.logoutMessage
+                  
+                  // 替换占位符
+                  const message = messageTemplate
+                    .replace(/{playerid}/g, playerName)
+                    .replace(/{at}/g, mention)
+
+                  await bot.sendMessage(binding.channelId, message, binding.guildId)
+                  logger.info(`已发送状态提醒给用户 ${binding.userId} (${playerName}): ${currentLoginStatus ? '上线' : '下线'}`)
+                  break // 成功发送后退出循环
+                } catch (error) {
+                  // 如果这个bot失败，尝试下一个
+                  continue
+                }
+              }
+            }
+          }
+        } catch (error) {
+          logger.warn(`检查用户 ${binding.userId} 状态失败:`, error)
+        }
+      }
+    } catch (error) {
+      logger.error('检查登录状态失败:', error)
+    }
+  }
+
+  // 启动定时任务，每1分钟检查一次
+  ctx.setInterval(checkLoginStatus, 60_000)
+
+  /**
+   * 开关播报功能
+   * 用法: /maialert [on|off]
+   */
+  ctx.command('maialert [state:text]', '开关账号状态播报功能')
+    .action(async ({ session }, state) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const currentState = binding.alertEnabled ?? false
+
+        // 如果没有提供参数，显示当前状态
+        if (!state) {
+          return `当前播报状态: ${currentState ? '✅ 已开启' : '❌ 已关闭'}\n\n使用 /maialert on 开启\n使用 /maialert off 关闭`
+        }
+
+        const newState = state.toLowerCase() === 'on' || state.toLowerCase() === 'true' || state === '1'
+
+        // 如果状态没有变化
+        if (currentState === newState) {
+          return `播报状态已经是 ${newState ? '开启' : '关闭'} 状态`
+        }
+
+        // 更新状态，同时保存群组和频道信息
+        await ctx.database.set('maibot_bindings', { userId }, {
+          alertEnabled: newState,
+          guildId: session.guildId || binding.guildId,
+          channelId: session.channelId || binding.channelId,
+        })
+
+        // 如果是首次开启，初始化登录状态
+        if (newState && binding.lastLoginStatus === undefined) {
+          try {
+            const preview = await api.preview(binding.maiUid)
+            const loginStatus = preview.IsLogin === 'true'
+            await ctx.database.set('maibot_bindings', { userId }, {
+              lastLoginStatus: loginStatus,
+            })
+          } catch (error) {
+            logger.warn('初始化登录状态失败:', error)
+          }
+        }
+
+        return `✅ 播报功能已${newState ? '开启' : '关闭'}\n${newState ? '当账号登录状态发生变化时，会在群内提醒你。' : '已停止播报账号状态变化。'}`
+      } catch (error: any) {
+        logger.error('开关播报功能失败:', error)
+        return `❌ 操作失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 管理员开关他人的播报状态
+   * 用法: /maialert set <userId> [on|off]
+   */
+  ctx.command('maialert set <targetUserId:text> [state:text]', '设置他人的播报状态（需要auth等级3以上）')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId, state) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      // 检查权限
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能设置他人的播报状态'
+      }
+
+      if (!targetUserId) {
+        return '请提供目标用户ID\n用法：/maialert set <userId> [on|off]'
+      }
+
+      if (!state) {
+        return '请提供状态\n用法：/maialert set <userId> on 或 /maialert set <userId> off'
+      }
+
+      try {
+        // 检查目标用户是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId: targetUserId })
+        
+        if (bindings.length === 0) {
+          return `❌ 用户 ${targetUserId} 尚未绑定账号`
+        }
+
+        const binding = bindings[0]
+        const newState = state.toLowerCase() === 'on' || state.toLowerCase() === 'true' || state === '1'
+
+        // 更新状态
+        await ctx.database.set('maibot_bindings', { userId: targetUserId }, {
+          alertEnabled: newState,
+          guildId: session.guildId || binding.guildId,
+          channelId: session.channelId || binding.channelId,
+        })
+
+        // 如果是首次开启，初始化登录状态
+        if (newState && binding.lastLoginStatus === undefined) {
+          try {
+            const preview = await api.preview(binding.maiUid)
+            const loginStatus = preview.IsLogin === 'true'
+            await ctx.database.set('maibot_bindings', { userId: targetUserId }, {
+              lastLoginStatus: loginStatus,
+            })
+          } catch (error) {
+            logger.warn('初始化登录状态失败:', error)
+          }
+        }
+
+        return `✅ 已${newState ? '开启' : '关闭'}用户 ${targetUserId} 的播报功能`
+      } catch (error: any) {
+        logger.error('设置他人播报状态失败:', error)
+        return `❌ 操作失败: ${error?.message || '未知错误'}`
       }
     })
 }
