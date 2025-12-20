@@ -568,6 +568,33 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n🔒 锁定状态: 未锁定\n使用 /mai锁定 可以锁定账号（防止他人登录）`
         }
 
+        // 显示票券信息
+        try {
+          const chargeInfo = await api.getCharge(binding.maiUid)
+          if (chargeInfo && chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
+            statusInfo += `\n\n🎫 票券情况（共${chargeInfo.length}张）：\n`
+            for (const charge of chargeInfo.userChargeList) {
+              const ticketName = getTicketName(charge.chargeId)
+              const purchaseDate = charge.purchaseDate 
+                ? new Date(charge.purchaseDate).toLocaleString('zh-CN')
+                : '未知'
+              const validDate = charge.validDate 
+                ? new Date(charge.validDate).toLocaleString('zh-CN')
+                : '未知'
+              
+              statusInfo += `\n${ticketName} (ID: ${charge.chargeId})\n`
+              statusInfo += `  库存: ${charge.stock}\n`
+              statusInfo += `  购买日期: ${purchaseDate}\n`
+              statusInfo += `  有效期至: ${validDate}\n`
+            }
+          } else {
+            statusInfo += `\n\n🎫 票券情况: 暂无票券`
+          }
+        } catch (error) {
+          logger.warn('获取票券信息失败:', error)
+          statusInfo += `\n\n🎫 票券情况: 获取失败，请检查API服务`
+        }
+
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询状态失败:', error)
@@ -623,7 +650,7 @@ export function apply(ctx: Context, config: Config) {
           if (result.UserID === -2) {
             return '❌ 锁定失败：Turnstile校验失败，请检查token配置'
           }
-          return '❌ 锁定失败，服务端未返回成功状态，请稍后重试'
+          return '❌ 锁定失败，服务端未返回成功状态，请稍后重试。请点击获取二维码刷新账号后再试。'
         }
 
         // 保存锁定信息到数据库
@@ -933,7 +960,7 @@ export function apply(ctx: Context, config: Config) {
           ticketResult.LogoutStatus === false ||
           ticketResult.TicketStatus === false
         ) {
-          return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试'
+          return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
         }
 
         return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
@@ -1257,7 +1284,7 @@ export function apply(ctx: Context, config: Config) {
         )
 
         if (result.ItemStatus === false || result.LoginStatus === false || result.LogoutStatus === false) {
-          return '❌ 发放失败：服务器未返回成功状态，请稍后再试'
+          return '❌ 发放失败：服务器未返回成功状态，请稍后再试或点击获取二维码刷新账号后再试。'
         }
 
         return `✅ 已为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
@@ -1337,7 +1364,7 @@ export function apply(ctx: Context, config: Config) {
         )
 
         if (result.ClearStatus === false || result.LoginStatus === false || result.LogoutStatus === false) {
-          return '❌ 清空失败：服务器未返回成功状态，请稍后再试'
+          return '❌ 清空失败：服务器未返回成功状态，请稍后再试或点击获取二维码刷新账号后再试。'
         }
 
         return `✅ 已清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
