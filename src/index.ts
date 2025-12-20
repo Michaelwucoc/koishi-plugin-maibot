@@ -492,10 +492,10 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 查询绑定状态
-   * 用法: /mai状态 [-h]
+   * 用法: /mai状态 [--expired]
    */
   ctx.command('mai状态', '查询绑定状态')
-    .option('h', '-h  显示过期票券')
+    .option('expired', '--expired  显示过期票券')
     .action(async ({ session, options }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
@@ -574,7 +574,7 @@ export function apply(ctx: Context, config: Config) {
           const chargeInfo = await api.getCharge(binding.maiUid)
           if (chargeInfo && chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
             const now = new Date()
-            const showExpired = options?.h || false  // 是否显示过期票券
+            const showExpired = options?.expired || false  // 是否显示过期票券
             
             // 计算总票数（所有stock>0的票券，包括过期的）
             const allValidStockCharges = chargeInfo.userChargeList.filter(charge => charge.stock > 0)
@@ -1176,17 +1176,36 @@ export function apply(ctx: Context, config: Config) {
           machineInfo.regionName,
         )
 
-        if (result.ClearStatus === false || result.TicketStatus === false) {
-          return '❌ 清票失败：服务器未返回成功状态，请稍后再试'
+        // 检查4个状态字段是否都是 true
+        const loginStatus = result.LoginStatus === true
+        const logoutStatus = result.LogoutStatus === true
+        const userAllStatus = result.UserAllStatus === true
+        const userLogStatus = result.UserLogStatus === true
+
+        // 如果4个状态都是 true，则清票成功
+        if (loginStatus && logoutStatus && userAllStatus && userLogStatus) {
+          return `✅ 已清空 ${maskUserId(binding.maiUid)} 的所有功能票`
         }
 
-        return `✅ 已清空 ${maskUserId(binding.maiUid)} 的所有功能票`
+        // 如果4个状态都是 false，显示特殊错误信息
+        if (
+          result.LoginStatus === false &&
+          result.LogoutStatus === false &&
+          result.UserAllStatus === false &&
+          result.UserLogStatus === false
+        ) {
+          return `清票错误！请点击获取二维码再试一次！\n错误信息： ${JSON.stringify(result)}`
+        }
+
+        // 其他失败情况，显示详细错误信息
+        return `❌ 清票失败\n错误信息： ${JSON.stringify(result)}`
       } catch (error: any) {
         logger.error('清票失败:', error)
         if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+          const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败\n错误信息： ${errorInfo}`
         }
-        return `❌ 清票失败: ${error?.message || '未知错误'}`
+        return `❌ 清票失败\n错误信息： ${error?.message || '未知错误'}`
       }
     })
 
