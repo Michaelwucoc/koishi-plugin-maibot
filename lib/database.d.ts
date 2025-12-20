@@ -9,6 +9,10 @@ export interface UserBinding {
     rating?: string;
     fishToken?: string;
     lxnsCode?: string;
+    alertEnabled?: boolean;
+    lastLoginStatus?: boolean;
+    guildId?: string;
+    channelId?: string;
 }
 declare module 'koishi' {
     interface Tables {

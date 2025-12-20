@@ -19,6 +19,10 @@ export interface Config {
         endHour: number;
         message: string;
     };
+    alertMessages?: {
+        loginMessage: string;
+        logoutMessage: string;
+    };
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
