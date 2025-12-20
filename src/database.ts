@@ -14,6 +14,9 @@ export interface UserBinding {
   lastLoginStatus?: boolean  // 上一次登录状态
   guildId?: string  // 群组ID（用于发送消息）
   channelId?: string  // 频道ID（用于发送消息）
+  isLocked?: boolean  // 是否锁定（通过mai锁定指令）
+  lockTime?: Date  // 锁定时间
+  lockLoginId?: number  // 锁定时的LoginId
 }
 
 declare module 'koishi' {
@@ -37,6 +40,9 @@ export function extendDatabase(ctx: Context) {
     lastLoginStatus: 'boolean',  // 上一次登录状态
     guildId: 'string',  // 群组ID
     channelId: 'string',  // 频道ID
+    isLocked: 'boolean',  // 是否锁定
+    lockTime: 'timestamp',  // 锁定时间
+    lockLoginId: 'unsigned',  // 锁定时的LoginId
   }, {
     primary: 'id',
     autoInc: true,
