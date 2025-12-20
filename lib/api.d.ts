@@ -27,8 +27,8 @@ export declare class MaiBotAPI {
     clearTicket(maiUid: string, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string): Promise<{
         LoginStatus?: boolean;
         LogoutStatus?: boolean;
-        TicketStatus?: boolean;
-        ClearStatus?: boolean;
+        UserAllStatus?: boolean;
+        UserLogStatus?: boolean;
     }>;
     /**
      * 用户状态预览
