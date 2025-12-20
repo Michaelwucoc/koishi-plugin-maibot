@@ -14,6 +14,7 @@
 - ✅ B50任务状态查询（水鱼/落雪）
 - ✅ 收藏品管理（发收藏品/清收藏品，支持交互式选择类别）
 - ✅ 功能票管理（发票/清票）
+- ✅ 账号状态提醒（自动检测登录状态变化并群内通知）
 - ✅ 用户ID隐藏显示（防止盗号）
 - ✅ 完整的 API 调用封装
 - ✅ 数据库存储（SQLite/MySQL/PostgreSQL）
@@ -40,6 +41,9 @@ plugins:
       placeName: 你的场所名称
       regionName: 你的区域名称
     turnstileToken: 你的Turnstile Token  # 必填
+    alertMessages:  # 可选，账号状态提醒消息配置
+      loginMessage: '{playerid}{at} 你的账号已上线。'  # 上线消息（支持占位符：{playerid} 玩家名，{at} @用户）
+      logoutMessage: '{playerid}{at} 你的账号已下线。'  # 下线消息
 ```
 
 **注意**：`machineInfo` 和 `turnstileToken` 为必填配置，需要在配置文件中填写。
@@ -123,6 +127,20 @@ plugins:
 ```
 /mai清票
 ```
+
+### 账号状态提醒
+```
+/maialert [on|off]              # 开关自己的播报功能
+/maialert set <userId> [on|off] # 管理员设置他人的播报状态（需要auth等级3以上）
+```
+
+功能说明：
+- 默认关闭，需要用户主动开启
+- 每1分钟自动检查一次登录状态
+- 当账号从离线变为在线时，会在群内发送上线提醒
+- 当账号从在线变为离线时，会在群内发送下线提醒
+- 仅在状态变化时发送，避免刷屏
+- 支持自定义消息格式（在配置文件中设置）
 
 ## API 要求
 
