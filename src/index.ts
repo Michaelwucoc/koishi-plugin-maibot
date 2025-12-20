@@ -492,10 +492,11 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 查询绑定状态
-   * 用法: /mai状态
+   * 用法: /mai状态 [-h]
    */
   ctx.command('mai状态', '查询绑定状态')
-    .action(async ({ session }) => {
+    .option('h', '-h  显示过期票券')
+    .action(async ({ session, options }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -572,20 +573,50 @@ export function apply(ctx: Context, config: Config) {
         try {
           const chargeInfo = await api.getCharge(binding.maiUid)
           if (chargeInfo && chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
-            statusInfo += `\n\n🎫 票券情况（共${chargeInfo.length}张）：\n`
-            for (const charge of chargeInfo.userChargeList) {
-              const ticketName = getTicketName(charge.chargeId)
-              const purchaseDate = charge.purchaseDate 
-                ? new Date(charge.purchaseDate).toLocaleString('zh-CN')
-                : '未知'
-              const validDate = charge.validDate 
-                ? new Date(charge.validDate).toLocaleString('zh-CN')
-                : '未知'
-              
-              statusInfo += `\n${ticketName} (ID: ${charge.chargeId})\n`
-              statusInfo += `  库存: ${charge.stock}\n`
-              statusInfo += `  购买日期: ${purchaseDate}\n`
-              statusInfo += `  有效期至: ${validDate}\n`
+            const now = new Date()
+            const showExpired = options?.h || false  // 是否显示过期票券
+            
+            // 计算总票数（所有stock>0的票券，包括过期的）
+            const allValidStockCharges = chargeInfo.userChargeList.filter(charge => charge.stock > 0)
+            const totalStock = allValidStockCharges.reduce((sum, charge) => sum + charge.stock, 0)
+            
+            // 根据是否显示过期票券来过滤
+            let displayCharges: typeof chargeInfo.userChargeList
+            if (showExpired) {
+              // 显示所有stock>0的票券（包括过期的）
+              displayCharges = allValidStockCharges
+            } else {
+              // 只显示未过期且stock>0的票券
+              displayCharges = allValidStockCharges.filter(charge => {
+                if (charge.validDate) {
+                  const validDate = new Date(charge.validDate)
+                  return validDate >= now  // 未过期
+                }
+                return true  // 没有有效期信息的也显示
+              })
+            }
+            
+            if (displayCharges.length > 0) {
+              statusInfo += `\n\n🎫 票券情况（总票数: ${totalStock}张）${showExpired ? '（包含过期）' : ''}：\n`
+              for (const charge of displayCharges) {
+                const ticketName = getTicketName(charge.chargeId)
+                const purchaseDate = charge.purchaseDate 
+                  ? new Date(charge.purchaseDate).toLocaleString('zh-CN')
+                  : '未知'
+                const validDate = charge.validDate 
+                  ? new Date(charge.validDate).toLocaleString('zh-CN')
+                  : '未知'
+                
+                // 检查是否过期
+                const isExpired = charge.validDate ? new Date(charge.validDate) < now : false
+                
+                statusInfo += `\n${ticketName} (ID: ${charge.chargeId})${isExpired ? ' [已过期]' : ''}\n`
+                statusInfo += `  库存: ${charge.stock}\n`
+                statusInfo += `  购买日期: ${purchaseDate}\n`
+                statusInfo += `  有效期至: ${validDate}\n`
+              }
+            } else {
+              statusInfo += `\n\n🎫 票券情况: 总票数 ${totalStock}张${showExpired ? '（包含过期）' : ''}`
             }
           } else {
             statusInfo += `\n\n🎫 票券情况: 暂无票券`
@@ -1666,6 +1697,71 @@ export function apply(ctx: Context, config: Config) {
     logger.info('执行首次登录状态检查...')
     checkLoginStatus()
   }, 5000) // 5秒后执行首次检查
+
+  /**
+   * 保持锁定账号的登录状态
+   * 每15分钟对锁定的用户重新执行login
+   */
+  const refreshLockedAccounts = async () => {
+    logger.debug('开始刷新锁定账号的登录状态...')
+    try {
+      // 获取所有锁定的账号
+      const lockedBindings = await ctx.database.get('maibot_bindings', {
+        isLocked: true,
+      })
+      
+      logger.info(`找到 ${lockedBindings.length} 个锁定的账号，开始刷新登录状态`)
+      
+      for (const binding of lockedBindings) {
+        try {
+          logger.debug(`刷新用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
+          
+          // 重新执行登录
+          const result = await api.login(
+            binding.maiUid,
+            machineInfo.regionId,
+            machineInfo.placeId,
+            machineInfo.clientId,
+            turnstileToken,
+          )
+          
+          if (result.LoginStatus) {
+            // 更新LoginId（如果有变化）
+            if (result.LoginId && result.LoginId !== binding.lockLoginId) {
+              await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+                lockLoginId: result.LoginId,
+              })
+              logger.info(`用户 ${binding.userId} 登录状态已刷新，LoginId: ${result.LoginId}`)
+            } else {
+              logger.debug(`用户 ${binding.userId} 登录状态已刷新`)
+            }
+          } else {
+            if (result.UserID === -2) {
+              logger.error(`用户 ${binding.userId} 刷新登录失败：Turnstile校验失败`)
+            } else {
+              logger.error(`用户 ${binding.userId} 刷新登录失败：服务端未返回成功状态`)
+            }
+          }
+        } catch (error) {
+          logger.error(`刷新用户 ${binding.userId} 登录状态失败:`, error)
+        }
+      }
+    } catch (error) {
+      logger.error('刷新锁定账号登录状态失败:', error)
+    }
+    logger.debug('锁定账号登录状态刷新完成')
+  }
+
+  // 启动锁定账号刷新任务，每15分钟执行一次
+  const lockRefreshInterval = 15 * 60 * 1000  // 15分钟
+  logger.info(`锁定账号刷新功能已启动，每15分钟刷新一次`)
+  ctx.setInterval(refreshLockedAccounts, lockRefreshInterval)
+  
+  // 立即执行一次刷新（延迟30秒，避免与首次检查冲突）
+  ctx.setTimeout(() => {
+    logger.info('执行首次锁定账号刷新...')
+    refreshLockedAccounts()
+  }, 30000) // 30秒后执行首次刷新
 
   /**
    * 开关播报功能
