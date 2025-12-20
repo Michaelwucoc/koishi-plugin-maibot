@@ -105,6 +105,34 @@ export class MaiBotAPI {
   }
 
   /**
+   * 用户登录（锁号）
+   */
+  async login(
+    maiUid: string,
+    regionId: number,
+    placeId: number,
+    clientId: string,
+    token: string
+  ): Promise<{
+    LoginStatus: boolean
+    LoginId?: number
+    LastLoginDate?: string
+    UserID?: number
+  }> {
+    const response = await this.client.post('/api/login', {
+      token,
+    }, {
+      params: {
+        mai_uid: maiUid,
+        region_id: regionId,
+        place_id: placeId,
+        client_id: clientId,
+      },
+    })
+    return response.data
+  }
+
+  /**
    * 用户登出
    */
   async logout(
@@ -346,6 +374,26 @@ export class MaiBotAPI {
         place_name: placeName,
         region_name: regionName,
       },
+    })
+    return response.data
+  }
+
+  /**
+   * 查询票券情况
+   */
+  async getCharge(maiUid: string): Promise<{
+    length: number
+    userChargeList: Array<{
+      chargeId: number
+      extNum1: number
+      purchaseDate: string
+      stock: number
+      validDate: string
+    }>
+    userId: number
+  }> {
+    const response = await this.client.get('/api/charge', {
+      params: { mai_uid: maiUid },
     })
     return response.data
   }

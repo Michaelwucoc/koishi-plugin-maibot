@@ -23,6 +23,8 @@ export interface Config {
         loginMessage: string;
         logoutMessage: string;
     };
+    alertCheckInterval?: number;
+    alertConcurrency?: number;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;

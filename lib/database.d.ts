@@ -13,6 +13,9 @@ export interface UserBinding {
     lastLoginStatus?: boolean;
     guildId?: string;
     channelId?: string;
+    isLocked?: boolean;
+    lockTime?: Date;
+    lockLoginId?: number;
 }
 declare module 'koishi' {
     interface Tables {

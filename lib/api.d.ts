@@ -43,6 +43,15 @@ export declare class MaiBotAPI {
         UserName: string;
     }>;
     /**
+     * 用户登录（锁号）
+     */
+    login(maiUid: string, regionId: number, placeId: number, clientId: string, token: string): Promise<{
+        LoginStatus: boolean;
+        LoginId?: number;
+        LastLoginDate?: string;
+        UserID?: number;
+    }>;
+    /**
      * 用户登出
      */
     logout(maiUid: string, regionId: string, clientId: string, placeId: string, token: string): Promise<{
