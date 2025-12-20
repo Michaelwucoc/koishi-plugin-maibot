@@ -30,6 +30,8 @@ export interface Config {
   }
   alertCheckInterval?: number  // 检查间隔（毫秒）
   alertConcurrency?: number  // 并发检查数量
+  lockRefreshDelay?: number  // 锁定账号刷新时每次 login 的延迟（毫秒）
+  lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -63,6 +65,8 @@ export const Config: Schema<Config> = Schema.object({
   }),
   alertCheckInterval: Schema.number().default(60000).description('账号状态检查间隔（毫秒），默认60秒（60000毫秒）'),
   alertConcurrency: Schema.number().default(3).description('并发检查数量，默认3个用户同时检查'),
+  lockRefreshDelay: Schema.number().default(1000).description('锁定账号刷新时每次 login 的延迟（毫秒），默认1秒（1000毫秒）'),
+  lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
 })
 
 /**
@@ -684,18 +688,33 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 锁定失败，服务端未返回成功状态，请稍后重试。请点击获取二维码刷新账号后再试。'
         }
 
-        // 保存锁定信息到数据库
-        await ctx.database.set('maibot_bindings', { userId }, {
+        // 保存锁定信息到数据库，同时关闭 maialert 推送（如果之前是开启的）
+        const updateData: any = {
           isLocked: true,
           lockTime: new Date(),
           lockLoginId: result.LoginId,
-        })
+        }
+        
+        // 如果之前开启了推送，锁定时自动关闭
+        if (binding.alertEnabled === true) {
+          updateData.alertEnabled = false
+          logger.info(`用户 ${userId} 锁定账号，已自动关闭 maialert 推送`)
+        }
 
-        return `✅ 账号已锁定\n` +
+        await ctx.database.set('maibot_bindings', { userId }, updateData)
+
+        let message = `✅ 账号已锁定\n` +
                `用户ID: ${maskUserId(binding.maiUid)}\n` +
                `LoginId: ${result.LoginId}\n` +
-               `锁定时间: ${new Date().toLocaleString('zh-CN')}\n\n` +
-               `使用 /mai解锁 可以解锁账号`
+               `锁定时间: ${new Date().toLocaleString('zh-CN')}\n\n`
+        
+        if (binding.alertEnabled === true) {
+          message += `⚠️ 已自动关闭 maialert 推送（锁定期间不会收到上线/下线提醒）\n`
+        }
+        
+        message += `使用 /mai解锁 可以解锁账号`
+
+        return message
       } catch (error: any) {
         logger.error('锁定账号失败:', error)
         if (error?.response) {
@@ -1568,6 +1587,8 @@ export function apply(ctx: Context, config: Config) {
   }
   const checkInterval = config.alertCheckInterval ?? 60000  // 默认60秒
   const concurrency = config.alertConcurrency ?? 3  // 默认并发3个
+  const lockRefreshDelay = config.lockRefreshDelay ?? 1000  // 默认1秒延迟
+  const lockRefreshConcurrency = config.lockRefreshConcurrency ?? 3  // 默认并发3个
 
   /**
    * 检查单个用户的登录状态
@@ -1678,13 +1699,16 @@ export function apply(ctx: Context, config: Config) {
       const allBindings = await ctx.database.get('maibot_bindings', {})
       logger.debug(`总共有 ${allBindings.length} 个绑定记录`)
       
-      // 过滤出启用播报的用户（alertEnabled 为 true）
+      // 过滤出启用播报的用户（alertEnabled 为 true），但排除已锁定的账号
       const bindings = allBindings.filter(b => {
         const enabled = b.alertEnabled === true
-        if (enabled) {
+        const isLocked = b.isLocked === true
+        if (enabled && !isLocked) {
           logger.debug(`用户 ${b.userId} 启用了播报 (alertEnabled: ${b.alertEnabled}, guildId: ${b.guildId}, channelId: ${b.channelId})`)
+        } else if (enabled && isLocked) {
+          logger.debug(`用户 ${b.userId} 启用了播报但账号已锁定，跳过推送`)
         }
-        return enabled
+        return enabled && !isLocked
       })
       logger.info(`启用播报的用户数量: ${bindings.length}`)
       
@@ -1718,8 +1742,46 @@ export function apply(ctx: Context, config: Config) {
   }, 5000) // 5秒后执行首次检查
 
   /**
+   * 刷新单个锁定账号的登录状态
+   */
+  const refreshSingleLockedAccount = async (binding: UserBinding) => {
+    try {
+      logger.debug(`刷新用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
+      
+      // 重新执行登录
+      const result = await api.login(
+        binding.maiUid,
+        machineInfo.regionId,
+        machineInfo.placeId,
+        machineInfo.clientId,
+        turnstileToken,
+      )
+      
+      if (result.LoginStatus) {
+        // 更新LoginId（如果有变化）
+        if (result.LoginId && result.LoginId !== binding.lockLoginId) {
+          await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+            lockLoginId: result.LoginId,
+          })
+          logger.info(`用户 ${binding.userId} 登录状态已刷新，LoginId: ${result.LoginId}`)
+        } else {
+          logger.debug(`用户 ${binding.userId} 登录状态已刷新`)
+        }
+      } else {
+        if (result.UserID === -2) {
+          logger.error(`用户 ${binding.userId} 刷新登录失败：Turnstile校验失败`)
+        } else {
+          logger.error(`用户 ${binding.userId} 刷新登录失败：服务端未返回成功状态`)
+        }
+      }
+    } catch (error) {
+      logger.error(`刷新用户 ${binding.userId} 登录状态失败:`, error)
+    }
+  }
+
+  /**
    * 保持锁定账号的登录状态
-   * 每15分钟对锁定的用户重新执行login
+   * 使用并发处理和延迟对锁定的用户重新执行login
    */
   const refreshLockedAccounts = async () => {
     logger.debug('开始刷新锁定账号的登录状态...')
@@ -1729,40 +1791,22 @@ export function apply(ctx: Context, config: Config) {
         isLocked: true,
       })
       
-      logger.info(`找到 ${lockedBindings.length} 个锁定的账号，开始刷新登录状态`)
+      logger.info(`找到 ${lockedBindings.length} 个锁定的账号，开始刷新登录状态（并发数: ${lockRefreshConcurrency}，延迟: ${lockRefreshDelay}ms）`)
       
-      for (const binding of lockedBindings) {
-        try {
-          logger.debug(`刷新用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
-          
-          // 重新执行登录
-          const result = await api.login(
-            binding.maiUid,
-            machineInfo.regionId,
-            machineInfo.placeId,
-            machineInfo.clientId,
-            turnstileToken,
-          )
-          
-          if (result.LoginStatus) {
-            // 更新LoginId（如果有变化）
-            if (result.LoginId && result.LoginId !== binding.lockLoginId) {
-              await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-                lockLoginId: result.LoginId,
-              })
-              logger.info(`用户 ${binding.userId} 登录状态已刷新，LoginId: ${result.LoginId}`)
-            } else {
-              logger.debug(`用户 ${binding.userId} 登录状态已刷新`)
-            }
-          } else {
-            if (result.UserID === -2) {
-              logger.error(`用户 ${binding.userId} 刷新登录失败：Turnstile校验失败`)
-            } else {
-              logger.error(`用户 ${binding.userId} 刷新登录失败：服务端未返回成功状态`)
-            }
-          }
-        } catch (error) {
-          logger.error(`刷新用户 ${binding.userId} 登录状态失败:`, error)
+      if (lockedBindings.length === 0) {
+        logger.debug('没有锁定的账号需要刷新')
+        return
+      }
+
+      // 使用并发处理，批次之间添加延迟
+      for (let i = 0; i < lockedBindings.length; i += lockRefreshConcurrency) {
+        const batch = lockedBindings.slice(i, i + lockRefreshConcurrency)
+        // 并发处理当前批次
+        await Promise.all(batch.map(refreshSingleLockedAccount))
+        
+        // 如果不是最后一批，添加延迟
+        if (i + lockRefreshConcurrency < lockedBindings.length) {
+          await new Promise(resolve => setTimeout(resolve, lockRefreshDelay))
         }
       }
     } catch (error) {
@@ -1771,9 +1815,9 @@ export function apply(ctx: Context, config: Config) {
     logger.debug('锁定账号登录状态刷新完成')
   }
 
-  // 启动锁定账号刷新任务，每15分钟执行一次
-  const lockRefreshInterval = 15 * 60 * 1000  // 15分钟
-  logger.info(`锁定账号刷新功能已启动，每15分钟刷新一次`)
+  // 启动锁定账号刷新任务，每1分钟执行一次
+  const lockRefreshInterval = 60 * 1000  // 1分钟
+  logger.info(`锁定账号刷新功能已启动，每1分钟刷新一次`)
   ctx.setInterval(refreshLockedAccounts, lockRefreshInterval)
   
   // 立即执行一次刷新（延迟30秒，避免与首次检查冲突）
