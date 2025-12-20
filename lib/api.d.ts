@@ -145,5 +145,19 @@ export declare class MaiBotAPI {
         MileStatus?: boolean;
         CurrentMile?: number;
     }>;
+    /**
+     * 查询票券情况
+     */
+    getCharge(maiUid: string): Promise<{
+        length: number;
+        userChargeList: Array<{
+            chargeId: number;
+            extNum1: number;
+            purchaseDate: string;
+            stock: number;
+            validDate: string;
+        }>;
+        userId: number;
+    }>;
 }
 //# sourceMappingURL=api.d.ts.map
