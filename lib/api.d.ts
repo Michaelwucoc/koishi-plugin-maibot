@@ -159,5 +159,14 @@ export declare class MaiBotAPI {
         }>;
         userId: number;
     }>;
+    /**
+     * 上传游戏乐曲成绩
+     */
+    uploadScore(maiUid: string, clientId: string, regionId: number, placeId: number, placeName: string, regionName: string, musicId: number, level: number, achievement: number, fcStatus: number, syncStatus: number, dxScore: number): Promise<{
+        LoginStatus?: boolean;
+        LogoutStatus?: boolean;
+        UploadStatus?: boolean;
+        UserLogStatus?: boolean;
+    }>;
 }
 //# sourceMappingURL=api.d.ts.map
