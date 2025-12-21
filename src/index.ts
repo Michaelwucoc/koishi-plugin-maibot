@@ -203,7 +203,7 @@ async function promptScoreData(session: Session, timeout = 60000): Promise<Score
     // 1. 乐曲ID
     await session.send(
       '请输入乐曲ID（数字）\n' +
-      '如果不知道乐曲ID，请前往 https://sdgb.lemonno.xyz/ 查询\n\n' +
+      '如果不知道乐曲ID，请前往 https://maimai.lxns.net/songs 查询\n\n' +
       '输入0取消操作'
     )
     const musicIdInput = await session.prompt(timeout)
@@ -675,7 +675,8 @@ export function apply(ctx: Context, config: Config) {
         const binding = bindings[0]
         let statusInfo = `✅ 已绑定账号\n\n` +
                         `用户ID: ${maskUserId(binding.maiUid)}\n` +
-                        `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n`
+                        `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
+                        `🚨 使用/maialert查看账号提醒状态\n`
 
         // 尝试获取最新状态并更新数据库
         try {
@@ -716,16 +717,13 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n❄️ 落雪代码: 未绑定\n使用 /mai绑定落雪 <lxns_code> 进行绑定`
         }
 
-        // 显示锁定状态
+        // 显示锁定状态（不显示LoginId）
         if (binding.isLocked) {
           const lockTime = binding.lockTime 
             ? new Date(binding.lockTime).toLocaleString('zh-CN')
             : '未知'
           statusInfo += `\n\n🔒 锁定状态: 已锁定`
           statusInfo += `\n锁定时间: ${lockTime}`
-          if (binding.lockLoginId) {
-            statusInfo += `\n锁定LoginId: ${binding.lockLoginId}`
-          }
           statusInfo += `\n使用 /mai解锁 可以解锁账号`
         } else {
           statusInfo += `\n\n🔒 锁定状态: 未锁定\n使用 /mai锁定 可以锁定账号（防止他人登录）`
@@ -863,7 +861,6 @@ export function apply(ctx: Context, config: Config) {
 
         let message = `✅ 账号已锁定\n` +
                `用户ID: ${maskUserId(binding.maiUid)}\n` +
-               `LoginId: ${result.LoginId}\n` +
                `锁定时间: ${new Date().toLocaleString('zh-CN')}\n\n`
         
         if (binding.alertEnabled === true) {
