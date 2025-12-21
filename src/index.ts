@@ -167,6 +167,157 @@ async function promptCollectionType(session: Session, timeout = 60000): Promise<
   }
 }
 
+const LEVEL_OPTIONS = [
+  { label: 'Basic', value: 1 },
+  { label: 'Advanced', value: 2 },
+  { label: 'Expert', value: 3 },
+  { label: 'Master', value: 4 },
+  { label: 'Re:Master', value: 5 },
+]
+
+const FC_STATUS_OPTIONS = [
+  { label: '无', value: 0 },
+  { label: 'Full Combo', value: 1 },
+  { label: 'Full Combo+', value: 2 },
+  { label: 'All Perfect', value: 3 },
+  { label: 'All Perfect+', value: 4 },
+]
+
+const SYNC_STATUS_OPTIONS = [
+  { label: '无', value: 0 },
+  { label: 'Full Sync', value: 1 },
+  { label: 'Full Sync DX', value: 2 },
+]
+
+interface ScoreData {
+  musicId: number
+  level: number
+  achievement: number
+  fcStatus: number
+  syncStatus: number
+  dxScore: number
+}
+
+async function promptScoreData(session: Session, timeout = 60000): Promise<ScoreData | null> {
+  try {
+    // 1. 乐曲ID
+    await session.send(
+      '请输入乐曲ID（数字）\n' +
+      '如果不知道乐曲ID，请前往 https://sdgb.lemonno.xyz/ 查询\n\n' +
+      '输入0取消操作'
+    )
+    const musicIdInput = await session.prompt(timeout)
+    if (!musicIdInput || musicIdInput.trim() === '0') {
+      return null
+    }
+    const musicId = parseInt(musicIdInput.trim(), 10)
+    if (isNaN(musicId) || musicId <= 0) {
+      await session.send('❌ 乐曲ID必须是大于0的数字，操作已取消')
+      return null
+    }
+
+    // 2. 难度等级
+    const levelOptionsText = LEVEL_OPTIONS.map(
+      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+    ).join('\n')
+    await session.send(
+      `请选择难度等级：\n\n${levelOptionsText}\n\n请输入对应的数字（1-${LEVEL_OPTIONS.length}），或输入0取消`
+    )
+    const levelInput = await session.prompt(timeout)
+    const levelChoice = parseInt(levelInput?.trim() || '0', 10)
+    if (levelChoice === 0) {
+      return null
+    }
+    if (levelChoice < 1 || levelChoice > LEVEL_OPTIONS.length) {
+      await session.send('❌ 无效的选择，操作已取消')
+      return null
+    }
+    const level = LEVEL_OPTIONS[levelChoice - 1].value
+
+    // 3. 达成率（achievement）
+    await session.send(
+      '请输入达成率（整数，例如：1010000 表示 S+）\n' +
+      '参考：\n' +
+      '  S+ = 1010000\n' +
+      '  S = 1007500\n' +
+      '  A+ = 1005000\n' +
+      '  A = 1000000\n\n' +
+      '输入0取消操作'
+    )
+    const achievementInput = await session.prompt(timeout)
+    if (!achievementInput || achievementInput.trim() === '0') {
+      return null
+    }
+    const achievement = parseInt(achievementInput.trim(), 10)
+    if (isNaN(achievement) || achievement < 0) {
+      await session.send('❌ 达成率必须是大于等于0的数字，操作已取消')
+      return null
+    }
+
+    // 4. Full Combo状态
+    const fcOptionsText = FC_STATUS_OPTIONS.map(
+      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+    ).join('\n')
+    await session.send(
+      `请选择Full Combo状态：\n\n${fcOptionsText}\n\n请输入对应的数字（1-${FC_STATUS_OPTIONS.length}），或输入0取消`
+    )
+    const fcInput = await session.prompt(timeout)
+    const fcChoice = parseInt(fcInput?.trim() || '0', 10)
+    if (fcChoice === 0) {
+      return null
+    }
+    if (fcChoice < 1 || fcChoice > FC_STATUS_OPTIONS.length) {
+      await session.send('❌ 无效的选择，操作已取消')
+      return null
+    }
+    const fcStatus = FC_STATUS_OPTIONS[fcChoice - 1].value
+
+    // 5. 同步状态
+    const syncOptionsText = SYNC_STATUS_OPTIONS.map(
+      (opt, idx) => `${idx + 1}. ${opt.label} (${opt.value})`
+    ).join('\n')
+    await session.send(
+      `请选择同步状态：\n\n${syncOptionsText}\n\n请输入对应的数字（1-${SYNC_STATUS_OPTIONS.length}），或输入0取消`
+    )
+    const syncInput = await session.prompt(timeout)
+    const syncChoice = parseInt(syncInput?.trim() || '0', 10)
+    if (syncChoice === 0) {
+      return null
+    }
+    if (syncChoice < 1 || syncChoice > SYNC_STATUS_OPTIONS.length) {
+      await session.send('❌ 无效的选择，操作已取消')
+      return null
+    }
+    const syncStatus = SYNC_STATUS_OPTIONS[syncChoice - 1].value
+
+    // 6. DX分数
+    await session.send(
+      '请输入DX分数（整数）\n\n' +
+      '输入0取消操作'
+    )
+    const dxScoreInput = await session.prompt(timeout)
+    if (!dxScoreInput || dxScoreInput.trim() === '0') {
+      return null
+    }
+    const dxScore = parseInt(dxScoreInput.trim(), 10)
+    if (isNaN(dxScore) || dxScore < 0) {
+      await session.send('❌ DX分数必须是大于等于0的数字，操作已取消')
+      return null
+    }
+
+    return {
+      musicId,
+      level,
+      achievement,
+      fcStatus,
+      syncStatus,
+      dxScore,
+    }
+  } catch {
+    return null
+  }
+}
+
 function isInMaintenanceWindow(maintenance?: {
   enabled: boolean
   startHour: number
@@ -237,6 +388,13 @@ export function apply(ctx: Context, config: Config) {
     timeout: config.apiTimeout,
   })
   const logger = ctx.logger('maibot')
+
+  // 插件运行状态标志，用于在插件停止后阻止新的请求
+  let isPluginActive = true
+  ctx.on('dispose', () => {
+    isPluginActive = false
+    logger.info('插件已停止，将不再执行新的定时任务')
+  })
 
   // 使用配置中的值
   const machineInfo = config.machineInfo
@@ -1447,6 +1605,102 @@ export function apply(ctx: Context, config: Config) {
     })
 
   /**
+   * 上传乐曲成绩
+   * 用法: /mai上传乐曲成绩
+   */
+  ctx.command('mai上传乐曲成绩', '上传游戏乐曲成绩')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+      try {
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+
+        // 交互式输入乐曲成绩数据
+        const scoreData = await promptScoreData(session)
+        if (!scoreData) {
+          return '操作已取消'
+        }
+
+        const levelLabel = LEVEL_OPTIONS.find(opt => opt.value === scoreData.level)?.label || scoreData.level.toString()
+        const fcLabel = FC_STATUS_OPTIONS.find(opt => opt.value === scoreData.fcStatus)?.label || scoreData.fcStatus.toString()
+        const syncLabel = SYNC_STATUS_OPTIONS.find(opt => opt.value === scoreData.syncStatus)?.label || scoreData.syncStatus.toString()
+
+        const confirm = await promptYes(
+          session,
+          `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+          `乐曲ID: ${scoreData.musicId}\n` +
+          `难度等级: ${levelLabel} (${scoreData.level})\n` +
+          `达成率: ${scoreData.achievement}\n` +
+          `Full Combo: ${fcLabel} (${scoreData.fcStatus})\n` +
+          `同步状态: ${syncLabel} (${scoreData.syncStatus})\n` +
+          `DX分数: ${scoreData.dxScore}\n` +
+          `确认继续？`
+        )
+        if (!confirm) {
+          return '操作已取消'
+        }
+
+        await session.send('⏳ 正在上传乐曲成绩，请稍候...')
+
+        const result = await api.uploadScore(
+          binding.maiUid,
+          machineInfo.clientId,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.placeName,
+          machineInfo.regionName,
+          scoreData.musicId,
+          scoreData.level,
+          scoreData.achievement,
+          scoreData.fcStatus,
+          scoreData.syncStatus,
+          scoreData.dxScore,
+        )
+
+        // 检查4个状态字段是否都是 true
+        const loginStatus = result.LoginStatus === true
+        const logoutStatus = result.LogoutStatus === true
+        const uploadStatus = result.UploadStatus === true
+        const userLogStatus = result.UserLogStatus === true
+
+        // 如果4个状态都是 true，则上传成功
+        if (loginStatus && logoutStatus && uploadStatus && userLogStatus) {
+          return `✅ 已为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+                 `乐曲ID: ${scoreData.musicId}\n` +
+                 `难度: ${levelLabel}`
+        }
+
+        // 如果4个状态都是 false，显示特殊错误信息
+        if (
+          result.LoginStatus === false &&
+          result.LogoutStatus === false &&
+          result.UploadStatus === false &&
+          result.UserLogStatus === false
+        ) {
+          return `上传错误！请点击获取二维码再试一次！\n错误信息： ${JSON.stringify(result)}`
+        }
+
+        // 其他失败情况，显示详细错误信息
+        return `❌ 上传失败\n错误信息： ${JSON.stringify(result)}`
+      } catch (error: any) {
+        logger.error('上传乐曲成绩失败:', error)
+        if (error?.response) {
+          const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败\n错误信息： ${errorInfo}`
+        }
+        return `❌ 上传失败\n错误信息： ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
    * 上传落雪B50
    * 用法: /mai上传落雪b50 [lxns_code]
    */
@@ -1594,11 +1848,42 @@ export function apply(ctx: Context, config: Config) {
    * 检查单个用户的登录状态
    */
   const checkUserStatus = async (binding: UserBinding) => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，跳过检查用户状态')
+      return
+    }
+
     try {
+      // 在执行 preview 前，再次检查账号是否仍然启用播报且未被锁定（可能在并发执行过程中被修改了）
+      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+      if (currentBinding.length === 0) {
+        logger.debug(`用户 ${binding.userId} 绑定记录已删除，跳过检查`)
+        return
+      }
+      
+      const current = currentBinding[0]
+      if (!current.alertEnabled || current.isLocked) {
+        logger.debug(`用户 ${binding.userId} 播报已关闭或账号已锁定，跳过检查 (alertEnabled: ${current.alertEnabled}, isLocked: ${current.isLocked})`)
+        return
+      }
+
+      // 再次检查插件状态
+      if (!isPluginActive) {
+        logger.debug('插件已停止，取消预览请求')
+        return
+      }
+
+      // 再次检查插件状态
+      if (!isPluginActive) {
+        logger.debug('插件已停止，取消预览请求')
+        return
+      }
+
       logger.debug(`检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的状态`)
       
       // 从数据库读取上一次保存的状态（用于比较）
-      const lastSavedStatus = binding.lastLoginStatus
+      const lastSavedStatus = current.lastLoginStatus
       logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)
       
       // 获取当前登录状态
@@ -1615,19 +1900,30 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 更新数据库中的状态和用户名（每次检查都更新）
-      const updateData: any = {
-        lastLoginStatus: currentLoginStatus,
+      // 再次检查账号状态，确保在更新前账号仍然启用播报且未被锁定
+      const verifyBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+      if (verifyBinding.length > 0 && verifyBinding[0].alertEnabled && !verifyBinding[0].isLocked) {
+        const updateData: any = {
+          lastLoginStatus: currentLoginStatus,
+        }
+        if (preview.UserName) {
+          updateData.userName = preview.UserName
+        }
+        await ctx.database.set('maibot_bindings', { userId: binding.userId }, updateData)
+        logger.debug(`已更新用户 ${binding.userId} 的状态到数据库: ${currentLoginStatus}`)
       }
-      if (preview.UserName) {
-        updateData.userName = preview.UserName
-      }
-      await ctx.database.set('maibot_bindings', { userId: binding.userId }, updateData)
-      logger.debug(`已更新用户 ${binding.userId} 的状态到数据库: ${currentLoginStatus}`)
 
       // 如果状态发生变化，发送提醒消息
+      // 再次检查账号状态，确保在发送消息前账号仍然启用播报且未被锁定
       if (statusChanged) {
+        const finalCheck = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+        if (finalCheck.length === 0 || !finalCheck[0].alertEnabled || finalCheck[0].isLocked) {
+          logger.debug(`用户 ${binding.userId} 在检查过程中播报已关闭或账号已锁定，取消发送消息`)
+          return
+        }
+
         // 发送提醒消息
-        if (binding.guildId && binding.channelId) {
+        if (finalCheck[0].guildId && finalCheck[0].channelId) {
           logger.debug(`准备发送消息到 guildId: ${binding.guildId}, channelId: ${binding.channelId}`)
           
           // 尝试使用第一个可用的bot发送消息
@@ -1649,7 +1945,7 @@ export function apply(ctx: Context, config: Config) {
                 .replace(/{at}/g, mention)
 
               logger.debug(`尝试使用 bot ${bot.selfId} 发送消息: ${message}`)
-              await bot.sendMessage(binding.channelId, message, binding.guildId)
+              await bot.sendMessage(finalCheck[0].channelId, message, finalCheck[0].guildId)
               logger.info(`✅ 已发送状态提醒给用户 ${binding.userId} (${playerName}): ${currentLoginStatus ? '上线' : '下线'}`)
               sent = true
               break // 成功发送后退出循环
@@ -1664,7 +1960,7 @@ export function apply(ctx: Context, config: Config) {
             logger.error(`❌ 所有bot都无法发送消息给用户 ${binding.userId}`)
           }
         } else {
-          logger.warn(`用户 ${binding.userId} 缺少群组信息 (guildId: ${binding.guildId}, channelId: ${binding.channelId})，无法发送提醒`)
+          logger.warn(`用户 ${binding.userId} 缺少群组信息 (guildId: ${finalCheck[0].guildId}, channelId: ${finalCheck[0].channelId})，无法发送提醒`)
         }
       } else {
         if (lastSavedStatus === undefined) {
@@ -1693,6 +1989,12 @@ export function apply(ctx: Context, config: Config) {
    * 使用配置的间隔和并发数检查所有启用播报的用户状态
    */
   const checkLoginStatus = async () => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，取消检查登录状态任务')
+      return
+    }
+
     logger.debug('开始检查登录状态...')
     try {
       // 获取所有绑定记录
@@ -1745,7 +2047,26 @@ export function apply(ctx: Context, config: Config) {
    * 刷新单个锁定账号的登录状态
    */
   const refreshSingleLockedAccount = async (binding: UserBinding) => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，跳过刷新登录状态')
+      return
+    }
+
     try {
+      // 在执行 login 前，再次检查账号是否仍然被锁定（可能在并发执行过程中被解锁了）
+      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+      if (currentBinding.length === 0 || !currentBinding[0].isLocked) {
+        logger.debug(`用户 ${binding.userId} 账号已解锁，跳过刷新登录状态`)
+        return
+      }
+
+      // 再次检查插件状态
+      if (!isPluginActive) {
+        logger.debug('插件已停止，取消登录请求')
+        return
+      }
+
       logger.debug(`刷新用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
       
       // 重新执行登录
@@ -1784,6 +2105,12 @@ export function apply(ctx: Context, config: Config) {
    * 使用并发处理和延迟对锁定的用户重新执行login
    */
   const refreshLockedAccounts = async () => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，取消刷新锁定账号任务')
+      return
+    }
+
     logger.debug('开始刷新锁定账号的登录状态...')
     try {
       // 获取所有锁定的账号
@@ -1799,13 +2126,24 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 使用并发处理，批次之间添加延迟
+      // refreshSingleLockedAccount 内部会检查账号是否仍然被锁定，所以这里直接处理即可
       for (let i = 0; i < lockedBindings.length; i += lockRefreshConcurrency) {
+        // 在每批处理前检查插件状态
+        if (!isPluginActive) {
+          logger.debug('插件已停止，中断刷新锁定账号任务')
+          break
+        }
+
         const batch = lockedBindings.slice(i, i + lockRefreshConcurrency)
-        // 并发处理当前批次
+        // 并发处理当前批次（每个任务内部会检查账号是否仍然被锁定）
         await Promise.all(batch.map(refreshSingleLockedAccount))
         
-        // 如果不是最后一批，添加延迟
+        // 如果不是最后一批，添加延迟（延迟前再次检查插件状态）
         if (i + lockRefreshConcurrency < lockedBindings.length) {
+          if (!isPluginActive) {
+            logger.debug('插件已停止，中断刷新锁定账号任务')
+            break
+          }
           await new Promise(resolve => setTimeout(resolve, lockRefreshDelay))
         }
       }

@@ -397,5 +397,46 @@ export class MaiBotAPI {
     })
     return response.data
   }
+
+  /**
+   * 上传游戏乐曲成绩
+   */
+  async uploadScore(
+    maiUid: string,
+    clientId: string,
+    regionId: number,
+    placeId: number,
+    placeName: string,
+    regionName: string,
+    musicId: number,
+    level: number,
+    achievement: number,
+    fcStatus: number,
+    syncStatus: number,
+    dxScore: number,
+  ): Promise<{
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    UploadStatus?: boolean
+    UserLogStatus?: boolean
+  }> {
+    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/upload_score`, null, {
+      params: {
+        mai_uid: maiUid,
+        client_id: clientId,
+        region_id: regionId,
+        place_id: placeId,
+        place_name: placeName,
+        region_name: regionName,
+        music_id: musicId,
+        level: level,
+        achievement: achievement,
+        fc_status: fcStatus,
+        sync_status: syncStatus,
+        dx_score: dxScore,
+      },
+    })
+    return response.data
+  }
 }
 
