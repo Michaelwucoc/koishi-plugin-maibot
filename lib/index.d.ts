@@ -29,6 +29,8 @@ export interface Config {
     lockRefreshConcurrency?: number;
     confirmTimeout?: number;
     protectionCheckInterval?: number;
+    authLevelForProxy?: number;
+    protectionLockMessage?: string;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
