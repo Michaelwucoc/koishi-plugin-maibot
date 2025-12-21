@@ -33,6 +33,9 @@ export interface Config {
   lockRefreshDelay?: number  // 锁定账号刷新时每次 login 的延迟（毫秒）
   lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
   confirmTimeout?: number  // 确认提示超时时间（毫秒）
+  protectionCheckInterval?: number  // 保护模式检查间隔（毫秒）
+  authLevelForProxy?: number  // 代操作功能需要的auth等级（默认3）
+  protectionLockMessage?: string  // 保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -69,6 +72,9 @@ export const Config: Schema<Config> = Schema.object({
   lockRefreshDelay: Schema.number().default(1000).description('锁定账号刷新时每次 login 的延迟（毫秒），默认1秒（1000毫秒）'),
   lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
   confirmTimeout: Schema.number().default(10000).description('确认提示超时时间（毫秒），默认10秒（10000毫秒）'),
+  protectionCheckInterval: Schema.number().default(60000).description('保护模式检查间隔（毫秒），默认60秒（60000毫秒）'),
+  authLevelForProxy: Schema.number().default(3).description('代操作功能需要的auth等级，默认3'),
+  protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
 })
 
 /**
@@ -382,6 +388,16 @@ function parseLoginStatus(isLogin: string | boolean | number | undefined): boole
   return false
 }
 
+/**
+ * 从文本中提取用户ID（支持@userid格式或直接userid）
+ */
+function extractUserId(text: string | undefined): string | null {
+  if (!text) return null
+  // 移除@符号和空格
+  const cleaned = text.trim().replace(/^@/, '')
+  return cleaned || null
+}
+
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -405,6 +421,8 @@ export function apply(ctx: Context, config: Config) {
   const turnstileToken = config.turnstileToken
   const maintenanceNotice = config.maintenanceNotice
   const confirmTimeout = config.confirmTimeout ?? 10000
+  const authLevelForProxy = config.authLevelForProxy ?? 3
+  const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
 
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
@@ -421,6 +439,52 @@ export function apply(ctx: Context, config: Config) {
   // 在 apply 函数内部使用 promptYesWithConfig 替代 promptYes
   // 为了简化，我们将直接修改所有调用，使用 promptYesWithConfig
   const promptYesLocal = promptYesWithConfig
+
+  /**
+   * 从文本中提取用户ID（支持@userid格式或直接userid）
+   */
+  function extractUserId(text: string | undefined): string | null {
+    if (!text) return null
+    // 移除@符号和空格
+    const cleaned = text.trim().replace(/^@/, '')
+    return cleaned || null
+  }
+
+  /**
+   * 检查权限并获取目标用户绑定
+   * 如果提供了targetUserId，检查权限并使用目标用户
+   * 否则使用当前用户
+   */
+  async function getTargetBinding(
+    session: Session,
+    targetUserIdText: string | undefined,
+  ): Promise<{ binding: UserBinding | null, isProxy: boolean, error: string | null }> {
+    const currentUserId = session.userId
+    const targetUserIdRaw = extractUserId(targetUserIdText)
+    
+    // 如果没有提供目标用户，使用当前用户
+    if (!targetUserIdRaw) {
+      const bindings = await ctx.database.get('maibot_bindings', { userId: currentUserId })
+      if (bindings.length === 0) {
+        return { binding: null, isProxy: false, error: '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定' }
+      }
+      return { binding: bindings[0], isProxy: false, error: null }
+    }
+    
+    // 如果提供了目标用户，需要检查权限
+    const userAuthority = (session.user as any)?.authority ?? 0
+    if (userAuthority < authLevelForProxy) {
+      return { binding: null, isProxy: true, error: `❌ 权限不足，需要auth等级${authLevelForProxy}以上才能代操作` }
+    }
+    
+    // 获取目标用户的绑定
+    const bindings = await ctx.database.get('maibot_bindings', { userId: targetUserIdRaw })
+    if (bindings.length === 0) {
+      return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号` }
+    }
+    
+    return { binding: bindings[0], isProxy: true, error: null }
+  }
 
   const scheduleB50Notification = (session: Session, taskId: string) => {
     const bot = session.bot
@@ -675,25 +739,24 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 查询绑定状态
-   * 用法: /mai状态 [--expired]
+   * 用法: /mai状态 [--expired] [@用户id]
    */
-  ctx.command('mai状态', '查询绑定状态')
+  ctx.command('mai状态 [targetUserId:text]', '查询绑定状态')
+    .userFields(['authority'])
     .option('expired', '--expired  显示过期票券')
-    .action(async ({ session, options }) => {
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
         let statusInfo = `✅ 已绑定账号\n\n` +
                         `用户ID: ${maskUserId(binding.maiUid)}\n` +
                         `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
@@ -847,8 +910,10 @@ export function apply(ctx: Context, config: Config) {
    * 锁定账号（登录保持）
    * 用法: /mai锁定
    */
-  ctx.command('mai锁定', '锁定账号，防止他人登录')
-    .action(async ({ session }) => {
+  ctx.command('mai锁定 [targetUserId:text]', '锁定账号，防止他人登录')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -871,9 +936,11 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 确认操作
-        const confirm = await promptYesLocal(session, `⚠️ 即将锁定账号 ${maskUserId(binding.maiUid)}\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
-        if (!confirm) {
-          return '操作已取消'
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(session, `⚠️ 即将锁定账号 ${maskUserId(binding.maiUid)}\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
 
         await session.send('⏳ 正在锁定账号，请稍候...')
@@ -936,22 +1003,24 @@ export function apply(ctx: Context, config: Config) {
    * 解锁账号（登出）
    * 用法: /mai解锁
    */
-  ctx.command('mai解锁', '解锁账号（仅限通过mai锁定指令锁定的账号）')
+  ctx.command('mai解锁 [targetUserId:text]', '解锁账号（仅限通过mai锁定指令锁定的账号）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
     .alias('mai逃离小黑屋')
     .alias('mai逃离')
-    .action(async ({ session }) => {
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 检查是否通过mai锁定指令锁定
         if (!binding.isLocked) {
@@ -959,9 +1028,12 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 确认操作
-        const confirm = await promptYesLocal(session, `⚠️ 即将解锁账号 ${maskUserId(binding.maiUid)}\n确认继续？`)
-        if (!confirm) {
-          return '操作已取消'
+        if (!options?.bypass) {
+          const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
+          const confirm = await promptYesLocal(session, `⚠️ 即将解锁账号 ${maskUserId(binding.maiUid)}${proxyTip}\n确认继续？`)
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
 
         await session.send('⏳ 正在解锁账号，请稍候...')
@@ -1008,8 +1080,9 @@ export function apply(ctx: Context, config: Config) {
    * 绑定水鱼Token
    * 用法: /mai绑定水鱼 <fishToken>
    */
-  ctx.command('mai绑定水鱼 <fishToken:text>', '绑定水鱼Token用于B50上传')
-    .action(async ({ session }, fishToken) => {
+  ctx.command('mai绑定水鱼 <fishToken:text> [targetUserId:text]', '绑定水鱼Token用于B50上传')
+    .userFields(['authority'])
+    .action(async ({ session }, fishToken, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -1023,15 +1096,14 @@ export function apply(ctx: Context, config: Config) {
         return '❌ Token长度错误，应在127-132字符之间'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
+
+        const userId = binding.userId
 
         // 更新水鱼Token
         await ctx.database.set('maibot_bindings', { userId }, {
@@ -1049,23 +1121,21 @@ export function apply(ctx: Context, config: Config) {
    * 解绑水鱼Token
    * 用法: /mai解绑水鱼
    */
-  ctx.command('mai解绑水鱼', '解绑水鱼Token（保留舞萌DX账号绑定）')
-    .action(async ({ session }) => {
+  ctx.command('mai解绑水鱼 [targetUserId:text]', '解绑水鱼Token（保留舞萌DX账号绑定）')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 检查是否已绑定水鱼Token
         if (!binding.fishToken) {
@@ -1088,8 +1158,9 @@ export function apply(ctx: Context, config: Config) {
    * 绑定落雪代码
    * 用法: /mai绑定落雪 <lxnsCode>
    */
-  ctx.command('mai绑定落雪 <lxnsCode:text>', '绑定落雪代码用于B50上传')
-    .action(async ({ session }, lxnsCode) => {
+  ctx.command('mai绑定落雪 <lxnsCode:text> [targetUserId:text]', '绑定落雪代码用于B50上传')
+    .userFields(['authority'])
+    .action(async ({ session }, lxnsCode, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -1103,15 +1174,14 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 落雪代码长度错误，必须为15个字符'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
+
+        const userId = binding.userId
 
         // 更新落雪代码
         await ctx.database.set('maibot_bindings', { userId }, {
@@ -1129,23 +1199,21 @@ export function apply(ctx: Context, config: Config) {
    * 解绑落雪代码
    * 用法: /mai解绑落雪
    */
-  ctx.command('mai解绑落雪', '解绑落雪代码（保留舞萌DX账号绑定）')
-    .action(async ({ session }) => {
+  ctx.command('mai解绑落雪 [targetUserId:text]', '解绑落雪代码（保留舞萌DX账号绑定）')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 检查是否已绑定落雪代码
         if (!binding.lxnsCode) {
@@ -1166,42 +1234,49 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 发票（2-6倍票）
-   * 用法: /mai发票 [倍数]，默认2
+   * 用法: /mai发票 [倍数] [@用户id]，默认2
    */
-  ctx.command('mai发票 [multiple:number]', '为账号发放功能票（2-6倍）')
-    .action(async ({ session }, multipleInput) => {
+  ctx.command('mai发票 [multiple:number] [targetUserId:text]', '为账号发放功能票（2-6倍）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, multipleInput, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
       const multiple = multipleInput ? Number(multipleInput) : 2
       if (!Number.isInteger(multiple) || multiple < 2 || multiple > 6) {
-        return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3'
+        return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3\n例如：/mai发票 6 @userid'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
-        const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票`
-        const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
-        if (!confirmFirst) {
-          return '操作已取消（第一次确认未通过）'
-        }
+        const userId = binding.userId
+        const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
+        
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票${proxyTip}`
+          const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
+          if (!confirmFirst) {
+            return '操作已取消（第一次确认未通过）'
+          }
 
-        const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
-        if (!confirmSecond) {
-          return '操作已取消（第二次确认未通过）'
-        }
+          const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
+          if (!confirmSecond) {
+            return '操作已取消（第二次确认未通过）'
+          }
 
-        if (multiple >= 3) {
-          const confirmThird = await promptYesLocal(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
-          if (!confirmThird) {
-            return '操作已取消（第三次确认未通过）'
+          if (multiple >= 3) {
+            const confirmThird = await promptYesLocal(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
+            if (!confirmThird) {
+              return '操作已取消（第三次确认未通过）'
+            }
           }
         }
 
@@ -1239,8 +1314,10 @@ export function apply(ctx: Context, config: Config) {
    * 舞里程发放 / 签到
    * 用法: /mai舞里程 <里程数>
    */
-  ctx.command('mai舞里程 <mile:number>', '为账号发放舞里程（maimile）')
-    .action(async ({ session }, mileInput) => {
+  ctx.command('mai舞里程 <mile:number> [targetUserId:text]', '为账号发放舞里程（maimile）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, mileInput, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -1258,23 +1335,28 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 舞里程过大，请控制在 99999 以下'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
-        const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程`
-        const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
-        if (!confirmFirst) {
-          return '操作已取消（第一次确认未通过）'
-        }
+        const userId = binding.userId
+        const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
+        
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程${proxyTip}`
+          const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
+          if (!confirmFirst) {
+            return '操作已取消（第一次确认未通过）'
+          }
 
-        const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
-        if (!confirmSecond) {
-          return '操作已取消（第二次确认未通过）'
+          const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
+          if (!confirmSecond) {
+            return '操作已取消（第二次确认未通过）'
+          }
         }
 
         await session.send('⏳ 已开始请求发放舞里程，服务器响应可能需要数秒，请耐心等待...')
@@ -1313,25 +1395,23 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 上传B50到水鱼
-   * 用法: /mai上传B50
+   * 用法: /mai上传B50 [@用户id]
    */
-  ctx.command('mai上传B50', '上传B50数据到水鱼')
-    .action(async ({ session }) => {
+  ctx.command('mai上传B50 [targetUserId:text]', '上传B50数据到水鱼')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 检查是否已绑定水鱼Token
         if (!binding.fishToken) {
@@ -1379,23 +1459,30 @@ export function apply(ctx: Context, config: Config) {
    * 清空功能票
    * 用法: /mai清票
    */
-  ctx.command('mai清票', '清空账号的所有功能票')
-    .action(async ({ session }) => {
+  ctx.command('mai清票 [targetUserId:text]', '清空账号的所有功能票')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
-        const confirm = await promptYesLocal(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票，确认继续？`)
-        if (!confirm) {
-          return '操作已取消'
+        const userId = binding.userId
+        const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
+        
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票${proxyTip}，确认继续？`)
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
 
         const result = await api.clearTicket(
@@ -1444,23 +1531,21 @@ export function apply(ctx: Context, config: Config) {
    * 查询B50任务状态
    * 用法: /mai查询B50
    */
-  ctx.command('mai查询B50', '查询B50上传任务状态')
-    .action(async ({ session }) => {
+  ctx.command('mai查询B50 [targetUserId:text]', '查询B50上传任务状态')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 查询任务状态
         const taskStatus = await api.getB50TaskStatus(binding.maiUid)
@@ -1502,20 +1587,22 @@ export function apply(ctx: Context, config: Config) {
    * 发收藏品
    * 用法: /mai发收藏品
    */
-  ctx.command('mai发收藏品', '发放收藏品')
-    .action(async ({ session }) => {
+  ctx.command('mai发收藏品 [targetUserId:text]', '发放收藏品')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 交互式选择收藏品类别
         const itemKind = await promptCollectionType(session)
@@ -1582,20 +1669,22 @@ export function apply(ctx: Context, config: Config) {
    * 清收藏品
    * 用法: /mai清收藏品
    */
-  ctx.command('mai清收藏品', '清空收藏品')
-    .action(async ({ session }) => {
+  ctx.command('mai清收藏品 [targetUserId:text]', '清空收藏品')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 交互式选择收藏品类别
         const itemKind = await promptCollectionType(session)
@@ -1623,12 +1712,15 @@ export function apply(ctx: Context, config: Config) {
           return '❌ ID必须是数字，请重新输入'
         }
 
-        const confirm = await promptYesLocal(
-          session,
-          `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
-        )
-        if (!confirm) {
-          return '操作已取消'
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
+          )
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
 
         await session.send('⏳ 正在清空收藏品，请稍候...')
@@ -1662,20 +1754,22 @@ export function apply(ctx: Context, config: Config) {
    * 上传乐曲成绩
    * 用法: /mai上传乐曲成绩
    */
-  ctx.command('mai上传乐曲成绩', '上传游戏乐曲成绩')
-    .action(async ({ session }) => {
+  ctx.command('mai上传乐曲成绩 [targetUserId:text]', '上传游戏乐曲成绩')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
       try {
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 交互式输入乐曲成绩数据
         const scoreData = await promptScoreData(session)
@@ -1687,19 +1781,22 @@ export function apply(ctx: Context, config: Config) {
         const fcLabel = FC_STATUS_OPTIONS.find(opt => opt.value === scoreData.fcStatus)?.label || scoreData.fcStatus.toString()
         const syncLabel = SYNC_STATUS_OPTIONS.find(opt => opt.value === scoreData.syncStatus)?.label || scoreData.syncStatus.toString()
 
-        const confirm = await promptYesLocal(
-          session,
-          `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
-          `乐曲ID: ${scoreData.musicId}\n` +
-          `难度等级: ${levelLabel} (${scoreData.level})\n` +
-          `达成率: ${scoreData.achievement}\n` +
-          `Full Combo: ${fcLabel} (${scoreData.fcStatus})\n` +
-          `同步状态: ${syncLabel} (${scoreData.syncStatus})\n` +
-          `DX分数: ${scoreData.dxScore}\n` +
-          `确认继续？`
-        )
-        if (!confirm) {
-          return '操作已取消'
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
+            `乐曲ID: ${scoreData.musicId}\n` +
+            `难度等级: ${levelLabel} (${scoreData.level})\n` +
+            `达成率: ${scoreData.achievement}\n` +
+            `Full Combo: ${fcLabel} (${scoreData.fcStatus})\n` +
+            `同步状态: ${syncLabel} (${scoreData.syncStatus})\n` +
+            `DX分数: ${scoreData.dxScore}\n` +
+            `确认继续？`
+          )
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
 
         await session.send('⏳ 正在上传乐曲成绩，请稍候...')
@@ -1756,25 +1853,23 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 上传落雪B50
-   * 用法: /mai上传落雪b50 [lxns_code]
+   * 用法: /mai上传落雪b50 [lxns_code] [@用户id]
    */
-  ctx.command('mai上传落雪b50 [lxnsCode:text]', '上传B50数据到落雪')
-    .action(async ({ session }, lxnsCode) => {
+  ctx.command('mai上传落雪b50 [lxnsCode:text] [targetUserId:text]', '上传B50数据到落雪')
+    .userFields(['authority'])
+    .action(async ({ session }, lxnsCode, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 确定使用的落雪代码
         let finalLxnsCode: string
@@ -1834,23 +1929,21 @@ export function apply(ctx: Context, config: Config) {
    * 查询落雪B50任务状态
    * 用法: /mai查询落雪B50
    */
-  ctx.command('mai查询落雪B50', '查询落雪B50上传任务状态')
-    .action(async ({ session }) => {
+  ctx.command('mai查询落雪B50 [targetUserId:text]', '查询落雪B50上传任务状态')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
 
         // 查询任务状态
         const taskStatus = await api.getLxB50TaskStatus(binding.maiUid)
@@ -2282,6 +2375,41 @@ export function apply(ctx: Context, config: Config) {
             lockLoginId: result.LoginId,
           })
           logger.info(`保护模式：用户 ${binding.userId} 账号已自动锁定成功，LoginId: ${result.LoginId}`)
+          
+          // 发送@用户通知
+          const finalBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+          if (finalBinding.length > 0 && finalBinding[0].guildId && finalBinding[0].channelId) {
+            try {
+              // 获取玩家名
+              // 获取玩家名
+              const playerName = preview.UserName || binding.userName || '玩家'
+              const mention = `<at id="${binding.userId}"/>`
+              // 使用配置的消息模板
+              const message = protectionLockMessage
+                .replace(/{playerid}/g, playerName)
+                .replace(/{at}/g, mention)
+              
+              // 尝试使用第一个可用的bot发送消息
+              let sent = false
+              for (const bot of ctx.bots) {
+                try {
+                  await bot.sendMessage(finalBinding[0].channelId, message, finalBinding[0].guildId)
+                  logger.info(`✅ 已发送保护模式锁定成功通知给用户 ${binding.userId} (${playerName})`)
+                  sent = true
+                  break // 成功发送后退出循环
+                } catch (error) {
+                  logger.warn(`bot ${bot.selfId} 发送保护模式通知失败:`, error)
+                  continue
+                }
+              }
+              
+              if (!sent) {
+                logger.error(`❌ 所有bot都无法发送保护模式通知给用户 ${binding.userId}`)
+              }
+            } catch (error) {
+              logger.error(`发送保护模式通知失败:`, error)
+            }
+          }
         } else {
           logger.warn(`保护模式：用户 ${binding.userId} 自动锁定失败，将在下次检查时重试`)
           if (result.UserID === -2) {
@@ -2338,9 +2466,10 @@ export function apply(ctx: Context, config: Config) {
     logger.debug('保护模式检查完成')
   }
 
-  // 启动保护模式检查定时任务，使用与 maialert 相同的间隔
-  logger.info(`账号保护模式检查功能已启动，检查间隔: ${checkInterval}ms (${checkInterval / 1000}秒)，并发数: ${concurrency}`)
-  ctx.setInterval(checkProtectionMode, checkInterval)
+  // 启动保护模式检查定时任务，使用配置的间隔
+  const protectionCheckInterval = config.protectionCheckInterval ?? 60000  // 默认60秒
+  logger.info(`账号保护模式检查功能已启动，检查间隔: ${protectionCheckInterval}ms (${protectionCheckInterval / 1000}秒)，并发数: ${concurrency}`)
+  ctx.setInterval(checkProtectionMode, protectionCheckInterval)
   
   // 立即执行一次检查（延迟35秒，避免与其他检查冲突）
   ctx.setTimeout(() => {
@@ -2520,23 +2649,21 @@ export function apply(ctx: Context, config: Config) {
    * 开关账号保护模式
    * 用法: /mai保护模式 [on|off]
    */
-  ctx.command('mai保护模式 [state:text]', '开关账号保护模式（自动锁定已下线的账号）')
-    .action(async ({ session }, state) => {
+  ctx.command('mai保护模式 [state:text] [targetUserId:text]', '开关账号保护模式（自动锁定已下线的账号）')
+    .userFields(['authority'])
+    .action(async ({ session }, state, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
-
       try {
-        // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
-          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        // 获取目标用户绑定
+        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
         }
 
-        const binding = bindings[0]
+        const userId = binding.userId
         const currentState = binding.protectionMode ?? false
 
         // 如果没有提供参数，显示当前状态
@@ -2597,7 +2724,7 @@ export function apply(ctx: Context, config: Config) {
             // 锁定失败，但仍开启保护模式，系统会在账号下线时自动尝试锁定
             await ctx.database.set('maibot_bindings', { userId }, updateData)
 
-            let message = `✅ 保护模式已开启\n⚠️ 当前无法锁定账号（可能账号正在被使用）\n系统将定期检查账号状态，当检测到账号下线时会自动尝试锁定\n`
+            let message = `✅ 保护模式已开启\n⚠️ 当前无法锁定账号（可能账号正在被使用或者挂哥上号）\n系统将定期检查账号状态，当检测到账号下线时会自动尝试锁定，防止一直小黑屋！\n`
             
             if (result.UserID === -2) {
               message += `\n错误信息：Turnstile校验失败`
