@@ -32,6 +32,7 @@ export interface Config {
   alertConcurrency?: number  // 并发检查数量
   lockRefreshDelay?: number  // 锁定账号刷新时每次 login 的延迟（毫秒）
   lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
+  confirmTimeout?: number  // 确认提示超时时间（毫秒）
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -67,6 +68,7 @@ export const Config: Schema<Config> = Schema.object({
   alertConcurrency: Schema.number().default(3).description('并发检查数量，默认3个用户同时检查'),
   lockRefreshDelay: Schema.number().default(1000).description('锁定账号刷新时每次 login 的延迟（毫秒），默认1秒（1000毫秒）'),
   lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
+  confirmTimeout: Schema.number().default(10000).description('确认提示超时时间（毫秒），默认10秒（10000毫秒）'),
 })
 
 /**
@@ -115,10 +117,12 @@ function buildMention(session: Session): string {
   return `@${session.author?.nickname || session.username || '玩家'}`
 }
 
-async function promptYes(session: Session, message: string, timeout = 10000): Promise<boolean> {
-  await session.send(`${message}\n在${timeout / 1000}秒内输入 Y 确认，其它输入取消`)
+// promptYes 函数将在 apply 函数内部重新定义以使用配置
+async function promptYes(session: Session, message: string, timeout?: number): Promise<boolean> {
+  const actualTimeout = timeout ?? 10000
+  await session.send(`${message}\n在${actualTimeout / 1000}秒内输入 Y 确认，其它输入取消`)
   try {
-    const answer = await session.prompt(timeout)
+    const answer = await session.prompt(actualTimeout)
     return answer?.trim().toUpperCase() === 'Y'
   } catch {
     return false
@@ -400,6 +404,23 @@ export function apply(ctx: Context, config: Config) {
   const machineInfo = config.machineInfo
   const turnstileToken = config.turnstileToken
   const maintenanceNotice = config.maintenanceNotice
+  const confirmTimeout = config.confirmTimeout ?? 10000
+
+  // 创建使用配置的 promptYes 函数
+  const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
+    const actualTimeout = timeout ?? confirmTimeout
+    await session.send(`${message}\n在${actualTimeout / 1000}秒内输入 Y 确认，其它输入取消`)
+    try {
+      const answer = await session.prompt(actualTimeout)
+      return answer?.trim().toUpperCase() === 'Y'
+    } catch {
+      return false
+    }
+  }
+
+  // 在 apply 函数内部使用 promptYesWithConfig 替代 promptYes
+  // 为了简化，我们将直接修改所有调用，使用 promptYesWithConfig
+  const promptYesLocal = promptYesWithConfig
 
   const scheduleB50Notification = (session: Session, taskId: string) => {
     const bot = session.bot
@@ -676,7 +697,7 @@ export function apply(ctx: Context, config: Config) {
         let statusInfo = `✅ 已绑定账号\n\n` +
                         `用户ID: ${maskUserId(binding.maiUid)}\n` +
                         `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
-                        `🚨 使用/maialert查看账号提醒状态\n`
+                        `🚨 /maialert查看账号提醒状态\n`
 
         // 尝试获取最新状态并更新数据库
         try {
@@ -821,7 +842,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 确认操作
-        const confirm = await promptYes(session, `⚠️ 即将锁定账号 ${maskUserId(binding.maiUid)}\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
+        const confirm = await promptYesLocal(session, `⚠️ 即将锁定账号 ${maskUserId(binding.maiUid)}\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
         if (!confirm) {
           return '操作已取消'
         }
@@ -909,7 +930,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 确认操作
-        const confirm = await promptYes(session, `⚠️ 即将解锁账号 ${maskUserId(binding.maiUid)}\n确认继续？`)
+        const confirm = await promptYesLocal(session, `⚠️ 即将解锁账号 ${maskUserId(binding.maiUid)}\n确认继续？`)
         if (!confirm) {
           return '操作已取消'
         }
@@ -1131,18 +1152,18 @@ export function apply(ctx: Context, config: Config) {
 
         const binding = bindings[0]
         const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票`
-        const confirmFirst = await promptYes(session, `${baseTip}\n操作具有风险，请谨慎`)
+        const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
         if (!confirmFirst) {
           return '操作已取消（第一次确认未通过）'
         }
 
-        const confirmSecond = await promptYes(session, '二次确认：若理解风险，请再次输入 Y 执行')
+        const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
         if (!confirmSecond) {
           return '操作已取消（第二次确认未通过）'
         }
 
         if (multiple >= 3) {
-          const confirmThird = await promptYes(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
+          const confirmThird = await promptYesLocal(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
           if (!confirmThird) {
             return '操作已取消（第三次确认未通过）'
           }
@@ -1210,12 +1231,12 @@ export function apply(ctx: Context, config: Config) {
 
         const binding = bindings[0]
         const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程`
-        const confirmFirst = await promptYes(session, `${baseTip}\n操作具有风险，请谨慎`)
+        const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
         if (!confirmFirst) {
           return '操作已取消（第一次确认未通过）'
         }
 
-        const confirmSecond = await promptYes(session, '二次确认：若理解风险，请再次输入 Y 执行')
+        const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
         if (!confirmSecond) {
           return '操作已取消（第二次确认未通过）'
         }
@@ -1336,7 +1357,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const binding = bindings[0]
-        const confirm = await promptYes(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票，确认继续？`)
+        const confirm = await promptYesLocal(session, `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的所有功能票，确认继续？`)
         if (!confirm) {
           return '操作已取消'
         }
@@ -1486,7 +1507,7 @@ export function apply(ctx: Context, config: Config) {
           return '❌ ID必须是数字，请重新输入'
         }
 
-        const confirm = await promptYes(
+        const confirm = await promptYesLocal(
           session,
           `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
         )
@@ -1566,7 +1587,7 @@ export function apply(ctx: Context, config: Config) {
           return '❌ ID必须是数字，请重新输入'
         }
 
-        const confirm = await promptYes(
+        const confirm = await promptYesLocal(
           session,
           `⚠️ 即将清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
         )
@@ -1630,7 +1651,7 @@ export function apply(ctx: Context, config: Config) {
         const fcLabel = FC_STATUS_OPTIONS.find(opt => opt.value === scoreData.fcStatus)?.label || scoreData.fcStatus.toString()
         const syncLabel = SYNC_STATUS_OPTIONS.find(opt => opt.value === scoreData.syncStatus)?.label || scoreData.syncStatus.toString()
 
-        const confirm = await promptYes(
+        const confirm = await promptYesLocal(
           session,
           `⚠️ 即将为 ${maskUserId(binding.maiUid)} 上传乐曲成绩\n` +
           `乐曲ID: ${scoreData.musicId}\n` +

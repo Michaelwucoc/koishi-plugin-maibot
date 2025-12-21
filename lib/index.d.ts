@@ -27,6 +27,7 @@ export interface Config {
     alertConcurrency?: number;
     lockRefreshDelay?: number;
     lockRefreshConcurrency?: number;
+    confirmTimeout?: number;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
