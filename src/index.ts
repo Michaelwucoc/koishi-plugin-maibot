@@ -781,15 +781,37 @@ export function apply(ctx: Context, config: Config) {
               statusInfo += `\n\n🎫 票券情况（总票数: ${totalStock}张）${showExpired ? '（包含过期）' : ''}：\n`
               for (const charge of displayCharges) {
                 const ticketName = getTicketName(charge.chargeId)
-                const purchaseDate = charge.purchaseDate 
-                  ? new Date(charge.purchaseDate).toLocaleString('zh-CN')
-                  : '未知'
-                const validDate = charge.validDate 
-                  ? new Date(charge.validDate).toLocaleString('zh-CN')
-                  : '未知'
                 
-                // 检查是否过期
-                const isExpired = charge.validDate ? new Date(charge.validDate) < now : false
+                // 检查购买日期是否异常（小于2000年）
+                let purchaseDate: string
+                if (charge.purchaseDate) {
+                  const purchaseDateObj = new Date(charge.purchaseDate)
+                  if (purchaseDateObj.getFullYear() < 2000) {
+                    purchaseDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+                  } else {
+                    purchaseDate = purchaseDateObj.toLocaleString('zh-CN')
+                  }
+                } else {
+                  purchaseDate = '未知'
+                }
+                
+                // 检查有效期日期是否异常（小于2000年）
+                let validDate: string
+                if (charge.validDate) {
+                  const validDateObj = new Date(charge.validDate)
+                  if (validDateObj.getFullYear() < 2000) {
+                    validDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+                  } else {
+                    validDate = validDateObj.toLocaleString('zh-CN')
+                  }
+                } else {
+                  validDate = '未知'
+                }
+                
+                // 检查是否过期（只检查正常日期）
+                const isExpired = charge.validDate && new Date(charge.validDate).getFullYear() >= 2000
+                  ? new Date(charge.validDate) < now
+                  : false
                 
                 statusInfo += `\n${ticketName} (ID: ${charge.chargeId})${isExpired ? ' [已过期]' : ''}\n`
                 statusInfo += `  库存: ${charge.stock}\n`
