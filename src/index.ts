@@ -738,6 +738,13 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n❄️ 落雪代码: 未绑定\n使用 /mai绑定落雪 <lxns_code> 进行绑定`
         }
 
+        // 显示保护模式状态
+        if (binding.protectionMode) {
+          statusInfo += `\n\n🛡️ 保护模式: 已开启\n使用 /mai保护模式 off 关闭`
+        } else {
+          statusInfo += `\n\n🛡️ 保护模式: 未开启\n使用 /mai保护模式 on 开启（自动锁定已下线的账号）`
+        }
+
         // 显示锁定状态（不显示LoginId）
         if (binding.isLocked) {
           const lockTime = binding.lockTime 
@@ -971,16 +978,23 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 解锁失败，服务端未返回成功状态，请稍后重试'
         }
 
-        // 清除锁定信息
+        // 清除锁定信息（如果开启了保护模式，不关闭保护模式，让它继续监控）
         await ctx.database.set('maibot_bindings', { userId }, {
           isLocked: false,
           lockTime: null,
           lockLoginId: null,
         })
 
-        return `✅ 账号已解锁\n` +
+        let message = `✅ 账号已解锁\n` +
                `用户ID: ${maskUserId(binding.maiUid)}\n` +
                `建议稍等片刻再登录`
+        
+        // 如果开启了保护模式，提示用户保护模式会继续监控
+        if (binding.protectionMode) {
+          message += `\n\n🛡️ 保护模式仍开启，系统会在检测到账号下线时自动尝试锁定`
+        }
+
+        return message
       } catch (error: any) {
         logger.error('解锁账号失败:', error)
         if (error?.response) {
@@ -2205,6 +2219,136 @@ export function apply(ctx: Context, config: Config) {
   }, 30000) // 30秒后执行首次刷新
 
   /**
+   * 保护模式：自动锁定单个账号（当检测到下线时）
+   */
+  const autoLockAccount = async (binding: UserBinding) => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，跳过自动锁定检查')
+      return
+    }
+
+    try {
+      // 再次检查账号是否仍在保护模式下且未锁定
+      const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+      if (currentBinding.length === 0 || !currentBinding[0].protectionMode || currentBinding[0].isLocked) {
+        logger.debug(`用户 ${binding.userId} 保护模式已关闭或账号已锁定，跳过自动锁定检查`)
+        return
+      }
+
+      // 再次检查插件状态
+      if (!isPluginActive) {
+        logger.debug('插件已停止，取消预览请求')
+        return
+      }
+
+      logger.debug(`保护模式：检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
+      
+      // 获取当前登录状态
+      const preview = await api.preview(binding.maiUid)
+      const currentLoginStatus = parseLoginStatus(preview.IsLogin)
+      logger.debug(`用户 ${binding.userId} 当前登录状态: ${currentLoginStatus}`)
+
+      // 如果账号已下线，尝试自动锁定
+      if (!currentLoginStatus) {
+        logger.info(`保护模式：检测到用户 ${binding.userId} 账号已下线，尝试自动锁定`)
+        
+        // 再次确认账号状态和插件状态
+        const verifyBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+        if (verifyBinding.length === 0 || !verifyBinding[0].protectionMode || verifyBinding[0].isLocked) {
+          logger.debug(`用户 ${binding.userId} 保护模式已关闭或账号已锁定，取消自动锁定`)
+          return
+        }
+
+        if (!isPluginActive) {
+          logger.debug('插件已停止，取消自动锁定请求')
+          return
+        }
+
+        // 执行锁定
+        const result = await api.login(
+          binding.maiUid,
+          machineInfo.regionId,
+          machineInfo.placeId,
+          machineInfo.clientId,
+          turnstileToken,
+        )
+
+        if (result.LoginStatus) {
+          // 锁定成功，更新数据库
+          await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+            isLocked: true,
+            lockTime: new Date(),
+            lockLoginId: result.LoginId,
+          })
+          logger.info(`保护模式：用户 ${binding.userId} 账号已自动锁定成功，LoginId: ${result.LoginId}`)
+        } else {
+          logger.warn(`保护模式：用户 ${binding.userId} 自动锁定失败，将在下次检查时重试`)
+          if (result.UserID === -2) {
+            logger.error(`保护模式：用户 ${binding.userId} 自动锁定失败：Turnstile校验失败`)
+          }
+        }
+      } else {
+        logger.debug(`保护模式：用户 ${binding.userId} 账号仍在线上，无需锁定`)
+      }
+    } catch (error) {
+      logger.error(`保护模式：检查用户 ${binding.userId} 状态失败:`, error)
+    }
+  }
+
+  /**
+   * 保护模式：检查所有启用保护模式的账号，自动锁定已下线的账号
+   */
+  const checkProtectionMode = async () => {
+    // 检查插件是否还在运行
+    if (!isPluginActive) {
+      logger.debug('插件已停止，取消保护模式检查任务')
+      return
+    }
+
+    logger.debug('开始检查保护模式账号...')
+    try {
+      // 获取所有启用保护模式且未锁定的账号
+      const allBindings = await ctx.database.get('maibot_bindings', {})
+      logger.debug(`总共有 ${allBindings.length} 个绑定记录`)
+
+      // 过滤出启用保护模式且未锁定的账号
+      const bindings = allBindings.filter(b => {
+        return b.protectionMode === true && b.isLocked !== true
+      })
+      
+      logger.debug(`启用保护模式的账号数量: ${bindings.length}`)
+      
+      if (bindings.length > 0) {
+        logger.debug(`启用保护模式的账号列表: ${bindings.map(b => `${b.userId}(${maskUserId(b.maiUid)})`).join(', ')}`)
+      }
+      
+      if (bindings.length === 0) {
+        logger.debug('没有启用保护模式的账号，跳过检查')
+        return
+      }
+
+      // 使用并发处理
+      logger.debug(`使用并发数 ${concurrency} 检查 ${bindings.length} 个保护模式账号`)
+      await processBatch(bindings, concurrency, autoLockAccount)
+      
+    } catch (error) {
+      logger.error('检查保护模式账号失败:', error)
+    }
+    logger.debug('保护模式检查完成')
+  }
+
+  // 启动保护模式检查定时任务，使用与 maialert 相同的间隔
+  logger.info(`账号保护模式检查功能已启动，检查间隔: ${checkInterval}ms (${checkInterval / 1000}秒)，并发数: ${concurrency}`)
+  ctx.setInterval(checkProtectionMode, checkInterval)
+  
+  // 立即执行一次检查（延迟35秒，避免与其他检查冲突）
+  ctx.setTimeout(() => {
+    logger.info('执行首次保护模式检查...')
+    checkProtectionMode()
+  }, 35000) // 35秒后执行首次检查
+
+  /**
    * 开关播报功能
    * 用法: /maialert [on|off]
    */
@@ -2368,6 +2512,110 @@ export function apply(ctx: Context, config: Config) {
         return resultMessage
       } catch (error: any) {
         logger.error('设置他人播报状态失败:', error)
+        return `❌ 操作失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 开关账号保护模式
+   * 用法: /mai保护模式 [on|off]
+   */
+  ctx.command('mai保护模式 [state:text]', '开关账号保护模式（自动锁定已下线的账号）')
+    .action(async ({ session }, state) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const userId = session.userId
+
+      try {
+        // 检查是否已绑定账号
+        const bindings = await ctx.database.get('maibot_bindings', { userId })
+        
+        if (bindings.length === 0) {
+          return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+
+        const binding = bindings[0]
+        const currentState = binding.protectionMode ?? false
+
+        // 如果没有提供参数，显示当前状态
+        if (!state) {
+          return `当前保护模式状态: ${currentState ? '✅ 已开启' : '❌ 已关闭'}\n\n使用 /mai保护模式 on 开启\n使用 /mai保护模式 off 关闭\n\n开启后会自动锁定账号，如果锁定失败会在账号下线时自动尝试锁定`
+        }
+
+        const newState = state.toLowerCase() === 'on' || state.toLowerCase() === 'true' || state === '1'
+
+        // 如果状态没有变化
+        if (currentState === newState) {
+          return `保护模式已经是 ${newState ? '开启' : '关闭'} 状态`
+        }
+
+        logger.info(`用户 ${userId} ${newState ? '开启' : '关闭'}保护模式`)
+
+        if (newState) {
+          // 开启保护模式：尝试立即锁定账号
+          if (binding.isLocked) {
+            // 如果已经锁定，直接开启保护模式
+            await ctx.database.set('maibot_bindings', { userId }, {
+              protectionMode: true,
+            })
+            return `✅ 保护模式已开启\n账号当前已锁定，保护模式将在账号解锁后生效`
+          }
+
+          // 尝试锁定账号
+          await session.send('⏳ 正在尝试锁定账号，请稍候...')
+
+          const result = await api.login(
+            binding.maiUid,
+            machineInfo.regionId,
+            machineInfo.placeId,
+            machineInfo.clientId,
+            turnstileToken,
+          )
+
+          const updateData: any = {
+            protectionMode: true,
+          }
+
+          if (result.LoginStatus) {
+            // 锁定成功
+            updateData.isLocked = true
+            updateData.lockTime = new Date()
+            updateData.lockLoginId = result.LoginId
+            
+            // 如果之前开启了推送，锁定时自动关闭
+            if (binding.alertEnabled === true) {
+              updateData.alertEnabled = false
+              logger.info(`用户 ${userId} 保护模式锁定账号，已自动关闭 maialert 推送`)
+            }
+
+            await ctx.database.set('maibot_bindings', { userId }, updateData)
+
+            return `✅ 保护模式已开启\n账号已成功锁定，将保持登录状态防止他人登录`
+          } else {
+            // 锁定失败，但仍开启保护模式，系统会在账号下线时自动尝试锁定
+            await ctx.database.set('maibot_bindings', { userId }, updateData)
+
+            let message = `✅ 保护模式已开启\n⚠️ 当前无法锁定账号（可能账号正在被使用）\n系统将定期检查账号状态，当检测到账号下线时会自动尝试锁定\n`
+            
+            if (result.UserID === -2) {
+              message += `\n错误信息：Turnstile校验失败`
+            } else {
+              message += `\n错误信息：服务端未返回成功状态`
+            }
+
+            return message
+          }
+        } else {
+          // 关闭保护模式
+          await ctx.database.set('maibot_bindings', { userId }, {
+            protectionMode: false,
+          })
+          return `✅ 保护模式已关闭\n已停止自动锁定功能`
+        }
+      } catch (error: any) {
+        logger.error('开关保护模式失败:', error)
         return `❌ 操作失败: ${error?.message || '未知错误'}`
       }
     })

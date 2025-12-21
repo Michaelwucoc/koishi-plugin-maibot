@@ -16,6 +16,7 @@ export interface UserBinding {
     isLocked?: boolean;
     lockTime?: Date;
     lockLoginId?: number;
+    protectionMode?: boolean;
 }
 declare module 'koishi' {
     interface Tables {
