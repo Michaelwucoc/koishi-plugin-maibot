@@ -17,6 +17,7 @@ export interface UserBinding {
   isLocked?: boolean  // 是否锁定（通过mai锁定指令）
   lockTime?: Date  // 锁定时间
   lockLoginId?: number  // 锁定时的LoginId
+  protectionMode?: boolean  // 是否开启保护模式
 }
 
 declare module 'koishi' {
@@ -43,6 +44,7 @@ export function extendDatabase(ctx: Context) {
     isLocked: 'boolean',  // 是否锁定
     lockTime: 'timestamp',  // 锁定时间
     lockLoginId: 'unsigned',  // 锁定时的LoginId
+    protectionMode: 'boolean',  // 是否开启保护模式
   }, {
     primary: 'id',
     autoInc: true,
