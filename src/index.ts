@@ -388,16 +388,6 @@ function parseLoginStatus(isLogin: string | boolean | number | undefined): boole
   return false
 }
 
-/**
- * 从文本中提取用户ID（支持@userid格式或直接userid）
- */
-function extractUserId(text: string | undefined): string | null {
-  if (!text) return null
-  // 移除@符号和空格
-  const cleaned = text.trim().replace(/^@/, '')
-  return cleaned || null
-}
-
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -441,13 +431,37 @@ export function apply(ctx: Context, config: Config) {
   const promptYesLocal = promptYesWithConfig
 
   /**
-   * 从文本中提取用户ID（支持@userid格式或直接userid）
+   * 从文本中提取用户ID（支持@userid格式、<at id="数字"/>格式或直接userid）
    */
   function extractUserId(text: string | undefined): string | null {
     if (!text) return null
-    // 移除@符号和空格
-    const cleaned = text.trim().replace(/^@/, '')
-    return cleaned || null
+    const trimmed = text.trim()
+    
+    // 尝试匹配 <at id="数字"/> 格式
+    const atMatch = trimmed.match(/<at\s+id=["'](\d+)["']\s*\/?>/i)
+    if (atMatch && atMatch[1]) {
+      logger.debug(`从 @mention 标签中提取到用户ID: ${atMatch[1]}`)
+      return atMatch[1]
+    }
+    
+    // 移除@符号和空格，然后提取所有数字
+    const cleaned = trimmed.replace(/^@/, '').trim()
+    
+    // 如果只包含数字，直接返回
+    if (/^\d+$/.test(cleaned)) {
+      logger.debug(`提取到纯数字用户ID: ${cleaned}`)
+      return cleaned
+    }
+    
+    // 如果包含其他字符，尝试提取其中的数字
+    const numberMatch = cleaned.match(/\d+/)
+    if (numberMatch) {
+      logger.debug(`从文本 "${cleaned}" 中提取到数字ID: ${numberMatch[0]}`)
+      return numberMatch[0]
+    }
+    
+    logger.debug(`无法从文本 "${trimmed}" 中提取用户ID`)
+    return null
   }
 
   /**
@@ -460,11 +474,16 @@ export function apply(ctx: Context, config: Config) {
     targetUserIdText: string | undefined,
   ): Promise<{ binding: UserBinding | null, isProxy: boolean, error: string | null }> {
     const currentUserId = session.userId
+    logger.debug(`getTargetBinding: 原始输入 = "${targetUserIdText}", 当前用户ID = ${currentUserId}`)
+    
     const targetUserIdRaw = extractUserId(targetUserIdText)
+    logger.debug(`getTargetBinding: 提取后的用户ID = "${targetUserIdRaw}"`)
     
     // 如果没有提供目标用户，使用当前用户
     if (!targetUserIdRaw) {
+      logger.debug(`getTargetBinding: 未提供目标用户，使用当前用户 ${currentUserId}`)
       const bindings = await ctx.database.get('maibot_bindings', { userId: currentUserId })
+      logger.debug(`getTargetBinding: 当前用户绑定数量 = ${bindings.length}`)
       if (bindings.length === 0) {
         return { binding: null, isProxy: false, error: '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定' }
       }
@@ -473,16 +492,21 @@ export function apply(ctx: Context, config: Config) {
     
     // 如果提供了目标用户，需要检查权限
     const userAuthority = (session.user as any)?.authority ?? 0
+    logger.debug(`getTargetBinding: 当前用户权限 = ${userAuthority}, 需要权限 = ${authLevelForProxy}`)
     if (userAuthority < authLevelForProxy) {
       return { binding: null, isProxy: true, error: `❌ 权限不足，需要auth等级${authLevelForProxy}以上才能代操作` }
     }
     
     // 获取目标用户的绑定
+    logger.debug(`getTargetBinding: 查询目标用户 ${targetUserIdRaw} 的绑定`)
     const bindings = await ctx.database.get('maibot_bindings', { userId: targetUserIdRaw })
+    logger.debug(`getTargetBinding: 目标用户绑定数量 = ${bindings.length}`)
     if (bindings.length === 0) {
-      return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号` }
+      logger.warn(`getTargetBinding: 用户 ${targetUserIdRaw} 尚未绑定账号（原始输入: "${targetUserIdText}"）`)
+      return { binding: null, isProxy: true, error: `❌ 用户 ${targetUserIdRaw} 尚未绑定账号\n\n[Debug] 原始输入: "${targetUserIdText}"\n提取的ID: "${targetUserIdRaw}"\n请确认用户ID是否正确` }
     }
     
+    logger.debug(`getTargetBinding: 成功获取目标用户 ${targetUserIdRaw} 的绑定`)
     return { binding: bindings[0], isProxy: true, error: null }
   }
 
