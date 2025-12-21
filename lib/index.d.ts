@@ -28,6 +28,7 @@ export interface Config {
     lockRefreshDelay?: number;
     lockRefreshConcurrency?: number;
     confirmTimeout?: number;
+    protectionCheckInterval?: number;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
