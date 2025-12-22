@@ -905,19 +905,21 @@ export function apply(ctx: Context, config: Config) {
             const romVersionMatch = preview.RomVersion.match(/^(\d+\.\d+)/)
             const romVersion = romVersionMatch ? romVersionMatch[1] : preview.RomVersion
             
-            // 数据版本：取最后两个数字，转换为字母，如 1.50.01 -> 01 -> A, 1.50.02 -> 02 -> B
+            // 数据版本：取前两个数字 + 最后两个数字转换为字母，如 1.50.09 -> 1.50 - I
+            const dataVersionPrefixMatch = preview.DataVersion.match(/^(\d+\.\d+)/)
+            const dataVersionPrefix = dataVersionPrefixMatch ? dataVersionPrefixMatch[1] : preview.DataVersion
+            
             // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
             const dataVersionMatch = preview.DataVersion.match(/(\d{2})(?:\.\d+)?$/)
             let dataVersionLetter = ''
             if (dataVersionMatch) {
               const lastTwoDigits = parseInt(dataVersionMatch[1], 10)
-              // 01 -> A (65), 02 -> B (66), ..., 09 -> I (73), 10 -> J (74), ...
-              // 如果数字大于 26，使用循环：27 -> A, 28 -> B, ...
-              const letterIndex = ((lastTwoDigits - 1) % 26) + 1
-              dataVersionLetter = String.fromCharCode(64 + letterIndex) // A=65
+              // 01 -> A (65), 02 -> B (66), ..., 09 -> I (73)
+              dataVersionLetter = String.fromCharCode(64 + lastTwoDigits) // A=65
             }
             
-            versionInfo = `版本: ${romVersion}${dataVersionLetter}\n`
+            versionInfo = `机台版本: ${romVersion}\n` +
+                         `数据版本: ${dataVersionPrefix} - ${dataVersionLetter}\n`
           }
           
           statusInfo += `\n📊 账号信息：\n` +
