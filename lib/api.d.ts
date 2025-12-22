@@ -41,6 +41,8 @@ export declare class MaiBotAPI {
         LastPlayDate: string;
         Rating: string;
         UserName: string;
+        DataVersion?: string;
+        RomVersion?: string;
     }>;
     /**
      * 用户登录（锁号）
