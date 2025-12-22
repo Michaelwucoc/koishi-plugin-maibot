@@ -910,12 +910,25 @@ export function apply(ctx: Context, config: Config) {
             const dataVersionPrefix = dataVersionPrefixMatch ? dataVersionPrefixMatch[1] : preview.DataVersion
             
             // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
-            const dataVersionMatch = preview.DataVersion.match(/(\d{2})(?:\.\d+)?$/)
-            let dataVersionLetter = ''
+            // 匹配最后一个点后的数字（确保只匹配版本号末尾）
+            let dataVersionLetter = '';
+            // 匹配最后一个点后的1-2位数字
+            const dataVersionMatch = preview.DataVersion.match(/\.(\d{1,2})$/);
+            
             if (dataVersionMatch) {
-              const lastTwoDigits = parseInt(dataVersionMatch[1], 10)
-              // 01 -> A (65), 02 -> B (66), ..., 09 -> I (73)
-              dataVersionLetter = String.fromCharCode(64 + lastTwoDigits) // A=65
+              // 提取数字字符串，如 "09" 或 "9"
+              const digitsStr = dataVersionMatch[1];
+              // 转换为数字，如 "09" -> 9, "9" -> 9
+              const versionNumber = parseInt(digitsStr, 10);
+              
+              // 验证转换是否正确
+              if (!isNaN(versionNumber) && versionNumber >= 1) {
+                // 01 -> A, 02 -> B, ..., 09 -> I, 10 -> J, ..., 26 -> Z
+                // 使用模运算确保在 A-Z 范围内循环（27 -> A, 28 -> B, ...）
+                const letterIndex = ((versionNumber - 1) % 26) + 1;
+                // 转换为大写字母：A=65, B=66, ..., Z=90
+                dataVersionLetter = String.fromCharCode(64 + letterIndex).toUpperCase();
+              }
             }
             
             versionInfo = `机台版本: ${romVersion}\n` +
