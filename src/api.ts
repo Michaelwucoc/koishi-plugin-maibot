@@ -381,21 +381,31 @@ export class MaiBotAPI {
   /**
    * 查询票券情况
    */
-  async getCharge(maiUid: string): Promise<{
-    length: number
-    userChargeList: Array<{
+  async getCharge(maiUid: string, token: string): Promise<{
+    ChargeStatus: boolean
+    userChargeList?: Array<{
       chargeId: number
-      extNum1: number
       purchaseDate: string
       stock: number
       validDate: string
     }>
-    userId: number
+    UserID?: number
   }> {
-    const response = await this.client.get('/api/charge', {
-      params: { mai_uid: maiUid },
-    })
-    return response.data
+    try {
+      const response = await this.client.post('/api/get_charge', {
+        token,
+      }, {
+        params: { mai_uid: maiUid },
+      })
+      return response.data
+    } catch (error: any) {
+      // 处理 401 错误（Turnstile 校验失败）
+      if (error?.response?.status === 401 && error?.response?.data?.UserID === -2) {
+        return { UserID: -2, ChargeStatus: false }
+      }
+      // 其他错误重新抛出
+      throw error
+    }
   }
 
   /**
