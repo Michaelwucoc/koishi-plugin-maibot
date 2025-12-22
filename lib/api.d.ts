@@ -148,16 +148,15 @@ export declare class MaiBotAPI {
     /**
      * 查询票券情况
      */
-    getCharge(maiUid: string): Promise<{
-        length: number;
-        userChargeList: Array<{
+    getCharge(maiUid: string, token: string): Promise<{
+        ChargeStatus: boolean;
+        userChargeList?: Array<{
             chargeId: number;
-            extNum1: number;
             purchaseDate: string;
             stock: number;
             validDate: string;
         }>;
-        userId: number;
+        UserID?: number;
     }>;
     /**
      * 上传游戏乐曲成绩

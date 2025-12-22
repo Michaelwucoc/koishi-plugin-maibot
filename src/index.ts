@@ -447,16 +447,19 @@ export function apply(ctx: Context, config: Config) {
     return originalMessage || ''
   }
 
-  // 维护模式中间件：拦截所有 mai 开头的命令
+  // 维护模式中间件：拦截所有 maibot 插件的命令
   ctx.middleware(async (session, next) => {
-    // 检查是否是 mai 开头的命令
-    const content = session.content?.trim() || ''
-    // 匹配 /mai 或 mai 开头的命令
-    if (content.match(/^\/?mai\S*/)) {
-      if (maintenanceMode) {
-        return maintenanceMessage
-      }
+    if (!maintenanceMode) {
+      return next()
     }
+    
+    // 检查是否是 maibot 插件的命令（所有 mai 开头的命令，包括 maialert）
+    const content = session.content?.trim() || ''
+    // 匹配所有 mai 开头的命令：/mai、mai、/maialert、maialert 等
+    if (content.match(/^\/?mai/i)) {
+      return maintenanceMessage
+    }
+    
     return next()
   })
 
@@ -945,8 +948,15 @@ export function apply(ctx: Context, config: Config) {
 
         // 显示票券信息
         try {
-          const chargeInfo = await api.getCharge(binding.maiUid)
-          if (chargeInfo && chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
+          const chargeInfo = await api.getCharge(binding.maiUid, turnstileToken)
+          
+          // 检查校验失败
+          if (chargeInfo.UserID === -2) {
+            statusInfo += `\n\n🎫 票券情况: 获取失败（Turnstile校验失败）`
+          } else if (!chargeInfo.ChargeStatus) {
+            // 获取失败
+            statusInfo += `\n\n🎫 票券情况: 获取失败`
+          } else if (chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
             const now = new Date()
             const showExpired = options?.expired || false  // 是否显示过期票券
             
@@ -1015,6 +1025,7 @@ export function apply(ctx: Context, config: Config) {
               statusInfo += `\n\n🎫 票券情况: 总票数 ${totalStock}张${showExpired ? '（包含过期）' : ''}`
             }
           } else {
+            // ChargeStatus 为 true 但没有 userChargeList 或为空
             statusInfo += `\n\n🎫 票券情况: 暂无票券`
           }
         } catch (error) {
