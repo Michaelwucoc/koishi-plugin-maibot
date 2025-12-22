@@ -36,6 +36,8 @@ export interface Config {
   protectionCheckInterval?: number  // 保护模式检查间隔（毫秒）
   authLevelForProxy?: number  // 代操作功能需要的auth等级（默认3）
   protectionLockMessage?: string  // 保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）
+  maintenanceMode?: boolean  // 维护模式开关
+  maintenanceMessage?: string  // 维护模式提示消息
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -75,6 +77,8 @@ export const Config: Schema<Config> = Schema.object({
   protectionCheckInterval: Schema.number().default(60000).description('保护模式检查间隔（毫秒），默认60秒（60000毫秒）'),
   authLevelForProxy: Schema.number().default(3).description('代操作功能需要的auth等级，默认3'),
   protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
+  maintenanceMode: Schema.boolean().default(false).description('维护模式开关，开启时所有指令都会提示维护信息'),
+  maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/').description('维护模式提示消息'),
 })
 
 /**
@@ -413,6 +417,8 @@ export function apply(ctx: Context, config: Config) {
   const confirmTimeout = config.confirmTimeout ?? 10000
   const authLevelForProxy = config.authLevelForProxy ?? 3
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
+  const maintenanceMode = config.maintenanceMode ?? false
+  const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/'
 
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
@@ -429,6 +435,30 @@ export function apply(ctx: Context, config: Config) {
   // 在 apply 函数内部使用 promptYesWithConfig 替代 promptYes
   // 为了简化，我们将直接修改所有调用，使用 promptYesWithConfig
   const promptYesLocal = promptYesWithConfig
+
+  /**
+   * 检查维护模式并返回相应的消息
+   * 如果维护模式开启，返回维护消息；否则返回原始消息
+   */
+  function getMaintenanceModeMessage(originalMessage?: string): string {
+    if (maintenanceMode) {
+      return maintenanceMessage
+    }
+    return originalMessage || ''
+  }
+
+  // 维护模式中间件：拦截所有 mai 开头的命令
+  ctx.middleware(async (session, next) => {
+    // 检查是否是 mai 开头的命令
+    const content = session.content?.trim() || ''
+    // 匹配 /mai 或 mai 开头的命令
+    if (content.match(/^\/?mai\S*/)) {
+      if (maintenanceMode) {
+        return maintenanceMessage
+      }
+    }
+    return next()
+  })
 
   /**
    * 从文本中提取用户ID（支持@userid格式、<at id="数字"/>格式或直接userid）
@@ -655,6 +685,69 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
+   * 帮助指令
+   * 用法: /mai 或 /mai帮助
+   */
+  ctx.command('mai [help:text]', '查看所有可用指令')
+    .alias('mai帮助')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      const helpText = `📖 舞萌DX机器人指令帮助
+
+🔐 账号管理：
+  /mai绑定 <SGWCMAID...> - 绑定舞萌DX账号
+  /mai解绑 - 解绑舞萌DX账号
+  /mai状态 [@用户] - 查询绑定状态（可查看他人，需要权限）
+
+🔒 账号锁定：
+  /mai锁定 [@用户] - 锁定账号，防止他人登录
+  /mai解锁 [@用户] - 解锁账号（仅限通过mai锁定指令锁定的账号）
+  /mai逃离 - 解锁账号的别名
+
+🐟 水鱼B50：
+  /mai绑定水鱼 <token> [@用户] - 绑定水鱼Token用于B50上传
+  /mai解绑水鱼 [@用户] - 解绑水鱼Token
+  /mai上传B50 [@用户] - 上传B50数据到水鱼
+  /mai查询B50 [@用户] - 查询B50上传任务状态
+
+❄️ 落雪B50：
+  /mai绑定落雪 <lxns_code> [@用户] - 绑定落雪代码用于B50上传
+  /mai解绑落雪 [@用户] - 解绑落雪代码
+  /mai上传落雪b50 [lxns_code] [@用户] - 上传B50数据到落雪
+  /mai查询落雪B50 [@用户] - 查询落雪B50上传任务状态
+
+🎫 票券管理：
+  /mai发票 [倍数] [@用户] - 为账号发放功能票（2-6倍，默认2倍）
+  /mai清票 [@用户] - 清空账号的所有功能票
+
+🎮 游戏功能：
+  /mai舞里程 <里程数> [@用户] - 为账号发放舞里程（必须是1000的倍数）
+  /mai发收藏品 [@用户] - 发放收藏品（交互式选择）
+  /mai清收藏品 [@用户] - 清空收藏品（交互式选择）
+  /mai上传乐曲成绩 [@用户] - 上传游戏乐曲成绩（交互式输入）
+
+🔔 提醒功能：
+  /maialert [on|off] - 开关账号状态播报功能
+  /maialert set <用户ID> [on|off] - 设置他人的播报状态（需要auth等级3以上）
+
+🛡️ 保护模式：
+  /mai保护模式 [on|off] [@用户] - 开关账号保护模式（自动锁定已下线的账号）
+
+💬 交流与反馈：
+如有问题或建议，请访问：https://awmc.cc/category/15/
+
+📝 说明：
+  - 所有指令支持 [@用户] 参数进行代操作（需要权限）
+  - 部分指令支持 -bypass 参数绕过确认
+  - 使用 /mai状态 --expired 可查看过期票券`
+
+      return helpText
+    })
+
+  /**
    * 绑定用户
    * 用法: /mai绑定 <SGWCMAID...>
    */
@@ -724,10 +817,13 @@ export function apply(ctx: Context, config: Config) {
                `绑定时间: ${new Date().toLocaleString('zh-CN')}`
       } catch (error: any) {
         ctx.logger('maibot').error('绑定失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 绑定失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -757,7 +853,10 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 解绑成功！\n已解绑的用户ID: ${maskUserId(bindings[0].maiUid)}`
       } catch (error: any) {
         ctx.logger('maibot').error('解绑失败:', error)
-        return `❌ 解绑失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 解绑失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -926,7 +1025,10 @@ export function apply(ctx: Context, config: Config) {
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询状态失败:', error)
-        return `❌ 查询失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1013,13 +1115,16 @@ export function apply(ctx: Context, config: Config) {
         return message
       } catch (error: any) {
         logger.error('锁定账号失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
         if (error?.response) {
           if (error.response.status === 401) {
-            return '❌ 锁定失败：Turnstile校验失败，请检查token配置'
+            return `❌ 锁定失败：Turnstile校验失败，请检查token配置\n\n${maintenanceMessage}`
           }
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 锁定失败: ${error?.message || '未知错误'}`
+        return `❌ 锁定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1093,10 +1198,13 @@ export function apply(ctx: Context, config: Config) {
         return message
       } catch (error: any) {
         logger.error('解锁账号失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 解锁失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 解锁失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1137,7 +1245,10 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 水鱼Token绑定成功！\nToken: ${fishToken.substring(0, 8)}***${fishToken.substring(fishToken.length - 4)}`
       } catch (error: any) {
         ctx.logger('maibot').error('绑定水鱼Token失败:', error)
-        return `❌ 绑定失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1174,7 +1285,10 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 水鱼Token解绑成功！\n已解绑的Token: ${binding.fishToken.substring(0, 8)}***${binding.fishToken.substring(binding.fishToken.length - 4)}\n\n舞萌DX账号绑定仍保留`
       } catch (error: any) {
         ctx.logger('maibot').error('解绑水鱼Token失败:', error)
-        return `❌ 解绑失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 解绑失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1215,7 +1329,10 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 落雪代码绑定成功！\n代码: ${lxnsCode.substring(0, 5)}***${lxnsCode.substring(lxnsCode.length - 3)}`
       } catch (error: any) {
         ctx.logger('maibot').error('绑定落雪代码失败:', error)
-        return `❌ 绑定失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1252,7 +1369,10 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 落雪代码解绑成功！\n已解绑的代码: ${binding.lxnsCode.substring(0, 5)}***${binding.lxnsCode.substring(binding.lxnsCode.length - 3)}\n\n舞萌DX账号绑定仍保留`
       } catch (error: any) {
         ctx.logger('maibot').error('解绑落雪代码失败:', error)
-        return `❌ 解绑失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 解绑失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1327,10 +1447,13 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
       } catch (error: any) {
         logger.error('发票失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 发票失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 发票失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1410,10 +1533,13 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${mile} 点舞里程${current}`
       } catch (error: any) {
         logger.error('发舞里程失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 发放舞里程失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 发放舞里程失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1463,6 +1589,9 @@ export function apply(ctx: Context, config: Config) {
         return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
         // 处理请求超时类错误，统一提示
         if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
           let msg = '水鱼B50任务 上传失败，请稍后再试一次。'
@@ -1470,12 +1599,13 @@ export function apply(ctx: Context, config: Config) {
           if (maintenanceMsg) {
             msg += `\n${maintenanceMsg}`
           }
+          msg += `\n\n${maintenanceMessage}`
           return msg
         }
         if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 上传失败: ${error?.message || '未知错误'}`
+        return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1543,11 +1673,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 清票失败\n错误信息： ${JSON.stringify(result)}`
       } catch (error: any) {
         logger.error('清票失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
         if (error?.response) {
           const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
-          return `❌ API请求失败\n错误信息： ${errorInfo}`
+          return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
         }
-        return `❌ 清票失败\n错误信息： ${error?.message || '未知错误'}`
+        return `❌ 清票失败\n错误信息： ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1603,7 +1736,10 @@ export function apply(ctx: Context, config: Config) {
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询B50任务状态失败:', error)
-        return `❌ 查询失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1682,10 +1818,13 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 已为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
       } catch (error: any) {
         logger.error('发收藏品失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 发放失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 发放失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1767,10 +1906,13 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 已清空 ${maskUserId(binding.maiUid)} 的收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
       } catch (error: any) {
         logger.error('清收藏品失败:', error)
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+        if (maintenanceMode) {
+          return maintenanceMessage
         }
-        return `❌ 清空失败: ${error?.message || '未知错误'}`
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 清空失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1867,11 +2009,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 上传失败\n错误信息： ${JSON.stringify(result)}`
       } catch (error: any) {
         logger.error('上传乐曲成绩失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
         if (error?.response) {
           const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
-          return `❌ API请求失败\n错误信息： ${errorInfo}`
+          return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
         }
-        return `❌ 上传失败\n错误信息： ${error?.message || '未知错误'}`
+        return `❌ 上传失败\n错误信息： ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -1933,6 +2078,9 @@ export function apply(ctx: Context, config: Config) {
         return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
       } catch (error: any) {
         ctx.logger('maibot').error('上传落雪B50失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
         // 处理请求超时类错误，统一提示
         if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
           let msg = '落雪B50任务 上传失败，请稍后再试一次。'
@@ -1940,12 +2088,13 @@ export function apply(ctx: Context, config: Config) {
           if (maintenanceMsg) {
             msg += `\n${maintenanceMsg}`
           }
+          msg += `\n\n${maintenanceMessage}`
           return msg
         }
         if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 上传失败: ${error?.message || '未知错误'}`
+        return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -2001,7 +2150,10 @@ export function apply(ctx: Context, config: Config) {
         return statusInfo
       } catch (error: any) {
         ctx.logger('maibot').error('查询落雪B50任务状态失败:', error)
-        return `❌ 查询失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -2584,7 +2736,10 @@ export function apply(ctx: Context, config: Config) {
         return resultMessage
       } catch (error: any) {
         logger.error('开关播报功能失败:', error)
-        return `❌ 操作失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -2665,7 +2820,10 @@ export function apply(ctx: Context, config: Config) {
         return resultMessage
       } catch (error: any) {
         logger.error('设置他人播报状态失败:', error)
-        return `❌ 操作失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
@@ -2767,7 +2925,10 @@ export function apply(ctx: Context, config: Config) {
         }
       } catch (error: any) {
         logger.error('开关保护模式失败:', error)
-        return `❌ 操作失败: ${error?.message || '未知错误'}`
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 }
