@@ -898,9 +898,32 @@ export function apply(ctx: Context, config: Config) {
             rating: preview.Rating,
           })
           
+          // 格式化版本信息
+          let versionInfo = ''
+          if (preview.RomVersion && preview.DataVersion) {
+            // 机台版本：取前两个数字，如 1.52.00 -> 1.52
+            const romVersionMatch = preview.RomVersion.match(/^(\d+\.\d+)/)
+            const romVersion = romVersionMatch ? romVersionMatch[1] : preview.RomVersion
+            
+            // 数据版本：取最后两个数字，转换为字母，如 1.50.01 -> 01 -> A, 1.50.02 -> 02 -> B
+            // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
+            const dataVersionMatch = preview.DataVersion.match(/(\d{2})(?:\.\d+)?$/)
+            let dataVersionLetter = ''
+            if (dataVersionMatch) {
+              const lastTwoDigits = parseInt(dataVersionMatch[1], 10)
+              // 01 -> A (65), 02 -> B (66), ..., 09 -> I (73), 10 -> J (74), ...
+              // 如果数字大于 26，使用循环：27 -> A, 28 -> B, ...
+              const letterIndex = ((lastTwoDigits - 1) % 26) + 1
+              dataVersionLetter = String.fromCharCode(64 + letterIndex) // A=65
+            }
+            
+            versionInfo = `版本: ${romVersion}${dataVersionLetter}\n`
+          }
+          
           statusInfo += `\n📊 账号信息：\n` +
                        `用户名: ${preview.UserName}\n` +
                        `Rating: ${preview.Rating}\n` +
+                       (versionInfo ? versionInfo : '') +
                        `登录状态: ${preview.IsLogin}\n` +
                        `封禁状态: ${preview.BanState}\n`
         } catch (error) {
@@ -997,7 +1020,7 @@ export function apply(ctx: Context, config: Config) {
             const totalStock = allIssuedStock + purchasedStock
             
             // 格式化总票数显示
-            let totalStockText = `库存（发票：${allIssuedStock}`
+            let totalStockText = `${totalStock}（发票：${allIssuedStock}`
             if (showExpired && expiredIssuedStock > 0) {
               totalStockText += `（包含过期：${expiredIssuedStock}）`
             }
@@ -1074,6 +1097,7 @@ export function apply(ctx: Context, config: Config) {
                 statusInfo += `\n🛒 用户购买的功能票：\n`
                 for (const charge of displayPurchasedCharges) {
                   const ticketName = getTicketName(charge.chargeId)
+                  
                   statusInfo += `\n${ticketName} (ID: ${charge.chargeId})\n`
                   statusInfo += `  库存: ${charge.stock}\n`
                 }

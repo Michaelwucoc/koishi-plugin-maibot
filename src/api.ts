@@ -97,6 +97,8 @@ export class MaiBotAPI {
     LastPlayDate: string
     Rating: string
     UserName: string
+    DataVersion?: string
+    RomVersion?: string
   }> {
     const response = await this.client.get('/api/preview', {
       params: { mai_uid: maiUid },
