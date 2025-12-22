@@ -956,77 +956,131 @@ export function apply(ctx: Context, config: Config) {
           } else if (!chargeInfo.ChargeStatus) {
             // 获取失败
             statusInfo += `\n\n🎫 票券情况: 获取失败`
-          } else if (chargeInfo.userChargeList && chargeInfo.userChargeList.length > 0) {
+          } else {
             const now = new Date()
             const showExpired = options?.expired || false  // 是否显示过期票券
             
-            // 计算总票数（所有stock>0的票券，包括过期的）
-            const allValidStockCharges = chargeInfo.userChargeList.filter(charge => charge.stock > 0)
-            const totalStock = allValidStockCharges.reduce((sum, charge) => sum + charge.stock, 0)
+            // 被发的功能票（发票）：只显示 id: 2, 3, 4, 5, 6
+            const issuedTicketIds = [2, 3, 4, 5, 6]
+            const issuedCharges = (chargeInfo.userChargeList || []).filter(charge => 
+              issuedTicketIds.includes(charge.chargeId)
+            )
             
-            // 根据是否显示过期票券来过滤
-            let displayCharges: typeof chargeInfo.userChargeList
+            // 用户购买的功能票：只显示 id: 10005, 10105, 10205, 30001, 0, 11001, 30002, 30003
+            const purchasedTicketIds = [10005, 10105, 10205, 30001, 0, 11001, 30002, 30003]
+            const purchasedCharges = (chargeInfo.userFreeChargeList || []).filter(charge => 
+              purchasedTicketIds.includes(charge.chargeId)
+            )
+            
+            // 计算发票库存（包括过期的）
+            const allIssuedStock = issuedCharges
+              .filter(charge => charge.stock > 0)
+              .reduce((sum, charge) => sum + charge.stock, 0)
+            
+            // 计算发票过期库存
+            const expiredIssuedStock = issuedCharges
+              .filter(charge => {
+                if (charge.stock > 0 && charge.validDate) {
+                  const validDate = new Date(charge.validDate)
+                  return validDate.getFullYear() >= 2000 && validDate < now
+                }
+                return false
+              })
+              .reduce((sum, charge) => sum + charge.stock, 0)
+            
+            // 计算购买库存
+            const purchasedStock = purchasedCharges
+              .filter(charge => charge.stock > 0)
+              .reduce((sum, charge) => sum + charge.stock, 0)
+            
+            // 总票数
+            const totalStock = allIssuedStock + purchasedStock
+            
+            // 格式化总票数显示
+            let totalStockText = `库存（发票：${allIssuedStock}`
+            if (showExpired && expiredIssuedStock > 0) {
+              totalStockText += `（包含过期：${expiredIssuedStock}）`
+            }
+            totalStockText += ` + 购买：${purchasedStock}）`
+            
+            // 过滤显示的被发功能票
+            let displayIssuedCharges: typeof issuedCharges
             if (showExpired) {
-              // 显示所有stock>0的票券（包括过期的）
-              displayCharges = allValidStockCharges
+              displayIssuedCharges = issuedCharges.filter(charge => charge.stock > 0)
             } else {
-              // 只显示未过期且stock>0的票券
-              displayCharges = allValidStockCharges.filter(charge => {
+              displayIssuedCharges = issuedCharges.filter(charge => {
+                if (charge.stock <= 0) return false
                 if (charge.validDate) {
                   const validDate = new Date(charge.validDate)
-                  return validDate >= now  // 未过期
+                  return validDate.getFullYear() >= 2000 && validDate >= now
                 }
-                return true  // 没有有效期信息的也显示
+                return true
               })
             }
             
-            if (displayCharges.length > 0) {
-              statusInfo += `\n\n🎫 票券情况（总票数: ${totalStock}张）${showExpired ? '（包含过期）' : ''}：\n`
-              for (const charge of displayCharges) {
-                const ticketName = getTicketName(charge.chargeId)
-                
-                // 检查购买日期是否异常（小于2000年）
-                let purchaseDate: string
-                if (charge.purchaseDate) {
-                  const purchaseDateObj = new Date(charge.purchaseDate)
-                  if (purchaseDateObj.getFullYear() < 2000) {
-                    purchaseDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+            // 过滤显示的购买功能票
+            const displayPurchasedCharges = purchasedCharges.filter(charge => charge.stock > 0)
+            
+            // 显示票券信息
+            if (displayIssuedCharges.length > 0 || displayPurchasedCharges.length > 0) {
+              statusInfo += `\n\n🎫 票券情况（总票数: ${totalStockText}）${showExpired ? '（包含过期）' : ''}：\n`
+              
+              // 显示被发的功能票（发票）
+              if (displayIssuedCharges.length > 0) {
+                statusInfo += `\n📤 被发的功能票（发票）：\n`
+                for (const charge of displayIssuedCharges) {
+                  const ticketName = getTicketName(charge.chargeId)
+                  
+                  // 检查购买日期是否异常（小于2000年）
+                  let purchaseDate: string
+                  if (charge.purchaseDate) {
+                    const purchaseDateObj = new Date(charge.purchaseDate)
+                    if (purchaseDateObj.getFullYear() < 2000) {
+                      purchaseDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+                    } else {
+                      purchaseDate = purchaseDateObj.toLocaleString('zh-CN')
+                    }
                   } else {
-                    purchaseDate = purchaseDateObj.toLocaleString('zh-CN')
+                    purchaseDate = '未知'
                   }
-                } else {
-                  purchaseDate = '未知'
-                }
-                
-                // 检查有效期日期是否异常（小于2000年）
-                let validDate: string
-                if (charge.validDate) {
-                  const validDateObj = new Date(charge.validDate)
-                  if (validDateObj.getFullYear() < 2000) {
-                    validDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+                  
+                  // 检查有效期日期是否异常（小于2000年）
+                  let validDate: string
+                  if (charge.validDate) {
+                    const validDateObj = new Date(charge.validDate)
+                    if (validDateObj.getFullYear() < 2000) {
+                      validDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
+                    } else {
+                      validDate = validDateObj.toLocaleString('zh-CN')
+                    }
                   } else {
-                    validDate = validDateObj.toLocaleString('zh-CN')
+                    validDate = '未知'
                   }
-                } else {
-                  validDate = '未知'
+                  
+                  // 检查是否过期（只检查正常日期）
+                  const isExpired = charge.validDate && new Date(charge.validDate).getFullYear() >= 2000
+                    ? new Date(charge.validDate) < now
+                    : false
+                  
+                  statusInfo += `\n${ticketName} (ID: ${charge.chargeId})${isExpired ? ' [已过期]' : ''}\n`
+                  statusInfo += `  库存: ${charge.stock}\n`
+                  statusInfo += `  购买日期: ${purchaseDate}\n`
+                  statusInfo += `  有效期至: ${validDate}\n`
                 }
-                
-                // 检查是否过期（只检查正常日期）
-                const isExpired = charge.validDate && new Date(charge.validDate).getFullYear() >= 2000
-                  ? new Date(charge.validDate) < now
-                  : false
-                
-                statusInfo += `\n${ticketName} (ID: ${charge.chargeId})${isExpired ? ' [已过期]' : ''}\n`
-                statusInfo += `  库存: ${charge.stock}\n`
-                statusInfo += `  购买日期: ${purchaseDate}\n`
-                statusInfo += `  有效期至: ${validDate}\n`
+              }
+              
+              // 显示用户购买的功能票
+              if (displayPurchasedCharges.length > 0) {
+                statusInfo += `\n🛒 用户购买的功能票：\n`
+                for (const charge of displayPurchasedCharges) {
+                  const ticketName = getTicketName(charge.chargeId)
+                  statusInfo += `\n${ticketName} (ID: ${charge.chargeId})\n`
+                  statusInfo += `  库存: ${charge.stock}\n`
+                }
               }
             } else {
-              statusInfo += `\n\n🎫 票券情况: 总票数 ${totalStock}张${showExpired ? '（包含过期）' : ''}`
+              statusInfo += `\n\n🎫 票券情况: 总票数 ${totalStockText}`
             }
-          } else {
-            // ChargeStatus 为 true 但没有 userChargeList 或为空
-            statusInfo += `\n\n🎫 票券情况: 暂无票券`
           }
         } catch (error) {
           logger.warn('获取票券信息失败:', error)
