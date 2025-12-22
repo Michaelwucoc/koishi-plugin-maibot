@@ -156,6 +156,10 @@ export declare class MaiBotAPI {
             stock: number;
             validDate: string;
         }>;
+        userFreeChargeList?: Array<{
+            chargeId: number;
+            stock: number;
+        }>;
         UserID?: number;
     }>;
     /**
