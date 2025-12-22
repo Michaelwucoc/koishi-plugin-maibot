@@ -31,6 +31,8 @@ export interface Config {
     protectionCheckInterval?: number;
     authLevelForProxy?: number;
     protectionLockMessage?: string;
+    maintenanceMode?: boolean;
+    maintenanceMessage?: string;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
