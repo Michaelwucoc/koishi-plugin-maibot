@@ -739,6 +739,9 @@ export function apply(ctx: Context, config: Config) {
 🛡️ 保护模式：
   /mai保护模式 [on|off] [@用户] - 开关账号保护模式（自动锁定已下线的账号）
 
+👑 管理员指令：
+  /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级3以上）
+
 💬 交流与反馈：
 如有问题或建议，请访问：https://awmc.cc/category/15/
 
@@ -3029,6 +3032,94 @@ export function apply(ctx: Context, config: Config) {
         }
       } catch (error: any) {
         logger.error('开关保护模式失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+      }
+    })
+
+  /**
+   * 管理员一键关闭所有人的锁定模式和保护模式
+   * 用法: /mai管理员关闭所有锁定和保护
+   */
+  ctx.command('mai管理员关闭所有锁定和保护', '管理员一键关闭所有人的锁定模式和保护模式（需要auth等级3以上）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      // 检查权限
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
+      }
+
+      try {
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            '⚠️ 即将关闭所有用户的锁定模式和保护模式\n此操作将影响所有已绑定账号的用户\n确认继续？'
+          )
+          if (!confirm) {
+            return '操作已取消'
+          }
+        }
+
+        await session.send('⏳ 正在处理，请稍候...')
+
+        // 获取所有绑定记录
+        const allBindings = await ctx.database.get('maibot_bindings', {})
+        
+        // 统计需要更新的用户数量
+        let lockedCount = 0
+        let protectionCount = 0
+        let totalUpdated = 0
+
+        // 遍历所有绑定记录，更新锁定模式和保护模式
+        for (const binding of allBindings) {
+          const updateData: any = {}
+          let needsUpdate = false
+
+          // 如果用户开启了锁定模式，关闭它
+          if (binding.isLocked === true) {
+            updateData.isLocked = false
+            updateData.lockTime = null
+            updateData.lockLoginId = null
+            lockedCount++
+            needsUpdate = true
+          }
+
+          // 如果用户开启了保护模式，关闭它
+          if (binding.protectionMode === true) {
+            updateData.protectionMode = false
+            protectionCount++
+            needsUpdate = true
+          }
+
+          // 如果有需要更新的字段，执行更新
+          if (needsUpdate) {
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, updateData)
+            totalUpdated++
+          }
+        }
+
+        logger.info(`管理员 ${session.userId} 执行了一键关闭操作，更新了 ${totalUpdated} 个用户（锁定: ${lockedCount}，保护模式: ${protectionCount}）`)
+
+        let resultMessage = `✅ 操作完成\n\n`
+        resultMessage += `已更新用户数: ${totalUpdated}\n`
+        resultMessage += `关闭锁定模式: ${lockedCount} 个用户\n`
+        resultMessage += `关闭保护模式: ${protectionCount} 个用户`
+
+        if (totalUpdated === 0) {
+          resultMessage = `ℹ️ 没有需要更新的用户\n所有用户都未开启锁定模式和保护模式`
+        }
+
+        return resultMessage
+      } catch (error: any) {
+        logger.error('管理员一键关闭操作失败:', error)
         if (maintenanceMode) {
           return maintenanceMessage
         }
