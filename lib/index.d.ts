@@ -33,6 +33,7 @@ export interface Config {
     protectionLockMessage?: string;
     maintenanceMode?: boolean;
     maintenanceMessage?: string;
+    hideLockAndProtection?: boolean;
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;
