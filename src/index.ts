@@ -38,6 +38,7 @@ export interface Config {
   protectionLockMessage?: string  // 保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）
   maintenanceMode?: boolean  // 维护模式开关
   maintenanceMessage?: string  // 维护模式提示消息
+  hideLockAndProtection?: boolean  // 隐藏锁定模式和保护模式功能
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -79,6 +80,7 @@ export const Config: Schema<Config> = Schema.object({
   protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
   maintenanceMode: Schema.boolean().default(false).description('维护模式开关，开启时所有指令都会提示维护信息'),
   maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/').description('维护模式提示消息'),
+  hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
 })
 
 /**
@@ -419,6 +421,7 @@ export function apply(ctx: Context, config: Config) {
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
   const maintenanceMode = config.maintenanceMode ?? false
   const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/'
+  const hideLockAndProtection = config.hideLockAndProtection ?? false
 
   // 创建使用配置的 promptYes 函数
   const promptYesWithConfig = async (session: Session, message: string, timeout?: number): Promise<boolean> => {
@@ -968,23 +971,25 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n❄️ 落雪代码: 未绑定\n使用 /mai绑定落雪 <lxns_code> 进行绑定`
         }
 
-        // 显示保护模式状态
-        if (binding.protectionMode) {
-          statusInfo += `\n\n🛡️ 保护模式: 已开启\n使用 /mai保护模式 off 关闭`
-        } else {
-          statusInfo += `\n\n🛡️ 保护模式: 未开启\n使用 /mai保护模式 on 开启（自动锁定已下线的账号）`
-        }
+        // 显示保护模式状态（如果未隐藏）
+        if (!hideLockAndProtection) {
+          if (binding.protectionMode) {
+            statusInfo += `\n\n🛡️ 保护模式: 已开启\n使用 /mai保护模式 off 关闭`
+          } else {
+            statusInfo += `\n\n🛡️ 保护模式: 未开启\n使用 /mai保护模式 on 开启（自动锁定已下线的账号）`
+          }
 
-        // 显示锁定状态（不显示LoginId）
-        if (binding.isLocked) {
-          const lockTime = binding.lockTime 
-            ? new Date(binding.lockTime).toLocaleString('zh-CN')
-            : '未知'
-          statusInfo += `\n\n🔒 锁定状态: 已锁定`
-          statusInfo += `\n锁定时间: ${lockTime}`
-          statusInfo += `\n使用 /mai解锁 可以解锁账号`
-        } else {
-          statusInfo += `\n\n🔒 锁定状态: 未锁定\n使用 /mai锁定 可以锁定账号（防止他人登录）`
+          // 显示锁定状态（不显示LoginId）
+          if (binding.isLocked) {
+            const lockTime = binding.lockTime 
+              ? new Date(binding.lockTime).toLocaleString('zh-CN')
+              : '未知'
+            statusInfo += `\n\n🔒 锁定状态: 已锁定`
+            statusInfo += `\n锁定时间: ${lockTime}`
+            statusInfo += `\n使用 /mai解锁 可以解锁账号`
+          } else {
+            statusInfo += `\n\n🔒 锁定状态: 未锁定\n使用 /mai锁定 可以锁定账号（防止他人登录）`
+          }
         }
 
         // 显示票券信息
@@ -1151,6 +1156,11 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查隐藏模式
+      if (hideLockAndProtection) {
+        return '❌ 该功能已禁用'
+      }
+
       const userId = session.userId
       try {
         const bindings = await ctx.database.get('maibot_bindings', { userId })
@@ -1247,6 +1257,11 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查隐藏模式
+      if (hideLockAndProtection) {
+        return '❌ 该功能已禁用'
       }
 
       try {
@@ -2943,6 +2958,11 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }, state, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查隐藏模式
+      if (hideLockAndProtection) {
+        return '❌ 该功能已禁用'
       }
 
       try {
