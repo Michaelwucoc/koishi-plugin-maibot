@@ -394,6 +394,194 @@ function parseLoginStatus(isLogin: string | boolean | number | undefined): boole
   return false
 }
 
+/**
+ * 检查API返回的状态是否全部为false
+ * 当所有状态都为false时，表示二维码已失效，需要重新绑定
+ */
+function checkAllStatusFalse(result: {
+  LoginStatus?: boolean
+  LogoutStatus?: boolean
+  UserAllStatus?: boolean
+  UserLogStatus?: boolean
+  [key: string]: any
+}): boolean {
+  return (
+    result.LoginStatus === false &&
+    result.LogoutStatus === false &&
+    result.UserAllStatus === false &&
+    result.UserLogStatus === false
+  )
+}
+
+/**
+ * 从session中提取二维码文本
+ * 支持从文本消息或图片消息中提取
+ */
+async function extractQRCodeFromSession(
+  session: Session,
+  ctx: Context
+): Promise<string | null> {
+  // 1. 检查文本消息中是否包含SGID
+  const text = session.content?.trim() || ''
+  if (text && text.startsWith('SGWCMAID')) {
+    return text
+  }
+
+  // 2. 检查是否有图片消息
+  if (session.elements) {
+    for (const element of session.elements) {
+      if (element.type === 'image' || element.type === 'img') {
+        // 尝试获取图片URL或本地路径
+        const imageUrl = element.attrs?.url || element.attrs?.src || element.attrs?.file
+        if (!imageUrl) {
+          continue
+        }
+
+        // 尝试从图片URL中提取（某些情况下二维码内容可能编码在URL中）
+        // 如果API支持图片二维码解析，可以在这里调用
+        // 目前先尝试从URL中提取文本（某些适配器可能会这样处理）
+        ctx.logger('maibot').warn('图片二维码解析：目前需要用户直接发送SGID文本，图片解析功能待API支持')
+        return null
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * 提示用户重新绑定二维码
+ * 支持用户输入SGID或发送二维码照片
+ */
+async function promptForRebind(
+  session: Session,
+  ctx: Context,
+  api: MaiBotAPI,
+  binding: UserBinding,
+  timeout: number = 60000
+): Promise<{ success: boolean; newBinding?: UserBinding; error?: string; messageId?: string }> {
+  const actualTimeout = timeout
+  const mention = buildMention(session)
+  
+  // 发送提示消息并保存消息ID以便后续撤回
+  let promptMessageId: string | undefined
+  try {
+    const sentMessage = await session.send(
+      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片。`
+    )
+    // 尝试从返回的消息中提取消息ID
+    if (typeof sentMessage === 'string') {
+      promptMessageId = sentMessage
+    } else if (sentMessage && (sentMessage as any).messageId) {
+      promptMessageId = (sentMessage as any).messageId
+    }
+  } catch (error) {
+    ctx.logger('maibot').warn('发送提示消息失败:', error)
+  }
+
+  // 使用Promise来等待用户响应（支持文本和图片）
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      ctx.off('message', messageHandler)
+      resolve({ success: false, error: '超时未收到响应', messageId: promptMessageId })
+    }, actualTimeout)
+
+    const messageHandler = async (nextSession: Session) => {
+      // 只处理来自同一用户且在同一频道的消息
+      if (nextSession.userId !== session.userId) return
+      if (nextSession.channelId && session.channelId && nextSession.channelId !== session.channelId) return
+
+      clearTimeout(timeoutId)
+      ctx.off('message', messageHandler)
+
+      try {
+        // 从消息中提取二维码
+        let qrCode: string | null = null
+        
+        // 先尝试从文本中提取
+        const text = nextSession.content?.trim() || ''
+        if (text && text.startsWith('SGWCMAID')) {
+          qrCode = text
+        } else {
+          // 尝试从图片中提取
+          qrCode = await extractQRCodeFromSession(nextSession, ctx)
+        }
+        
+        if (!qrCode || !qrCode.startsWith('SGWCMAID')) {
+          resolve({ success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId })
+          return
+        }
+    
+    if (!qrCode || !qrCode.startsWith('SGWCMAID')) {
+      return { success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId }
+    }
+
+        // 验证二维码格式
+        if (qrCode.length < 48 || qrCode.length > 128) {
+          resolve({ success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId })
+          return
+        }
+
+        // 调用API获取用户ID
+        const result = await api.qr2userid(qrCode)
+
+        if (!result.QRStatus) {
+          resolve({ 
+            success: false, 
+            error: `绑定失败：无法从二维码获取用户ID\n错误信息: ${result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID}`,
+            messageId: promptMessageId
+          })
+          return
+        }
+
+        const maiUid = result.UserID
+
+        // 获取用户详细信息
+        let userName: string | undefined
+        let rating: string | undefined
+        try {
+          const preview = await api.preview(maiUid)
+          userName = preview.UserName
+          rating = preview.Rating
+        } catch (error) {
+          ctx.logger('maibot').warn('获取用户预览信息失败:', error)
+        }
+
+        // 更新数据库中的绑定
+        await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+          maiUid,
+          qrCode,
+          bindTime: new Date(),
+          userName,
+          rating,
+        })
+
+        // 尝试撤回提示消息
+        if (promptMessageId && session.channelId) {
+          try {
+            await session.bot.deleteMessage(session.channelId, promptMessageId)
+          } catch (error) {
+            ctx.logger('maibot').warn('撤回消息失败:', error)
+          }
+        }
+
+        // 获取更新后的绑定
+        const updated = await ctx.database.get('maibot_bindings', { userId: binding.userId })
+        if (updated.length > 0) {
+          resolve({ success: true, newBinding: updated[0], messageId: promptMessageId })
+        } else {
+          resolve({ success: false, error: '更新绑定失败', messageId: promptMessageId })
+        }
+      } catch (error: any) {
+        ctx.logger('maibot').error('重新绑定失败:', error)
+        resolve({ success: false, error: error?.message || '未知错误', messageId: promptMessageId })
+      }
+    }
+
+    ctx.on('message', messageHandler)
+  })
+}
+
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
@@ -758,25 +946,12 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 绑定用户
-   * 用法: /mai绑定 <SGWCMAID...>
+   * 用法: /mai绑定 [SGWCMAID...]
    */
-  ctx.command('mai绑定 <qrCode:text>', '绑定舞萌DX账号')
+  ctx.command('mai绑定 [qrCode:text]', '绑定舞萌DX账号')
     .action(async ({ session }, qrCode) => {
       if (!session) {
         return '❌ 无法获取会话信息'
-      }
-
-      if (!qrCode) {
-        return '请提供二维码文本（SGWCMAID开头）\n用法：/mai绑定 SGWCMAIDxxxxxxxxxxxxx'
-      }
-
-      // 验证二维码格式
-      if (!qrCode.startsWith('SGWCMAID')) {
-        return '❌ 二维码格式错误，必须以 SGWCMAID 开头'
-      }
-
-      if (qrCode.length < 48 || qrCode.length > 128) {
-        return '❌ 二维码长度错误，应在48-128字符之间'
       }
 
       const userId = session.userId
@@ -786,6 +961,91 @@ export function apply(ctx: Context, config: Config) {
         const existing = await ctx.database.get('maibot_bindings', { userId })
         if (existing.length > 0) {
           return `❌ 您已经绑定了账号\n用户ID: ${maskUserId(existing[0].maiUid)}\n绑定时间: ${new Date(existing[0].bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
+        }
+
+        // 如果没有提供SGID，提示用户输入
+        if (!qrCode) {
+          const actualTimeout = 60000 // 60秒超时
+          let promptMessageId: string | undefined
+          try {
+            const sentMessage = await session.send(
+              `请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片（二维码内容解析就是SGID）\n绑定完成后将自动撤回此消息。`
+            )
+            if (typeof sentMessage === 'string') {
+              promptMessageId = sentMessage
+            } else if (sentMessage && (sentMessage as any).messageId) {
+              promptMessageId = (sentMessage as any).messageId
+            }
+          } catch (error) {
+            ctx.logger('maibot').warn('发送提示消息失败:', error)
+          }
+
+          try {
+            // 使用Promise来等待用户响应（支持文本和图片）
+            qrCode = await new Promise<string>((resolve, reject) => {
+              const timeoutId = setTimeout(() => {
+                ctx.off('message', messageHandler)
+                reject(new Error('超时未收到响应'))
+              }, actualTimeout)
+
+              const messageHandler = async (nextSession: Session) => {
+                // 只处理来自同一用户且在同一频道的消息
+                if (nextSession.userId !== session.userId) return
+                if (nextSession.channelId && session.channelId && nextSession.channelId !== session.channelId) return
+
+                clearTimeout(timeoutId)
+                ctx.off('message', messageHandler)
+
+                try {
+                  // 从消息中提取二维码
+                  let extractedQrCode: string | null = null
+                  
+                  // 先尝试从文本中提取
+                  const text = nextSession.content?.trim() || ''
+                  if (text && text.startsWith('SGWCMAID')) {
+                    extractedQrCode = text
+                  } else {
+                    // 尝试从图片中提取
+                    extractedQrCode = await extractQRCodeFromSession(nextSession, ctx)
+                  }
+
+                  if (!extractedQrCode || !extractedQrCode.startsWith('SGWCMAID')) {
+                    reject(new Error('无效的二维码格式，必须以 SGWCMAID 开头'))
+                    return
+                  }
+
+                  resolve(extractedQrCode)
+                } catch (error: any) {
+                  reject(error)
+                }
+              }
+
+              ctx.on('message', messageHandler)
+            })
+          } catch (error: any) {
+            if (error.message?.includes('超时') || error.message?.includes('timeout')) {
+              return '❌ 超时未收到响应，绑定已取消'
+            }
+            throw error
+          } finally {
+            // 尝试撤回提示消息
+            if (promptMessageId && session.channelId) {
+              try {
+                await session.bot.deleteMessage(session.channelId, promptMessageId)
+              } catch (error) {
+                ctx.logger('maibot').warn('撤回消息失败:', error)
+              }
+            }
+          }
+        }
+
+        // 验证二维码格式
+        if (!qrCode.startsWith('SGWCMAID')) {
+          return '❌ 二维码格式错误，必须以 SGWCMAID 开头'
+        }
+
+        if (qrCode.length < 48 || qrCode.length > 128) {
+          return '❌ 二维码长度错误，应在48-128字符之间'
         }
 
         // 调用API获取用户ID
@@ -1781,14 +2041,42 @@ export function apply(ctx: Context, config: Config) {
           return `✅ 已清空 ${maskUserId(binding.maiUid)} 的所有功能票`
         }
 
-        // 如果4个状态都是 false，显示特殊错误信息
-        if (
-          result.LoginStatus === false &&
-          result.LogoutStatus === false &&
-          result.UserAllStatus === false &&
-          result.UserLogStatus === false
-        ) {
-          return `清票错误！请点击获取二维码再试一次！\n错误信息： ${JSON.stringify(result)}`
+        // 如果4个状态都是 false，需要重新绑定二维码
+        if (checkAllStatusFalse(result)) {
+          const rebindResult = await promptForRebind(session, ctx, api, binding, 60000)
+          if (rebindResult.success && rebindResult.newBinding) {
+            // 重新绑定成功后，尝试再次清票
+            try {
+              const retryResult = await api.clearTicket(
+                rebindResult.newBinding.maiUid,
+                machineInfo.clientId,
+                machineInfo.regionId,
+                machineInfo.placeId,
+                machineInfo.placeName,
+                machineInfo.regionName,
+              )
+              
+              if (checkAllStatusFalse(retryResult)) {
+                return `❌ 重新绑定后清票仍然失败，请检查二维码是否正确\n错误信息： ${JSON.stringify(retryResult)}`
+              }
+              
+              const retryLoginStatus = retryResult.LoginStatus === true
+              const retryLogoutStatus = retryResult.LogoutStatus === true
+              const retryUserAllStatus = retryResult.UserAllStatus === true
+              const retryUserLogStatus = retryResult.UserLogStatus === true
+
+              if (retryLoginStatus && retryLogoutStatus && retryUserAllStatus && retryUserLogStatus) {
+                return `✅ 重新绑定成功！已清空 ${maskUserId(rebindResult.newBinding.maiUid)} 的所有功能票`
+              }
+              
+              return `⚠️ 重新绑定成功，但清票部分失败\n错误信息： ${JSON.stringify(retryResult)}`
+            } catch (retryError) {
+              logger.error('重新绑定后清票失败:', retryError)
+              return `✅ 重新绑定成功，但清票操作失败，请稍后重试`
+            }
+          } else {
+            return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+          }
         }
 
         // 其他失败情况，显示详细错误信息
@@ -2117,14 +2405,60 @@ export function apply(ctx: Context, config: Config) {
                  `难度: ${levelLabel}`
         }
 
-        // 如果4个状态都是 false，显示特殊错误信息
+        // 如果4个状态都是 false，需要重新绑定二维码
         if (
           result.LoginStatus === false &&
           result.LogoutStatus === false &&
           result.UploadStatus === false &&
           result.UserLogStatus === false
         ) {
-          return `上传错误！请点击获取二维码再试一次！\n错误信息： ${JSON.stringify(result)}`
+          const rebindResult = await promptForRebind(session, ctx, api, binding, 60000)
+          if (rebindResult.success && rebindResult.newBinding) {
+            // 重新绑定成功后，尝试再次上传
+            try {
+              const retryResult = await api.uploadScore(
+                rebindResult.newBinding.maiUid,
+                machineInfo.clientId,
+                machineInfo.regionId,
+                machineInfo.placeId,
+                machineInfo.placeName,
+                machineInfo.regionName,
+                scoreData.musicId,
+                scoreData.level,
+                scoreData.achievement,
+                scoreData.fcStatus,
+                scoreData.syncStatus,
+                scoreData.dxScore,
+              )
+              
+              if (
+                retryResult.LoginStatus === false &&
+                retryResult.LogoutStatus === false &&
+                retryResult.UploadStatus === false &&
+                retryResult.UserLogStatus === false
+              ) {
+                return `❌ 重新绑定后上传仍然失败，请检查二维码是否正确\n错误信息： ${JSON.stringify(retryResult)}`
+              }
+              
+              const retryLoginStatus = retryResult.LoginStatus === true
+              const retryLogoutStatus = retryResult.LogoutStatus === true
+              const retryUploadStatus = retryResult.UploadStatus === true
+              const retryUserLogStatus = retryResult.UserLogStatus === true
+
+              if (retryLoginStatus && retryLogoutStatus && retryUploadStatus && retryUserLogStatus) {
+                return `✅ 重新绑定成功！已为 ${maskUserId(rebindResult.newBinding.maiUid)} 上传乐曲成绩\n` +
+                       `乐曲ID: ${scoreData.musicId}\n` +
+                       `难度: ${levelLabel}`
+              }
+              
+              return `⚠️ 重新绑定成功，但上传部分失败\n错误信息： ${JSON.stringify(retryResult)}`
+            } catch (retryError) {
+              logger.error('重新绑定后上传失败:', retryError)
+              return `✅ 重新绑定成功，但上传操作失败，请稍后重试`
+            }
+          } else {
+            return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+          }
         }
 
         // 其他失败情况，显示详细错误信息
