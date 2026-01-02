@@ -1777,7 +1777,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await session.send('⏳ 已开始请求发票，服务器响应可能需要约10秒，请耐心等待...')
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const ticketResult = await api.getTicket(
           binding.maiUid,
@@ -1859,7 +1859,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await session.send('⏳ 已开始请求发放舞里程，服务器响应可能需要数秒，请耐心等待...')
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const result = await api.maimile(
           binding.maiUid,
@@ -1991,6 +1991,8 @@ export function apply(ctx: Context, config: Config) {
             return '操作已取消'
           }
         }
+
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const result = await api.clearTicket(
           binding.maiUid,
@@ -2182,7 +2184,7 @@ export function apply(ctx: Context, config: Config) {
           return '操作已取消'
         }
 
-        await session.send('⏳ 正在发放收藏品，请稍候...')
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const result = await api.getItem(
           binding.maiUid,
@@ -2270,7 +2272,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await session.send('⏳ 正在清空收藏品，请稍候...')
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const result = await api.clearItem(
           binding.maiUid,
@@ -2349,7 +2351,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        await session.send('⏳ 正在上传乐曲成绩，请稍候...')
+        await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
         const result = await api.uploadScore(
           binding.maiUid,
