@@ -28,6 +28,7 @@ export interface Config {
     lockRefreshDelay?: number;
     lockRefreshConcurrency?: number;
     confirmTimeout?: number;
+    rebindTimeout?: number;
     protectionCheckInterval?: number;
     authLevelForProxy?: number;
     protectionLockMessage?: string;
