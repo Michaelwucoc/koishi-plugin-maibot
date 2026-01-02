@@ -33,6 +33,7 @@ export interface Config {
   lockRefreshDelay?: number  // 锁定账号刷新时每次 login 的延迟（毫秒）
   lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
   confirmTimeout?: number  // 确认提示超时时间（毫秒）
+  rebindTimeout?: number  // 重新绑定超时时间（毫秒），默认60秒
   protectionCheckInterval?: number  // 保护模式检查间隔（毫秒）
   authLevelForProxy?: number  // 代操作功能需要的auth等级（默认3）
   protectionLockMessage?: string  // 保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）
@@ -75,6 +76,7 @@ export const Config: Schema<Config> = Schema.object({
   lockRefreshDelay: Schema.number().default(1000).description('锁定账号刷新时每次 login 的延迟（毫秒），默认1秒（1000毫秒）'),
   lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
   confirmTimeout: Schema.number().default(10000).description('确认提示超时时间（毫秒），默认10秒（10000毫秒）'),
+  rebindTimeout: Schema.number().default(60000).description('重新绑定超时时间（毫秒），默认60秒（60000毫秒）'),
   protectionCheckInterval: Schema.number().default(60000).description('保护模式检查间隔（毫秒），默认60秒（60000毫秒）'),
   authLevelForProxy: Schema.number().default(3).description('代操作功能需要的auth等级，默认3'),
   protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
@@ -461,7 +463,7 @@ async function promptForRebind(
   timeout: number = 60000
 ): Promise<{ success: boolean; newBinding?: UserBinding; error?: string; messageId?: string }> {
   const actualTimeout = timeout
-  const mention = buildMention(session)
+  const logger = ctx.logger('maibot')
   
   // 发送提示消息并保存消息ID以便后续撤回
   let promptMessageId: string | undefined
@@ -476,48 +478,91 @@ async function promptForRebind(
       promptMessageId = (sentMessage as any).messageId
     }
   } catch (error) {
-    ctx.logger('maibot').warn('发送提示消息失败:', error)
+    logger.warn('发送提示消息失败:', error)
   }
 
+  // 创建一个唯一标识来匹配等待的消息
+  const waitKey = `rebind_${session.userId}_${session.channelId || 'private'}_${Date.now()}`
+  
   // 使用Promise来等待用户响应（支持文本和图片）
   return new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
+    let resolved = false
+    const timeoutId = setTimeout(async () => {
+      if (resolved) return
+      resolved = true
       ctx.off('message', messageHandler)
+      // 发送超时反馈
+      try {
+        await session.send(`❌ 重新绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定二维码`)
+      } catch (error) {
+        logger.warn('发送超时提示消息失败:', error)
+      }
       resolve({ success: false, error: '超时未收到响应', messageId: promptMessageId })
     }, actualTimeout)
 
     const messageHandler = async (nextSession: Session) => {
-      // 只处理来自同一用户且在同一频道的消息
+      if (resolved) return
+      
+      // 只处理来自同一用户的消息
       if (nextSession.userId !== session.userId) return
-      if (nextSession.channelId && session.channelId && nextSession.channelId !== session.channelId) return
+      
+      // 处理群组消息：必须是同一个频道
+      if (session.channelId) {
+        if (nextSession.channelId !== session.channelId) return
+      } else {
+        // 私聊消息：不能是群组消息
+        if (nextSession.channelId) return
+      }
 
+      // 忽略命令消息（避免响应其他命令）
+      const content = nextSession.content?.trim() || ''
+      if (content.match(/^\/?mai/i)) {
+        return // 继续等待非命令消息
+      }
+
+      // 检查是否有图片或文本
+      const hasImage = nextSession.elements?.some(el => el.type === 'image' || el.type === 'img')
+      const hasText = content && content.length > 0
+
+      if (!hasImage && !hasText) {
+        return // 忽略空消息
+      }
+
+      if (resolved) return
+      resolved = true
       clearTimeout(timeoutId)
       ctx.off('message', messageHandler)
 
       try {
+        // 发送识别中反馈
+        await session.send('⏳ 正在识别二维码，请稍候...')
+
         // 从消息中提取二维码
         let qrCode: string | null = null
         
         // 先尝试从文本中提取
-        const text = nextSession.content?.trim() || ''
-        if (text && text.startsWith('SGWCMAID')) {
-          qrCode = text
-        } else {
+        if (content && content.startsWith('SGWCMAID')) {
+          qrCode = content
+          logger.debug(`从文本中提取到二维码: ${qrCode.substring(0, 20)}...`)
+        } else if (hasImage) {
           // 尝试从图片中提取
           qrCode = await extractQRCodeFromSession(nextSession, ctx)
+          if (qrCode) {
+            logger.debug(`从图片中提取到二维码: ${qrCode.substring(0, 20)}...`)
+          } else {
+            logger.debug('图片中未识别到二维码')
+          }
         }
         
         if (!qrCode || !qrCode.startsWith('SGWCMAID')) {
+          await session.send('❌ 识别失败：未找到有效的二维码，请确保发送的是SGID文本（SGWCMAID开头）或二维码照片')
           resolve({ success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId })
           return
         }
-    
-    if (!qrCode || !qrCode.startsWith('SGWCMAID')) {
-      return { success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId }
-    }
 
         // 验证二维码格式
         if (qrCode.length < 48 || qrCode.length > 128) {
+          await session.send('❌ 识别失败：二维码长度错误，应在48-128字符之间')
           resolve({ success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId })
           return
         }
@@ -526,9 +571,11 @@ async function promptForRebind(
         const result = await api.qr2userid(qrCode)
 
         if (!result.QRStatus) {
+          const errorMsg = result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID
+          await session.send(`❌ 绑定失败：无法从二维码获取用户ID\n错误信息: ${errorMsg}`)
           resolve({ 
             success: false, 
-            error: `绑定失败：无法从二维码获取用户ID\n错误信息: ${result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID}`,
+            error: `绑定失败：无法从二维码获取用户ID\n错误信息: ${errorMsg}`,
             messageId: promptMessageId
           })
           return
@@ -544,7 +591,7 @@ async function promptForRebind(
           userName = preview.UserName
           rating = preview.Rating
         } catch (error) {
-          ctx.logger('maibot').warn('获取用户预览信息失败:', error)
+          logger.warn('获取用户预览信息失败:', error)
         }
 
         // 更新数据库中的绑定
@@ -556,12 +603,15 @@ async function promptForRebind(
           rating,
         })
 
+        // 发送成功反馈
+        await session.send(`✅ 重新绑定成功！\n用户ID: ${maskUserId(maiUid)}${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}`)
+
         // 尝试撤回提示消息
         if (promptMessageId && session.channelId) {
           try {
             await session.bot.deleteMessage(session.channelId, promptMessageId)
           } catch (error) {
-            ctx.logger('maibot').warn('撤回消息失败:', error)
+            logger.warn('撤回消息失败:', error)
           }
         }
 
@@ -570,10 +620,12 @@ async function promptForRebind(
         if (updated.length > 0) {
           resolve({ success: true, newBinding: updated[0], messageId: promptMessageId })
         } else {
+          await session.send('⚠️ 绑定已更新，但获取绑定信息失败')
           resolve({ success: false, error: '更新绑定失败', messageId: promptMessageId })
         }
       } catch (error: any) {
-        ctx.logger('maibot').error('重新绑定失败:', error)
+        logger.error('重新绑定失败:', error)
+        await session.send(`❌ 重新绑定过程中发生错误：${error?.message || '未知错误'}`)
         resolve({ success: false, error: error?.message || '未知错误', messageId: promptMessageId })
       }
     }
@@ -605,6 +657,7 @@ export function apply(ctx: Context, config: Config) {
   const turnstileToken = config.turnstileToken
   const maintenanceNotice = config.maintenanceNotice
   const confirmTimeout = config.confirmTimeout ?? 10000
+  const rebindTimeout = config.rebindTimeout ?? 60000  // 默认60秒
   const authLevelForProxy = config.authLevelForProxy ?? 3
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
   const maintenanceMode = config.maintenanceMode ?? false
@@ -965,7 +1018,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 如果没有提供SGID，提示用户输入
         if (!qrCode) {
-          const actualTimeout = 60000 // 60秒超时
+          const actualTimeout = rebindTimeout
           let promptMessageId: string | undefined
           try {
             const sentMessage = await session.send(
@@ -983,39 +1036,82 @@ export function apply(ctx: Context, config: Config) {
           try {
             // 使用Promise来等待用户响应（支持文本和图片）
             qrCode = await new Promise<string>((resolve, reject) => {
-              const timeoutId = setTimeout(() => {
+              let resolved = false
+              const timeoutId = setTimeout(async () => {
+                if (resolved) return
+                resolved = true
                 ctx.off('message', messageHandler)
+                try {
+                  await session.send(`❌ 绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定`)
+                } catch (error) {
+                  ctx.logger('maibot').warn('发送超时提示消息失败:', error)
+                }
                 reject(new Error('超时未收到响应'))
               }, actualTimeout)
 
               const messageHandler = async (nextSession: Session) => {
-                // 只处理来自同一用户且在同一频道的消息
+                if (resolved) return
+                
+                // 只处理来自同一用户的消息
                 if (nextSession.userId !== session.userId) return
-                if (nextSession.channelId && session.channelId && nextSession.channelId !== session.channelId) return
+                
+                // 处理群组消息：必须是同一个频道
+                if (session.channelId) {
+                  if (nextSession.channelId !== session.channelId) return
+                } else {
+                  // 私聊消息：不能是群组消息
+                  if (nextSession.channelId) return
+                }
 
+                // 忽略命令消息（避免响应其他命令）
+                const content = nextSession.content?.trim() || ''
+                if (content.match(/^\/?mai/i)) {
+                  return // 继续等待非命令消息
+                }
+
+                // 检查是否有图片或文本
+                const hasImage = nextSession.elements?.some(el => el.type === 'image' || el.type === 'img')
+                const hasText = content && content.length > 0
+
+                if (!hasImage && !hasText) {
+                  return // 忽略空消息
+                }
+
+                if (resolved) return
+                resolved = true
                 clearTimeout(timeoutId)
                 ctx.off('message', messageHandler)
 
                 try {
+                  // 发送识别中反馈
+                  await session.send('⏳ 正在识别二维码，请稍候...')
+
                   // 从消息中提取二维码
                   let extractedQrCode: string | null = null
                   
                   // 先尝试从文本中提取
-                  const text = nextSession.content?.trim() || ''
-                  if (text && text.startsWith('SGWCMAID')) {
-                    extractedQrCode = text
-                  } else {
+                  if (content && content.startsWith('SGWCMAID')) {
+                    extractedQrCode = content
+                    ctx.logger('maibot').debug(`从文本中提取到二维码: ${extractedQrCode.substring(0, 20)}...`)
+                  } else if (hasImage) {
                     // 尝试从图片中提取
                     extractedQrCode = await extractQRCodeFromSession(nextSession, ctx)
+                    if (extractedQrCode) {
+                      ctx.logger('maibot').debug(`从图片中提取到二维码: ${extractedQrCode.substring(0, 20)}...`)
+                    } else {
+                      ctx.logger('maibot').debug('图片中未识别到二维码')
+                    }
                   }
 
                   if (!extractedQrCode || !extractedQrCode.startsWith('SGWCMAID')) {
+                    await session.send('❌ 识别失败：未找到有效的二维码，请确保发送的是SGID文本（SGWCMAID开头）或二维码照片')
                     reject(new Error('无效的二维码格式，必须以 SGWCMAID 开头'))
                     return
                   }
 
                   resolve(extractedQrCode)
                 } catch (error: any) {
+                  await session.send(`❌ 识别过程中发生错误：${error?.message || '未知错误'}`)
                   reject(error)
                 }
               }
@@ -1025,6 +1121,9 @@ export function apply(ctx: Context, config: Config) {
           } catch (error: any) {
             if (error.message?.includes('超时') || error.message?.includes('timeout')) {
               return '❌ 超时未收到响应，绑定已取消'
+            }
+            if (error.message?.includes('无效的二维码')) {
+              return `❌ 绑定失败：${error.message}`
             }
             throw error
           } finally {
@@ -2043,10 +2142,12 @@ export function apply(ctx: Context, config: Config) {
 
         // 如果4个状态都是 false，需要重新绑定二维码
         if (checkAllStatusFalse(result)) {
-          const rebindResult = await promptForRebind(session, ctx, api, binding, 60000)
+          await session.send('🔄 二维码已失效，需要重新绑定后才能继续操作')
+          const rebindResult = await promptForRebind(session, ctx, api, binding, rebindTimeout)
           if (rebindResult.success && rebindResult.newBinding) {
             // 重新绑定成功后，尝试再次清票
             try {
+              await session.send('⏳ 重新绑定成功，正在重新执行清票操作...')
               const retryResult = await api.clearTicket(
                 rebindResult.newBinding.maiUid,
                 machineInfo.clientId,
@@ -2057,7 +2158,8 @@ export function apply(ctx: Context, config: Config) {
               )
               
               if (checkAllStatusFalse(retryResult)) {
-                return `❌ 重新绑定后清票仍然失败，请检查二维码是否正确\n错误信息： ${JSON.stringify(retryResult)}`
+                await session.send('❌ 重新绑定后清票仍然失败，请检查二维码是否正确')
+                return `❌ 重新绑定后清票仍然失败\n错误信息： ${JSON.stringify(retryResult)}`
               }
               
               const retryLoginStatus = retryResult.LoginStatus === true
@@ -2412,10 +2514,12 @@ export function apply(ctx: Context, config: Config) {
           result.UploadStatus === false &&
           result.UserLogStatus === false
         ) {
-          const rebindResult = await promptForRebind(session, ctx, api, binding, 60000)
+          await session.send('🔄 二维码已失效，需要重新绑定后才能继续操作')
+          const rebindResult = await promptForRebind(session, ctx, api, binding, rebindTimeout)
           if (rebindResult.success && rebindResult.newBinding) {
             // 重新绑定成功后，尝试再次上传
             try {
+              await session.send('⏳ 重新绑定成功，正在重新执行上传操作...')
               const retryResult = await api.uploadScore(
                 rebindResult.newBinding.maiUid,
                 machineInfo.clientId,
@@ -2437,7 +2541,8 @@ export function apply(ctx: Context, config: Config) {
                 retryResult.UploadStatus === false &&
                 retryResult.UserLogStatus === false
               ) {
-                return `❌ 重新绑定后上传仍然失败，请检查二维码是否正确\n错误信息： ${JSON.stringify(retryResult)}`
+                await session.send('❌ 重新绑定后上传仍然失败，请检查二维码是否正确')
+                return `❌ 重新绑定后上传仍然失败\n错误信息： ${JSON.stringify(retryResult)}`
               }
               
               const retryLoginStatus = retryResult.LoginStatus === true
