@@ -469,7 +469,7 @@ async function promptForRebind(
   let promptMessageId: string | undefined
   try {
     const sentMessage = await session.send(
-      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片。`
+      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片`
     )
     // 尝试从返回的消息中提取消息ID
     if (typeof sentMessage === 'string') {
@@ -547,17 +547,23 @@ async function promptForRebind(
         } else if (hasImage) {
           // 尝试从图片中提取
           qrCode = await extractQRCodeFromSession(nextSession, ctx)
-          if (qrCode) {
+          if (qrCode && qrCode.startsWith('SGWCMAID')) {
             logger.debug(`从图片中提取到二维码: ${qrCode.substring(0, 20)}...`)
           } else {
-            logger.debug('图片中未识别到二维码')
+            // 图片无法解析，提示用户但继续等待（不立即失败）
+            logger.debug('图片中无法提取二维码，继续等待用户发送SGID文本')
+            await session.send('⚠️ 无法从图片中识别二维码，请直接发送SGID文本（SGWCMAID开头）').catch(() => {})
+            return // 继续等待，不resolve也不reject
           }
         }
         
         if (!qrCode || !qrCode.startsWith('SGWCMAID')) {
-          await session.send('❌ 识别失败：未找到有效的二维码，请确保发送的是SGID文本（SGWCMAID开头）或二维码照片')
-          resolve({ success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId })
-          return
+          // 如果有内容但不是SGID，提示用户继续等待
+          if (content) {
+            await session.send('⚠️ 未识别到有效的二维码格式，请发送SGID文本（SGWCMAID开头）').catch(() => {})
+            return // 继续等待
+          }
+          return // 空消息，继续等待
         }
 
         // 验证二维码格式
@@ -604,16 +610,7 @@ async function promptForRebind(
         })
 
         // 发送成功反馈
-        await session.send(`✅ 重新绑定成功！\n用户ID: ${maskUserId(maiUid)}${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}`)
-
-        // 尝试撤回提示消息
-        if (promptMessageId && session.channelId) {
-          try {
-            await session.bot.deleteMessage(session.channelId, promptMessageId)
-          } catch (error) {
-            logger.warn('撤回消息失败:', error)
-          }
-        }
+        await session.send(`✅ 重新绑定成功！\n用户ID: ${maskUserId(maiUid)}${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}\n\n⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`)
 
         // 获取更新后的绑定
         const updated = await ctx.database.get('maibot_bindings', { userId: binding.userId })
@@ -1023,7 +1020,7 @@ export function apply(ctx: Context, config: Config) {
           let promptMessageId: string | undefined
           try {
             const sentMessage = await session.send(
-              `请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片（二维码内容解析就是SGID）\n绑定完成后将自动撤回此消息。`
+              `请在${actualTimeout / 1000}秒内直接发送SGID或二维码照片`
             )
             if (typeof sentMessage === 'string') {
               promptMessageId = sentMessage
@@ -1037,114 +1034,118 @@ export function apply(ctx: Context, config: Config) {
           try {
             logger.info(`开始等待用户 ${session.userId} 输入二维码，超时时间: ${actualTimeout}ms`)
             
-            // 使用Promise.race同时等待session.prompt和message事件
-            let promptResolved = false
-            let messageHandlerRegistered = false
+            // 使用Promise同时等待session.prompt和message事件
+            // 不立即resolve，只有当真正收到有效二维码或超时才resolve
+            let resolved = false
             let messageHandler: ((nextSession: Session) => void) | null = null
             
-            const result = await Promise.race([
-              // 方法1: 使用session.prompt（主要方法，适用于文本）
-              session.prompt(actualTimeout).then((text: string | undefined) => {
-                if (!text) {
-                  logger.debug('session.prompt返回空文本')
-                  return null
+            qrCode = await new Promise<string>((resolve, reject) => {
+              const timeoutId = setTimeout(() => {
+                if (resolved) return
+                resolved = true
+                if (messageHandler) {
+                  ctx.off('message', messageHandler)
                 }
-                const trimmed = text.trim()
-                logger.debug(`session.prompt收到消息: ${trimmed.substring(0, 50)}`)
-                if (trimmed.startsWith('SGWCMAID')) {
-                  promptResolved = true
-                  logger.info(`✅ 通过session.prompt接收到二维码: ${trimmed.substring(0, 20)}...`)
-                  if (messageHandlerRegistered && messageHandler) {
-                    ctx.off('message', messageHandler)
-                  }
-                  return trimmed
-                }
-                logger.debug(`消息不是有效的二维码格式: ${trimmed.substring(0, 30)}`)
-                return null
-              }).catch((error: any) => {
-                logger.debug(`session.prompt异常: ${error?.message || '未知错误'}`)
-                return null
-              }),
-              
-              // 方法2: 监听message事件（备选方法，支持文本和图片）
-              new Promise<string | null>((resolve) => {
-                const timeoutId = setTimeout(() => {
-                  if (messageHandler) {
-                    ctx.off('message', messageHandler)
-                  }
-                  resolve(null)
-                }, actualTimeout)
+                reject(new Error('超时未收到响应'))
+              }, actualTimeout)
 
-                messageHandler = async (nextSession: Session) => {
-                  if (promptResolved) {
+              // 方法1: 监听message事件（支持文本和图片）
+              messageHandler = async (nextSession: Session) => {
+                if (resolved) return
+                
+                logger.debug(`收到message事件: userId=${nextSession.userId}, channelId=${nextSession.channelId}`)
+                
+                // 检查用户和频道
+                if (nextSession.userId !== session.userId) return
+                if (session.channelId && nextSession.channelId !== session.channelId) return
+                if (!session.channelId && nextSession.channelId) return
+
+                const content = nextSession.content?.trim() || ''
+                const hasImage = nextSession.elements?.some(el => el.type === 'image' || el.type === 'img')
+                
+                // 忽略命令
+                if (content.match(/^\/?mai/i)) return
+                // 忽略空消息
+                if (!hasImage && !content) return
+
+                // 处理文本二维码
+                if (content && content.startsWith('SGWCMAID')) {
+                  logger.info(`✅ 通过message事件接收到文本二维码: ${content.substring(0, 20)}...`)
+                  if (!resolved) {
+                    resolved = true
+                    clearTimeout(timeoutId)
                     if (messageHandler) {
                       ctx.off('message', messageHandler)
                     }
-                    clearTimeout(timeoutId)
-                    return
-                  }
-                  
-                  logger.debug(`收到message事件: userId=${nextSession.userId}, channelId=${nextSession.channelId}, content=${nextSession.content?.substring(0, 50)}`)
-                  
-                  // 检查用户和频道
-                  if (nextSession.userId !== session.userId) return
-                  if (session.channelId && nextSession.channelId !== session.channelId) return
-                  if (!session.channelId && nextSession.channelId) return
-
-                  const content = nextSession.content?.trim() || ''
-                  const hasImage = nextSession.elements?.some(el => el.type === 'image' || el.type === 'img')
-                  
-                  // 忽略命令
-                  if (content.match(/^\/?mai/i)) return
-                  // 忽略空消息
-                  if (!hasImage && !content) return
-
-                  // 处理文本二维码
-                  if (content && content.startsWith('SGWCMAID')) {
-                    logger.info(`✅ 通过message事件接收到文本二维码: ${content.substring(0, 20)}...`)
-                    promptResolved = true
-                    if (messageHandler) {
-                      ctx.off('message', messageHandler)
-                    }
-                    clearTimeout(timeoutId)
                     resolve(content)
-                    return
                   }
-                  
-                  // 处理图片二维码
-                  if (hasImage) {
-                    logger.debug('检测到图片消息，尝试提取二维码')
-                    try {
-                      const qrCode = await extractQRCodeFromSession(nextSession, ctx)
-                      if (qrCode && qrCode.startsWith('SGWCMAID')) {
-                        logger.info(`✅ 通过message事件从图片中提取到二维码: ${qrCode.substring(0, 20)}...`)
-                        promptResolved = true
+                  return
+                }
+                
+                // 处理图片二维码
+                if (hasImage) {
+                  logger.debug('检测到图片消息，尝试提取二维码')
+                  try {
+                    const qrCode = await extractQRCodeFromSession(nextSession, ctx)
+                    if (qrCode && qrCode.startsWith('SGWCMAID')) {
+                      logger.info(`✅ 通过message事件从图片中提取到二维码: ${qrCode.substring(0, 20)}...`)
+                      if (!resolved) {
+                        resolved = true
+                        clearTimeout(timeoutId)
                         if (messageHandler) {
                           ctx.off('message', messageHandler)
                         }
-                        clearTimeout(timeoutId)
                         resolve(qrCode)
-                        return
                       }
-                    } catch (error) {
-                      logger.warn('提取图片二维码失败:', error)
+                      return
+                    } else {
+                      // 图片无法解析，提示用户但继续等待（不立即超时）
+                      logger.debug('图片中无法提取二维码，继续等待用户发送SGID文本')
+                      await session.send('⚠️ 无法从图片中识别二维码，请直接发送SGID文本（SGWCMAID开头）').catch(() => {})
+                      return // 继续等待，不resolve也不reject
                     }
+                  } catch (error) {
+                    logger.warn('提取图片二维码失败:', error)
+                    await session.send('⚠️ 处理图片时发生错误，请直接发送SGID文本（SGWCMAID开头）').catch(() => {})
+                    return // 继续等待
                   }
                 }
+              }
+              
+              // 注册message事件监听器
+              if (messageHandler) {
+                ctx.on('message', messageHandler)
+                logger.debug(`已注册message事件监听器`)
+              }
+
+              // 方法2: 同时使用session.prompt（作为辅助，处理文本消息）
+              session.prompt(actualTimeout).then((text: string | undefined) => {
+                if (resolved) return
+                if (!text) return
                 
-                if (messageHandler) {
-                  ctx.on('message', messageHandler)
-                  messageHandlerRegistered = true
-                  logger.debug(`已注册message事件监听器`)
+                const trimmed = text.trim()
+                logger.debug(`session.prompt收到消息: ${trimmed.substring(0, 50)}`)
+                
+                if (trimmed.startsWith('SGWCMAID')) {
+                  logger.info(`✅ 通过session.prompt接收到二维码: ${trimmed.substring(0, 20)}...`)
+                  if (!resolved) {
+                    resolved = true
+                    clearTimeout(timeoutId)
+                    if (messageHandler) {
+                      ctx.off('message', messageHandler)
+                    }
+                    resolve(trimmed)
+                  }
+                } else {
+                  // session.prompt收到了非二维码文本，继续等待（不resolve）
+                  logger.debug(`session.prompt收到非二维码消息: ${trimmed.substring(0, 30)}`)
                 }
+              }).catch((error: any) => {
+                // session.prompt失败不影响，继续等待message事件
+                logger.debug(`session.prompt异常: ${error?.message || '未知错误'}`)
               })
-            ])
+            })
 
-            if (!result) {
-              throw new Error('超时未收到响应')
-            }
-
-            qrCode = result
             // 发送识别中反馈
             await session.send('⏳ 正在识别二维码，请稍候...')
           } catch (error: any) {
@@ -1158,15 +1159,6 @@ export function apply(ctx: Context, config: Config) {
             }
             await session.send(`❌ 绑定过程中发生错误：${error?.message || '未知错误'}`)
             return `❌ 绑定失败：${error?.message || '未知错误'}`
-          } finally {
-            // 尝试撤回提示消息
-            if (promptMessageId && session.channelId) {
-              try {
-                await session.bot.deleteMessage(session.channelId, promptMessageId)
-              } catch (error) {
-                ctx.logger('maibot').warn('撤回消息失败:', error)
-              }
-            }
           }
         }
 
@@ -1214,7 +1206,8 @@ export function apply(ctx: Context, config: Config) {
                `用户ID: ${maskUserId(maiUid)}\n` +
                (userName ? `用户名: ${userName}\n` : '') +
                (rating ? `Rating: ${rating}\n` : '') +
-               `绑定时间: ${new Date().toLocaleString('zh-CN')}`
+               `绑定时间: ${new Date().toLocaleString('zh-CN')}\n\n` +
+               `⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`
       } catch (error: any) {
         ctx.logger('maibot').error('绑定失败:', error)
         if (maintenanceMode) {
