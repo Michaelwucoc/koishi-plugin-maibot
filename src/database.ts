@@ -20,9 +20,16 @@ export interface UserBinding {
   protectionMode?: boolean  // 是否开启保护模式
 }
 
+export interface MaiBotSetting {
+  key: string
+  boolValue?: boolean
+  updatedAt: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     maibot_bindings: UserBinding
+    maibot_settings: MaiBotSetting
   }
 }
 
@@ -50,6 +57,15 @@ export function extendDatabase(ctx: Context) {
     autoInc: true,
     // userName、rating、fishToken、lxnsCode、alertEnabled、lastLoginStatus、guildId、channelId 可以为空
     unique: ['userId'], // 每个用户只能绑定一个账号
+  })
+
+  // 插件全局设置（用于持久化管理员开关等状态）
+  ctx.model.extend('maibot_settings', {
+    key: 'string',
+    boolValue: 'boolean',
+    updatedAt: 'timestamp',
+  }, {
+    primary: 'key',
   })
 }
 

@@ -588,6 +588,57 @@ export function apply(ctx: Context, config: Config) {
     logger.info('插件已停止，将不再执行新的定时任务')
   })
 
+  // 登录播报功能全局开关（管理员可控制）
+  let alertFeatureEnabled = true
+
+  // 从数据库加载/初始化管理员全局开关（保证重启不丢）
+  const ALERT_FEATURE_KEY = 'alertFeatureEnabled'
+  const loadAlertFeatureEnabled = async () => {
+    try {
+      const rows = await ctx.database.get('maibot_settings', { key: ALERT_FEATURE_KEY })
+      if (rows.length > 0) {
+        alertFeatureEnabled = rows[0].boolValue ?? true
+        logger.info(`已从数据库加载登录播报全局开关: ${alertFeatureEnabled ? '开启' : '关闭'}`)
+        return
+      }
+      await ctx.database.create('maibot_settings', {
+        key: ALERT_FEATURE_KEY,
+        boolValue: true,
+        updatedAt: new Date(),
+      })
+      alertFeatureEnabled = true
+      logger.info('已初始化登录播报全局开关为开启（写入数据库默认值）')
+    } catch (e) {
+      // 兜底：数据库异常不阻塞插件运行，继续使用内存默认值
+      logger.warn('加载登录播报全局开关失败，将使用默认值 true：', e)
+      alertFeatureEnabled = true
+    }
+  }
+
+  const saveAlertFeatureEnabled = async (value: boolean) => {
+    alertFeatureEnabled = value
+    try {
+      const rows = await ctx.database.get('maibot_settings', { key: ALERT_FEATURE_KEY })
+      if (rows.length > 0) {
+        await ctx.database.set('maibot_settings', { key: ALERT_FEATURE_KEY }, {
+          boolValue: value,
+          updatedAt: new Date(),
+        })
+      } else {
+        await ctx.database.create('maibot_settings', {
+          key: ALERT_FEATURE_KEY,
+          boolValue: value,
+          updatedAt: new Date(),
+        })
+      }
+    } catch (e) {
+      logger.warn('保存登录播报全局开关失败（已更新内存状态）：', e)
+    }
+  }
+
+  // 插件启动后异步加载一次
+  void loadAlertFeatureEnabled()
+
   // 使用配置中的值
   const machineInfo = config.machineInfo
   const turnstileToken = config.turnstileToken
@@ -922,6 +973,8 @@ export function apply(ctx: Context, config: Config) {
 
 👑 管理员指令：
   /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级3以上）
+  /mai管理员关闭登录播报 - 关闭/开启登录播报功能（需要auth等级3以上）
+  /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级3以上）
 
 💬 交流与反馈：
 如有问题或建议，请访问：https://awmc.cc/category/15/
@@ -2753,6 +2806,12 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
+    // 检查登录播报功能是否被管理员关闭
+    if (!alertFeatureEnabled) {
+      logger.debug('登录播报功能已被管理员关闭，跳过检查')
+      return
+    }
+
     logger.debug('开始检查登录状态...')
     try {
       // 获取所有绑定记录
@@ -3458,6 +3517,106 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+    })
+
+  /**
+   * 管理员关闭/开启登录播报功能（全局开关）
+   * 用法: /mai管理员关闭登录播报 [on|off]
+   */
+  ctx.command('mai管理员关闭登录播报 [state:text]', '关闭/开启登录播报功能（需要auth等级3以上）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }, state) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
+      }
+
+      const current = alertFeatureEnabled
+      if (!state) {
+        return `当前登录播报全局状态: ${current ? '✅ 开启' : '❌ 关闭'}\n\n用法：/mai管理员关闭登录播报 on（开启）\n用法：/mai管理员关闭登录播报 off（关闭）`
+      }
+
+      const s = state.trim().toLowerCase()
+      const next = (s === 'on' || s === 'true' || s === '1') ? true
+        : (s === 'off' || s === 'false' || s === '0') ? false
+        : null
+
+      if (next === null) {
+        return '参数错误：只能是 on/off\n用法：/mai管理员关闭登录播报 on 或 /mai管理员关闭登录播报 off'
+      }
+
+      if (next === current) {
+        return `登录播报全局状态已经是 ${next ? '开启' : '关闭'}`
+      }
+
+      // 关闭时：默认强制关闭所有人的 maialert 状态，避免仍在开启但不会推送造成困惑
+      if (!next) {
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            '⚠️ 即将关闭【登录播报全局功能】并强制关闭所有人的 maialert 状态\n确认继续？'
+          )
+          if (!confirm) return '操作已取消'
+        }
+
+        await session.send('⏳ 正在关闭登录播报并强制关闭所有播报，请稍候...')
+
+        const allBindings = await ctx.database.get('maibot_bindings', {})
+        let updated = 0
+        for (const b of allBindings) {
+          if (b.alertEnabled === true) {
+            await ctx.database.set('maibot_bindings', { userId: b.userId }, { alertEnabled: false })
+            updated++
+          }
+        }
+
+        await saveAlertFeatureEnabled(false)
+        logger.info(`管理员 ${session.userId} 关闭登录播报全局功能，并强制关闭了 ${updated} 个用户的 maialert`)
+        return `✅ 登录播报全局功能已关闭\n已强制关闭 maialert 的用户数: ${updated}`
+      }
+
+      // 开启时：只恢复全局开关，不自动开启任何人的 maialert
+      await saveAlertFeatureEnabled(true)
+      logger.info(`管理员 ${session.userId} 开启登录播报全局功能`)
+      return '✅ 登录播报全局功能已开启（不会自动开启任何人的 maialert）'
+    })
+
+  /**
+   * 管理员强制关闭所有人的 maialert 状态
+   * 用法: /mai管理员关闭所有播报
+   */
+  ctx.command('mai管理员关闭所有播报', '强制关闭所有人的maialert状态（需要auth等级3以上）')
+    .userFields(['authority'])
+    .option('bypass', '-bypass  绕过确认')
+    .action(async ({ session, options }) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
+      }
+
+      if (!options?.bypass) {
+        const confirm = await promptYesLocal(
+          session,
+          '⚠️ 即将强制关闭所有人的 maialert 状态（仅影响播报开关，不影响绑定/锁定/保护模式）\n确认继续？'
+        )
+        if (!confirm) return '操作已取消'
+      }
+
+      await session.send('⏳ 正在强制关闭所有播报，请稍候...')
+      const allBindings = await ctx.database.get('maibot_bindings', {})
+      let updated = 0
+      for (const b of allBindings) {
+        if (b.alertEnabled === true) {
+          await ctx.database.set('maibot_bindings', { userId: b.userId }, { alertEnabled: false })
+          updated++
+        }
+      }
+
+      logger.info(`管理员 ${session.userId} 强制关闭所有播报，关闭了 ${updated} 个用户的 maialert`)
+      return updated === 0
+        ? 'ℹ️ 没有需要关闭的用户（所有人的 maialert 都已是关闭状态）'
+        : `✅ 已强制关闭所有人的 maialert\n关闭的用户数: ${updated}`
     })
 }
 
