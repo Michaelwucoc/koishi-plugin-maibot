@@ -85,6 +85,11 @@ export const Config: Schema<Config> = Schema.object({
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
 })
 
+// 我认识了很多朋友 以下是我认识的好朋友们！
+// Fracture_Hikaritsu
+// MisakaNo
+// Tome Chen
+
 /**
  * 票券ID到中文名称的映射
  */
