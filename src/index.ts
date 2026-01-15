@@ -81,7 +81,7 @@ export const Config: Schema<Config> = Schema.object({
   authLevelForProxy: Schema.number().default(3).description('代操作功能需要的auth等级，默认3'),
   protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
   maintenanceMode: Schema.boolean().default(false).description('维护模式开关，开启时所有指令都会提示维护信息'),
-  maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/').description('维护模式提示消息'),
+  maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/').description('维护模式提示消息'),
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
 })
 
@@ -787,7 +787,7 @@ export function apply(ctx: Context, config: Config) {
   const authLevelForProxy = config.authLevelForProxy ?? 3
   const protectionLockMessage = config.protectionLockMessage ?? '🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功'
   const maintenanceMode = config.maintenanceMode ?? false
-  const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/category/15/'
+  const maintenanceMessage = config.maintenanceMessage ?? '⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/'
   const hideLockAndProtection = config.hideLockAndProtection ?? false
 
   // 创建使用配置的 promptYes 函数
@@ -1116,7 +1116,7 @@ export function apply(ctx: Context, config: Config) {
   /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级3以上）
 
 💬 交流与反馈：
-如有问题或建议，请访问：https://awmc.cc/category/15/
+如有问题或建议，请前往QQ群: 1072033605
 
 📝 说明：
   - 所有指令支持 [@用户] 参数进行代操作（需要权限）
@@ -1125,7 +1125,7 @@ export function apply(ctx: Context, config: Config) {
 
       return helpText
     })
-
+// 这个 Fracture_Hikaritsu 不给我吃KFC，故挂在此处。 我很生气。
   /**
    * 绑定用户
    * 用法: /mai绑定 [SGWCMAID...]
