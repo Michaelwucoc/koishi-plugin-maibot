@@ -7,7 +7,6 @@ export interface ApiConfig {
 
 export class MaiBotAPI {
   private client: AxiosInstance
-  private static readonly ADMIN_PREFIX = '/api/t9yf457788igaga3jvvo'
 
   constructor(config: ApiConfig) {
     this.client = axios.create({
@@ -20,74 +19,303 @@ export class MaiBotAPI {
   }
 
   /**
-   * 二维码转用户ID
+   * 机台 Ping
+   * GET /api/public/mai_ping
    */
-  async qr2userid(qrText: string): Promise<{ QRStatus: boolean; UserID: string }> {
-    const response = await this.client.post(`/api/qr2userid/${qrText}`)
+  async maiPing(): Promise<{
+    returnCode?: number
+    serverTime?: number
+    result?: string
+  }> {
+    const response = await this.client.get('/api/public/mai_ping')
     return response.data
   }
 
   /**
-   * 发票（2-6倍）
+   * 查看用户信息（预览）
+   * GET /api/public/get_preview
+   * 需要: client_id, qr_text
+   */
+  async getPreview(clientId: string, qrText: string): Promise<{
+    UserID: string | number
+    BanState?: number
+    IsLogin?: boolean
+    LastLoginDate?: string
+    LastPlayDate?: string
+    Rating?: number
+    UserName?: string
+    DataVersion?: string
+    RomVersion?: string
+  }> {
+    const response = await this.client.get('/api/public/get_preview', {
+      params: {
+        client_id: clientId,
+        qr_text: qrText,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 上传水鱼 B50
+   * POST /api/public/upload_b50
+   * 需要: region_id, client_id, place_id, qr_text, fish_token
+   */
+  async uploadB50(
+    regionId: number,
+    clientId: string,
+    placeId: number,
+    qrText: string,
+    fishToken: string
+  ): Promise<{
+    UploadStatus: boolean
+    msg: string
+    task_id: string
+    login_time?: number
+    userID?: string
+    token?: string
+  }> {
+    const response = await this.client.post('/api/public/upload_b50', null, {
+      params: {
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
+        qr_text: qrText,
+        fish_token: fishToken,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 查询水鱼 B50 任务状态
+   * GET /api/public/get_b50_task_status
+   * 需要: mai_uid (加密的用户ID)
+   */
+  async getB50TaskStatus(maiUid: string): Promise<{
+    code: number
+    alive_task_id: string | number
+    alive_task_time: number
+    task_id?: number
+    task_status?: string
+  }> {
+    const response = await this.client.get('/api/public/get_b50_task_status', {
+      params: { mai_uid: maiUid },
+    })
+    return response.data
+  }
+
+  /**
+   * 根据任务 ID 查询水鱼 B50 任务
+   * GET /api/public/get_b50_task_byid
+   * 需要: task_id
+   */
+  async getB50TaskById(taskId: string): Promise<{
+    code: number
+    alive_task_id: string | number
+    alive_task_time: number
+    alive_task_end_time?: number | null
+    error?: string | null
+    logout_status?: boolean | null
+    done: boolean
+  }> {
+    const response = await this.client.get('/api/public/get_b50_task_byid', {
+      params: { task_id: taskId },
+    })
+    return response.data
+  }
+
+  /**
+   * 上传落雪 B50
+   * POST /api/public/upload_lx_b50
+   * 需要: region_id, client_id, place_id, qr_text, lxns_code
+   */
+  async uploadLxB50(
+    regionId: number,
+    clientId: string,
+    placeId: number,
+    qrText: string,
+    lxnsCode: string
+  ): Promise<{
+    UploadStatus: boolean
+    msg: string
+    task_id: string
+    login_time?: number
+    userID?: string
+    token?: string
+  }> {
+    const response = await this.client.post('/api/public/upload_lx_b50', null, {
+      params: {
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
+        qr_text: qrText,
+        lxns_code: lxnsCode,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 查询落雪 B50 任务状态
+   * GET /api/public/get_lx_b50_task_status
+   * 需要: mai_uid (加密的用户ID)
+   */
+  async getLxB50TaskStatus(maiUid: string): Promise<{
+    code: number
+    alive_task_id: string | number
+    alive_task_time: number
+    task_id?: number
+    task_status?: string
+  }> {
+    const response = await this.client.get('/api/public/get_lx_b50_task_status', {
+      params: { mai_uid: maiUid },
+    })
+    return response.data
+  }
+
+  /**
+   * 根据任务 ID 查询落雪 B50 任务
+   * GET /api/public/get_lx_b50_task_byid
+   * 需要: task_id
+   */
+  async getLxB50TaskById(taskId: string): Promise<{
+    code: number
+    alive_task_id: string | number
+    alive_task_time: number
+    alive_task_end_time?: number | null
+    error?: string | null
+    logout_status?: boolean | null
+    done: boolean
+  }> {
+    const response = await this.client.get('/api/public/get_lx_b50_task_byid', {
+      params: { task_id: taskId },
+    })
+    return response.data
+  }
+
+  /**
+   * 测试登录
+   * POST /api/private/test_login
+   * 需要: region_id, client_id, place_id, qr_text
+   */
+  async testLogin(
+    regionId: number,
+    clientId: string,
+    placeId: number,
+    qrText: string
+  ): Promise<{
+    login_time?: number
+    login_result?: {
+      Result: {
+        returnCode: number
+      }
+      Cookie: string
+    }
+    QrStatus?: boolean
+    LoginStatus?: boolean
+    LogoutStatus?: boolean
+    TicketStatus?: boolean
+  }> {
+    const response = await this.client.post('/api/private/test_login', null, {
+      params: {
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
+        qr_text: qrText,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 获取选项文件
+   * GET /api/private/get_opt
+   * 需要: title_ver, client_id
+   */
+  async getOpt(titleVer: string, clientId: string): Promise<{
+    app_url: string[]
+    opt_url: string[]
+    latest_app_time?: string | null
+    latest_opt_time?: string | null
+    error?: string
+  }> {
+    const response = await this.client.get('/api/private/get_opt', {
+      params: {
+        title_ver: titleVer,
+        client_id: clientId,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 获取密钥信息
+   * GET /api/private/get_keyinfo
+   * 需要: title_ver, client_id
+   */
+  async getKeyInfo(titleVer: string, clientId: string): Promise<{
+    clientId: string
+    placeId: number
+    placeName: string
+    regionId: number
+    regionName: string
+    error?: string
+  }> {
+    const response = await this.client.get('/api/private/get_keyinfo', {
+      params: {
+        title_ver: titleVer,
+        client_id: clientId,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 获取功能票
+   * POST /api/private/get_ticket
+   * 需要: region_id, client_id, place_id, ticket_id, qr_text
    */
   async getTicket(
-    maiUid: string,
-    ticketId: number,
-    clientId: string,
     regionId: number,
+    clientId: string,
     placeId: number,
-    placeName?: string,
-    regionName?: string,
+    ticketId: number,
+    qrText: string
   ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
+    QrStatus: boolean
+    LoginStatus: boolean
+    LogoutStatus: boolean
     TicketStatus: boolean
   }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/get_ticket`, null, {
+    const response = await this.client.post('/api/private/get_ticket', null, {
       params: {
-        mai_uid: maiUid,
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
         ticket_id: ticketId,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
+        qr_text: qrText,
       },
     })
     return response.data
   }
 
+  // ========== 以下为旧API，已不再支持，保留用于兼容性 ==========
+
   /**
-   * 清空功能票
+   * @deprecated 旧API，已不再支持
+   * 二维码转用户ID - 现在使用 getPreview 代替
    */
-  async clearTicket(
-    maiUid: string,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-  ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
-    UserAllStatus?: boolean
-    UserLogStatus?: boolean
-  }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/clear_ticket`, null, {
-      params: {
-        mai_uid: maiUid,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-      },
-    })
-    return response.data
+  async qr2userid(qrText: string): Promise<{ QRStatus: boolean; UserID: string }> {
+    // 尝试使用新API获取用户信息
+    // 注意：这个方法需要client_id，但旧代码可能没有提供
+    // 为了兼容性，这里保留但标记为deprecated
+    throw new Error('qr2userid已废弃，请使用getPreview代替')
   }
 
   /**
-   * 用户状态预览
+   * @deprecated 旧API，已不再支持
+   * 用户状态预览 - 现在使用 getPreview 代替（需要qr_text）
    */
   async preview(maiUid: string): Promise<{
     UserID: string
@@ -100,359 +328,37 @@ export class MaiBotAPI {
     DataVersion?: string
     RomVersion?: string
   }> {
-    const response = await this.client.get('/api/preview', {
-      params: { mai_uid: maiUid },
-    })
-    return response.data
+    throw new Error('preview已废弃，请使用getPreview代替（需要qr_text）')
   }
 
-  /**
-   * 用户登录（锁号）
-   */
-  async login(
-    maiUid: string,
-    regionId: number,
-    placeId: number,
-    clientId: string,
-    token: string
-  ): Promise<{
-    LoginStatus: boolean
-    LoginId?: number
-    LastLoginDate?: string
-    UserID?: number
-  }> {
-    const response = await this.client.post('/api/login', {
-      token,
-    }, {
-      params: {
-        mai_uid: maiUid,
-        region_id: regionId,
-        place_id: placeId,
-        client_id: clientId,
-      },
-    })
-    return response.data
-  }
+  // ========== 以下功能在新API中未提供，已注释 ==========
 
-  /**
-   * 用户登出
-   */
-  async logout(
-    maiUid: string,
-    regionId: string,
-    clientId: string,
-    placeId: string,
-    token: string
-  ): Promise<{ LogoutStatus: boolean }> {
-    const response = await this.client.post('/api/logout', {
-      token,
-    }, {
-      params: {
-        mai_uid: maiUid,
-        region_id: regionId,
-        client_id: clientId,
-        place_id: placeId,
-      },
-    })
-    return response.data
-  }
+  /*
+  // 清空功能票 - 新API未提供
+  async clearTicket(...) { ... }
 
-  /**
-   * 获取1.5倍票
-   */
-  async get15Ticket(
-    maiUid: string,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-    token: string
-  ): Promise<{
-    LoginStatus: boolean
-    LogoutStatus: boolean
-    UserAllStatus: boolean
-    UserLogStatus: boolean
-  }> {
-    const response = await this.client.post('/api/get_15_ticket', {
-      token,
-    }, {
-      params: {
-        mai_uid: maiUid,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-      },
-    })
-    return response.data
-  }
+  // 用户登录（锁号）- 锁定功能已注释
+  async login(...) { ... }
 
-  /**
-   * 上传水鱼 B50
-   */
-  async uploadB50(maiUid: string, fishToken: string): Promise<{
-    UploadStatus: boolean
-    msg: string
-    task_id: string
-  }> {
-    const response = await this.client.post('/api/upload_b50', null, {
-      params: {
-        mai_uid: maiUid,
-        fish_token: fishToken,
-      },
-    })
-    return response.data
-  }
+  // 用户登出 - 解锁功能已注释
+  async logout(...) { ... }
 
-  /**
-   * 查询水鱼 B50 任务状态
-   */
-  async getB50TaskStatus(maiUid: string): Promise<{
-    code: number
-    alive_task_id: string
-    alive_task_time: string
-  }> {
-    const response = await this.client.get('/api/get_b50_task_status', {
-      params: { mai_uid: maiUid },
-    })
-    return response.data
-  }
+  // 获取1.5倍票 - 新API未提供
+  async get15Ticket(...) { ... }
 
-  /**
-   * 根据ID查询水鱼 B50 任务
-   */
-  async getB50TaskById(taskId: string): Promise<{
-    code: number
-    alive_task_id: string
-    alive_task_time: string
-    alive_task_end_time?: string
-    error?: string
-    done: boolean
-  }> {
-    const response = await this.client.get('/api/get_b50_task_byid', {
-      params: { taskid: taskId },
-    })
-    return response.data
-  }
+  // 发收藏品 - 新API未提供
+  async getItem(...) { ... }
 
-  /**
-   * 上传落雪 B50
-   */
-  async uploadLxB50(maiUid: string, lxnsCode: string): Promise<{
-    UploadStatus: boolean
-    msg: string
-    task_id: string
-  }> {
-    const response = await this.client.post('/api/upload_lx_b50', null, {
-      params: {
-        mai_uid: maiUid,
-        lxns_code: lxnsCode,
-      },
-    })
-    return response.data
-  }
+  // 清收藏品 - 新API未提供
+  async clearItem(...) { ... }
 
-  /**
-   * 查询落雪 B50 任务状态
-   */
-  async getLxB50TaskStatus(maiUid: string): Promise<{
-    code: number
-    alive_task_id: string
-    alive_task_time: string
-  }> {
-    const response = await this.client.get('/api/get_lx_b50_task_status', {
-      params: { mai_uid: maiUid },
-    })
-    return response.data
-  }
+  // 舞里程签到 / 发舞里程 - 新API未提供
+  async maimile(...) { ... }
 
-  /**
-   * 根据ID查询落雪 B50 任务
-   */
-  async getLxB50TaskById(taskId: string): Promise<{
-    code: number
-    alive_task_id: string
-    alive_task_time: string
-    alive_task_end_time?: string
-    error?: string
-    done: boolean
-  }> {
-    const response = await this.client.get('/api/get_lx_b50_task_byid', {
-      params: { taskid: taskId },
-    })
-    return response.data
-  }
+  // 查询票券情况 - 新API未提供
+  async getCharge(...) { ... }
 
-  /**
-   * 发收藏品
-   */
-  async getItem(
-    maiUid: string,
-    itemId: string,
-    itemKind: string,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-  ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
-    ItemStatus?: boolean
-  }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/get_item`, null, {
-      params: {
-        mai_uid: maiUid,
-        item_id: itemId,
-        item_kind: itemKind,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-      },
-    })
-    return response.data
-  }
-
-  /**
-   * 清收藏品
-   */
-  async clearItem(
-    maiUid: string,
-    itemId: string,
-    itemKind: string,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-  ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
-    ClearStatus?: boolean
-  }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/clear_item`, null, {
-      params: {
-        mai_uid: maiUid,
-        item_id: itemId,
-        item_kind: itemKind,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-      },
-    })
-    return response.data
-  }
-
-  /**
-   * 舞里程签到 / 发舞里程
-   */
-  async maimile(
-    maiUid: string,
-    maiMile: number,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-  ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
-    MileStatus?: boolean
-    CurrentMile?: number
-  }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/maimile`, null, {
-      params: {
-        mai_uid: maiUid,
-        mai_mile: maiMile,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-      },
-    })
-    return response.data
-  }
-
-  /**
-   * 查询票券情况
-   */
-  async getCharge(maiUid: string, token: string): Promise<{
-    ChargeStatus: boolean
-    userChargeList?: Array<{
-      chargeId: number
-      purchaseDate: string
-      stock: number
-      validDate: string
-    }>
-    userFreeChargeList?: Array<{
-      chargeId: number
-      stock: number
-    }>
-    UserID?: number
-  }> {
-    try {
-      const response = await this.client.post('/api/get_charge', {
-        token,
-      }, {
-        params: { mai_uid: maiUid },
-      })
-      return response.data
-    } catch (error: any) {
-      // 处理 401 错误（Turnstile 校验失败）
-      if (error?.response?.status === 401 && error?.response?.data?.UserID === -2) {
-        return { UserID: -2, ChargeStatus: false }
-      }
-      // 其他错误重新抛出
-      throw error
-    }
-  }
-
-  /**
-   * 上传游戏乐曲成绩
-   */
-  async uploadScore(
-    maiUid: string,
-    clientId: string,
-    regionId: number,
-    placeId: number,
-    placeName: string,
-    regionName: string,
-    musicId: number,
-    level: number,
-    achievement: number,
-    fcStatus: number,
-    syncStatus: number,
-    dxScore: number,
-  ): Promise<{
-    LoginStatus?: boolean
-    LogoutStatus?: boolean
-    UploadStatus?: boolean
-    UserLogStatus?: boolean
-  }> {
-    const response = await this.client.post(`${MaiBotAPI.ADMIN_PREFIX}/upload_score`, null, {
-      params: {
-        mai_uid: maiUid,
-        client_id: clientId,
-        region_id: regionId,
-        place_id: placeId,
-        place_name: placeName,
-        region_name: regionName,
-        music_id: musicId,
-        level: level,
-        achievement: achievement,
-        fc_status: fcStatus,
-        sync_status: syncStatus,
-        dx_score: dxScore,
-      },
-    })
-    return response.data
-  }
+  // 上传游戏乐曲成绩 - 新API未提供
+  async uploadScore(...) { ... }
+  */
 }
-

@@ -452,6 +452,138 @@ async function extractQRCodeFromSession(
 }
 
 /**
+ * 交互式获取二维码文本（qr_text）
+ * 如果binding存在且包含qrCode，优先使用；否则提示用户输入
+ * 如果API调用失败，会尝试重新绑定
+ */
+async function getQrText(
+  session: Session,
+  ctx: Context,
+  api: MaiBotAPI,
+  binding: UserBinding | null,
+  config: Config,
+  timeout: number = 60000,
+  promptMessage?: string
+): Promise<{ qrText: string; error?: string; needRebind?: boolean }> {
+  const logger = ctx.logger('maibot')
+  
+  // 如果绑定存在且有qrCode，先验证是否有效
+  if (binding && binding.qrCode) {
+    // 验证qrCode是否仍然有效（可选，如果验证失败再提示重新输入）
+    try {
+      const preview = await api.getPreview(config.machineInfo.clientId, binding.qrCode)
+      if (preview.UserID !== -1 && (typeof preview.UserID !== 'string' || preview.UserID !== '-1')) {
+        // qrCode有效，直接返回
+        return { qrText: binding.qrCode }
+      }
+      // qrCode无效，需要重新绑定
+      logger.warn(`用户 ${binding.userId} 的qrCode已失效，需要重新绑定`)
+      return { qrText: '', error: '二维码已失效', needRebind: true }
+    } catch (error) {
+      // 验证失败，可能需要重新绑定，但先尝试使用现有qrCode
+      logger.warn(`验证qrCode失败，将使用现有qrCode: ${error}`)
+      return { qrText: binding.qrCode }
+    }
+  }
+  
+  // 否则提示用户输入
+  const actualTimeout = timeout
+  const message = promptMessage || `请在${actualTimeout / 1000}秒内直接发送SGID（长按玩家二维码识别后发送）`
+  
+  try {
+    await session.send(message)
+    logger.info(`开始等待用户 ${session.userId} 输入SGID，超时时间: ${actualTimeout}ms`)
+    
+    const promptText = await session.prompt(actualTimeout)
+    
+    if (!promptText || !promptText.trim()) {
+      await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
+      return { qrText: '', error: '超时未收到响应' }
+    }
+    
+    const trimmed = promptText.trim()
+    logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
+    
+    // 检查是否为SGID格式
+    if (!trimmed.startsWith('SGWCMAID')) {
+      await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）')
+      return { qrText: '', error: '无效的二维码格式，必须以 SGWCMAID 开头' }
+    }
+    
+    // 验证二维码格式
+    if (trimmed.length < 48 || trimmed.length > 128) {
+      await session.send('❌ SGID长度错误，应在48-128字符之间')
+      return { qrText: '', error: '二维码长度错误，应在48-128字符之间' }
+    }
+    
+    logger.info(`✅ 接收到SGID: ${trimmed.substring(0, 20)}...`)
+    await session.send('⏳ 正在处理SGID，请稍候...')
+    
+    // 验证qrCode是否有效
+    try {
+      const preview = await api.getPreview(config.machineInfo.clientId, trimmed)
+      if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+        await session.send('❌ 无效或过期的二维码，请重新发送')
+        return { qrText: '', error: '无效或过期的二维码' }
+      }
+      
+      // 如果binding存在，更新数据库中的qrCode
+      if (binding) {
+        await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+          qrCode: trimmed,
+        })
+        logger.info(`已更新用户 ${binding.userId} 的qrCode`)
+      }
+      
+      return { qrText: trimmed }
+    } catch (error: any) {
+      logger.error('验证qrCode失败:', error)
+      await session.send(`❌ 验证二维码失败：${error?.message || '未知错误'}`)
+      return { qrText: '', error: `验证二维码失败：${error?.message || '未知错误'}` }
+    }
+  } catch (error: any) {
+    logger.error(`等待用户输入二维码失败: ${error?.message}`, error)
+    if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
+      await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
+      return { qrText: '', error: '超时未收到响应' }
+    }
+    return { qrText: '', error: error?.message || '未知错误' }
+  }
+}
+
+/**
+ * 处理API调用失败，如果需要重新绑定则进入重新绑定流程
+ */
+async function handleApiFailure(
+  session: Session,
+  ctx: Context,
+  api: MaiBotAPI,
+  binding: UserBinding | null,
+  config: Config,
+  error: any,
+  rebindTimeout: number
+): Promise<{ success: boolean; error?: string; rebindResult?: { success: boolean; newBinding?: UserBinding; error?: string } }> {
+  const logger = ctx.logger('maibot')
+  
+  // 检查错误是否表示需要重新绑定（例如UserID为-1，或qr_text相关错误）
+  const needRebind = 
+    error?.response?.data?.UserID === -1 ||
+    error?.response?.data?.UserID === '-1' ||
+    error?.message?.includes('二维码') ||
+    error?.message?.includes('qr_text') ||
+    error?.message?.includes('无效') ||
+    error?.message?.includes('过期')
+  
+  if (needRebind && binding) {
+    logger.info(`检测到需要重新绑定，用户: ${binding.userId}`)
+    const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+    return { success: false, rebindResult }
+  }
+  
+  return { success: false, error: error?.message || '未知错误' }
+}
+
+/**
  * 提示用户重新绑定二维码
  * 只支持用户输入SGID文本
  */
@@ -460,6 +592,7 @@ async function promptForRebind(
   ctx: Context,
   api: MaiBotAPI,
   binding: UserBinding,
+  config: Config,
   timeout: number = 60000
 ): Promise<{ success: boolean; newBinding?: UserBinding; error?: string; messageId?: string }> {
   const actualTimeout = timeout
@@ -513,31 +646,37 @@ async function promptForRebind(
       return { success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId }
     }
 
-    // 调用API获取用户ID
-    const result = await api.qr2userid(qrCode)
-
-    if (!result.QRStatus) {
-      const errorMsg = result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID
-      await session.send(`❌ 绑定失败：无法从二维码获取用户ID\n错误信息: ${errorMsg}`)
+    // 使用新API获取用户信息（需要client_id）
+    // 注意：这里需要从配置中获取client_id，但为了兼容性，我们先尝试使用getPreview
+    // 如果失败，可能需要提示用户输入client_id或从配置中获取
+    const machineInfo = config.machineInfo
+    let previewResult
+    try {
+      previewResult = await api.getPreview(machineInfo.clientId, qrCode)
+    } catch (error: any) {
+      logger.error('获取用户预览信息失败:', error)
+      await session.send(`❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${error?.message || '未知错误'}`)
       return { 
         success: false, 
-        error: `绑定失败：无法从二维码获取用户ID\n错误信息: ${errorMsg}`,
+        error: `绑定失败：无法从二维码获取用户信息\n错误信息: ${error?.message || '未知错误'}`,
         messageId: promptMessageId
       }
     }
 
-    const maiUid = result.UserID
-
-    // 获取用户详细信息
-    let userName: string | undefined
-    let rating: string | undefined
-    try {
-      const preview = await api.preview(maiUid)
-      userName = preview.UserName
-      rating = preview.Rating
-    } catch (error) {
-      logger.warn('获取用户预览信息失败:', error)
+    // 检查是否获取成功
+    if (previewResult.UserID === -1 || (typeof previewResult.UserID === 'string' && previewResult.UserID === '-1')) {
+      await session.send(`❌ 绑定失败：无效或过期的二维码`)
+      return { 
+        success: false, 
+        error: '绑定失败：无效或过期的二维码',
+        messageId: promptMessageId
+      }
     }
+
+    // UserID在新API中是加密的字符串
+    const maiUid = String(previewResult.UserID)
+    const userName = previewResult.UserName
+    const rating = previewResult.Rating ? String(previewResult.Rating) : undefined
 
     // 更新数据库中的绑定
     await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
@@ -804,7 +943,7 @@ export function apply(ctx: Context, config: Config) {
             ? `❌ 任务失败：${detail.error}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
-            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}`
+            ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
           await bot.sendMessage(
             channelId,
@@ -876,7 +1015,7 @@ export function apply(ctx: Context, config: Config) {
             ? `❌ 任务失败：${detail.error}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
-            ? `\n完成时间: ${new Date(parseInt(detail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}`
+            ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
           await bot.sendMessage(
             channelId,
@@ -1071,26 +1210,25 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 二维码长度错误，应在48-128字符之间'
         }
 
-        // 调用API获取用户ID
-        const result = await api.qr2userid(qrCode)
-
-        if (!result.QRStatus) {
-          return `❌ 绑定失败：无法从二维码获取用户ID\n错误信息: ${result.UserID === 'MTI1MTEy' ? '无效或过期的二维码' : result.UserID}`
-        }
-
-        const maiUid = result.UserID
-
-        // 获取用户详细信息（可选）
-        let userName: string | undefined
-        let rating: string | undefined
+        // 使用新API获取用户信息（需要client_id）
+        const machineInfo = config.machineInfo
+        let previewResult
         try {
-          const preview = await api.preview(maiUid)
-          userName = preview.UserName
-          rating = preview.Rating
-        } catch (error) {
-          // 如果获取预览失败，不影响绑定
-          ctx.logger('maibot').warn('获取用户预览信息失败:', error)
+          previewResult = await api.getPreview(machineInfo.clientId, qrCode)
+        } catch (error: any) {
+          ctx.logger('maibot').error('获取用户预览信息失败:', error)
+          return `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${error?.message || '未知错误'}`
         }
+
+        // 检查是否获取成功
+        if (previewResult.UserID === -1 || (typeof previewResult.UserID === 'string' && previewResult.UserID === '-1')) {
+          return `❌ 绑定失败：无效或过期的二维码`
+        }
+
+        // UserID在新API中是加密的字符串
+        const maiUid = String(previewResult.UserID)
+        const userName = previewResult.UserName
+        const rating = previewResult.Rating ? String(previewResult.Rating) : undefined
 
         // 存储到数据库
         await ctx.database.create('maibot_bindings', {
@@ -1180,57 +1318,66 @@ export function apply(ctx: Context, config: Config) {
 
         // 尝试获取最新状态并更新数据库
         try {
-          const preview = await api.preview(binding.maiUid)
-          
-          // 更新数据库中的用户名和Rating
-          await ctx.database.set('maibot_bindings', { userId }, {
-            userName: preview.UserName,
-            rating: preview.Rating,
-          })
-          
-          // 格式化版本信息
-          let versionInfo = ''
-          if (preview.RomVersion && preview.DataVersion) {
-            // 机台版本：取前两个数字，如 1.52.00 -> 1.52
-            const romVersionMatch = preview.RomVersion.match(/^(\d+\.\d+)/)
-            const romVersion = romVersionMatch ? romVersionMatch[1] : preview.RomVersion
-            
-            // 数据版本：取前两个数字 + 最后两个数字转换为字母，如 1.50.09 -> 1.50 - I
-            const dataVersionPrefixMatch = preview.DataVersion.match(/^(\d+\.\d+)/)
-            const dataVersionPrefix = dataVersionPrefixMatch ? dataVersionPrefixMatch[1] : preview.DataVersion
-            
-            // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
-            // 匹配最后一个点后的数字（确保只匹配版本号末尾）
-            let dataVersionLetter = '';
-            // 匹配最后一个点后的1-2位数字
-            const dataVersionMatch = preview.DataVersion.match(/\.(\d{1,2})$/);
-            
-            if (dataVersionMatch) {
-              // 提取数字字符串，如 "09" 或 "9"
-              const digitsStr = dataVersionMatch[1];
-              // 转换为数字，如 "09" -> 9, "9" -> 9
-              const versionNumber = parseInt(digitsStr, 10);
+          // 使用新API获取用户信息（需要qr_text）
+          if (!binding.qrCode) {
+            logger.warn(`用户 ${userId} 没有qrCode，无法更新用户信息`)
+          } else {
+            try {
+              const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
               
-              // 验证转换是否正确
-              if (!isNaN(versionNumber) && versionNumber >= 1) {
-                // 01 -> A, 02 -> B, ..., 09 -> I, 10 -> J, ..., 26 -> Z
-                // 使用模运算确保在 A-Z 范围内循环（27 -> A, 28 -> B, ...）
-                const letterIndex = ((versionNumber - 1) % 26) + 1;
-                // 转换为大写字母：A=65, B=66, ..., Z=90
-                dataVersionLetter = String.fromCharCode(64 + letterIndex).toUpperCase();
+              // 更新数据库中的用户名和Rating
+              await ctx.database.set('maibot_bindings', { userId }, {
+                userName: preview.UserName,
+                rating: preview.Rating ? String(preview.Rating) : undefined,
+              })
+              
+              // 格式化版本信息
+              let versionInfo = ''
+              if (preview.RomVersion && preview.DataVersion) {
+                // 机台版本：取前两个数字，如 1.52.00 -> 1.52
+                const romVersionMatch = preview.RomVersion.match(/^(\d+\.\d+)/)
+                const romVersion = romVersionMatch ? romVersionMatch[1] : preview.RomVersion
+                
+                // 数据版本：取前两个数字 + 最后两个数字转换为字母，如 1.50.09 -> 1.50 - I
+                const dataVersionPrefixMatch = preview.DataVersion.match(/^(\d+\.\d+)/)
+                const dataVersionPrefix = dataVersionPrefixMatch ? dataVersionPrefixMatch[1] : preview.DataVersion
+                
+                // 从版本号末尾提取最后两位数字，如 "1.50.01" -> "01", "1.50.09" -> "09"
+                // 匹配最后一个点后的数字（确保只匹配版本号末尾）
+                let dataVersionLetter = '';
+                // 匹配最后一个点后的1-2位数字
+                const dataVersionMatch = preview.DataVersion.match(/\.(\d{1,2})$/);
+                
+                if (dataVersionMatch) {
+                  // 提取数字字符串，如 "09" 或 "9"
+                  const digitsStr = dataVersionMatch[1];
+                  // 转换为数字，如 "09" -> 9, "9" -> 9
+                  const versionNumber = parseInt(digitsStr, 10);
+                  
+                  // 验证转换是否正确
+                  if (!isNaN(versionNumber) && versionNumber >= 1) {
+                    // 01 -> A, 02 -> B, ..., 09 -> I, 10 -> J, ..., 26 -> Z
+                    // 使用模运算确保在 A-Z 范围内循环（27 -> A, 28 -> B, ...）
+                    const letterIndex = ((versionNumber - 1) % 26) + 1;
+                    // 转换为大写字母：A=65, B=66, ..., Z=90
+                    dataVersionLetter = String.fromCharCode(64 + letterIndex).toUpperCase();
+                  }
+                }
+                
+                versionInfo = `机台版本: ${romVersion}\n` +
+                             `数据版本: ${dataVersionPrefix} - ${dataVersionLetter}\n`
               }
+              
+              statusInfo += `\n📊 账号信息：\n` +
+                           `用户名: ${preview.UserName || '未知'}\n` +
+                           `Rating: ${preview.Rating || '未知'}\n` +
+                           (versionInfo ? versionInfo : '') +
+                           `登录状态: ${preview.IsLogin === true ? '已登录' : '未登录'}\n` +
+                           `封禁状态: ${preview.BanState === 0 ? '正常' : '已封禁'}\n`
+            } catch (error) {
+              logger.warn('获取用户预览信息失败:', error)
             }
-            
-            versionInfo = `机台版本: ${romVersion}\n` +
-                         `数据版本: ${dataVersionPrefix} - ${dataVersionLetter}\n`
           }
-          
-          statusInfo += `\n📊 账号信息：\n` +
-                       `用户名: ${preview.UserName}\n` +
-                       `Rating: ${preview.Rating}\n` +
-                       (versionInfo ? versionInfo : '') +
-                       `登录状态: ${preview.IsLogin}\n` +
-                       `封禁状态: ${preview.BanState}\n`
         } catch (error) {
           // 如果获取失败，使用缓存的信息
           if (binding.userName) {
@@ -1277,146 +1424,8 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 显示票券信息
-        try {
-          const chargeInfo = await api.getCharge(binding.maiUid, turnstileToken)
-          
-          // 检查校验失败
-          if (chargeInfo.UserID === -2) {
-            statusInfo += `\n\n🎫 票券情况: 获取失败（Turnstile校验失败）`
-          } else if (!chargeInfo.ChargeStatus) {
-            // 获取失败
-            statusInfo += `\n\n🎫 票券情况: 获取失败`
-          } else {
-            const now = new Date()
-            const showExpired = options?.expired || false  // 是否显示过期票券
-            
-            // 被发的功能票（发票）：只显示 id: 2, 3, 4, 5, 6
-            const issuedTicketIds = [2, 3, 4, 5, 6]
-            const issuedCharges = (chargeInfo.userChargeList || []).filter(charge => 
-              issuedTicketIds.includes(charge.chargeId)
-            )
-            
-            // 用户购买的功能票：只显示 id: 10005, 10105, 10205, 30001, 0, 11001, 30002, 30003
-            const purchasedTicketIds = [10005, 10105, 10205, 30001, 0, 11001, 30002, 30003]
-            const purchasedCharges = (chargeInfo.userFreeChargeList || []).filter(charge => 
-              purchasedTicketIds.includes(charge.chargeId)
-            )
-            
-            // 计算发票库存（包括过期的）
-            const allIssuedStock = issuedCharges
-              .filter(charge => charge.stock > 0)
-              .reduce((sum, charge) => sum + charge.stock, 0)
-            
-            // 计算发票过期库存
-            const expiredIssuedStock = issuedCharges
-              .filter(charge => {
-                if (charge.stock > 0 && charge.validDate) {
-                  const validDate = new Date(charge.validDate)
-                  return validDate.getFullYear() >= 2000 && validDate < now
-                }
-                return false
-              })
-              .reduce((sum, charge) => sum + charge.stock, 0)
-            
-            // 计算购买库存
-            const purchasedStock = purchasedCharges
-              .filter(charge => charge.stock > 0)
-              .reduce((sum, charge) => sum + charge.stock, 0)
-            
-            // 总票数
-            const totalStock = allIssuedStock + purchasedStock
-            
-            // 格式化总票数显示
-            let totalStockText = `${totalStock}（发票：${allIssuedStock}`
-            if (showExpired && expiredIssuedStock > 0) {
-              totalStockText += `（包含过期：${expiredIssuedStock}）`
-            }
-            totalStockText += ` + 购买：${purchasedStock}）`
-            
-            // 过滤显示的被发功能票
-            let displayIssuedCharges: typeof issuedCharges
-            if (showExpired) {
-              displayIssuedCharges = issuedCharges.filter(charge => charge.stock > 0)
-            } else {
-              displayIssuedCharges = issuedCharges.filter(charge => {
-                if (charge.stock <= 0) return false
-                if (charge.validDate) {
-                  const validDate = new Date(charge.validDate)
-                  return validDate.getFullYear() >= 2000 && validDate >= now
-                }
-                return true
-              })
-            }
-            
-            // 过滤显示的购买功能票
-            const displayPurchasedCharges = purchasedCharges.filter(charge => charge.stock > 0)
-            
-            // 显示票券信息
-            if (displayIssuedCharges.length > 0 || displayPurchasedCharges.length > 0) {
-              statusInfo += `\n\n🎫 票券情况（总票数: ${totalStockText}）${showExpired ? '（包含过期）' : ''}：\n`
-              
-              // 显示被发的功能票（发票）
-              if (displayIssuedCharges.length > 0) {
-                statusInfo += `\n📤 被发的功能票（发票）：\n`
-                for (const charge of displayIssuedCharges) {
-                  const ticketName = getTicketName(charge.chargeId)
-                  
-                  // 检查购买日期是否异常（小于2000年）
-                  let purchaseDate: string
-                  if (charge.purchaseDate) {
-                    const purchaseDateObj = new Date(charge.purchaseDate)
-                    if (purchaseDateObj.getFullYear() < 2000) {
-                      purchaseDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
-                    } else {
-                      purchaseDate = purchaseDateObj.toLocaleString('zh-CN')
-                    }
-                  } else {
-                    purchaseDate = '未知'
-                  }
-                  
-                  // 检查有效期日期是否异常（小于2000年）
-                  let validDate: string
-                  if (charge.validDate) {
-                    const validDateObj = new Date(charge.validDate)
-                    if (validDateObj.getFullYear() < 2000) {
-                      validDate = '19**/*/* **:**:00 [Hacked | 异常登录]'
-                    } else {
-                      validDate = validDateObj.toLocaleString('zh-CN')
-                    }
-                  } else {
-                    validDate = '未知'
-                  }
-                  
-                  // 检查是否过期（只检查正常日期）
-                  const isExpired = charge.validDate && new Date(charge.validDate).getFullYear() >= 2000
-                    ? new Date(charge.validDate) < now
-                    : false
-                  
-                  statusInfo += `\n${ticketName} (ID: ${charge.chargeId})${isExpired ? ' [已过期]' : ''}\n`
-                  statusInfo += `  库存: ${charge.stock}\n`
-                  statusInfo += `  购买日期: ${purchaseDate}\n`
-                  statusInfo += `  有效期至: ${validDate}\n`
-                }
-              }
-              
-              // 显示用户购买的功能票
-              if (displayPurchasedCharges.length > 0) {
-                statusInfo += `\n🛒 用户购买的功能票：\n`
-                for (const charge of displayPurchasedCharges) {
-                  const ticketName = getTicketName(charge.chargeId)
-                  
-                  statusInfo += `\n${ticketName} (ID: ${charge.chargeId})\n`
-                  statusInfo += `  库存: ${charge.stock}\n`
-                }
-              }
-            } else {
-              statusInfo += `\n\n🎫 票券情况: 总票数 ${totalStockText}`
-            }
-          }
-        } catch (error) {
-          logger.warn('获取票券信息失败:', error)
-          statusInfo += `\n\n🎫 票券情况: 获取失败，请检查API服务`
-        }
+        // @deprecated getCharge功能已在新API中移除，已注释
+        statusInfo += `\n\n🎫 票券情况: 此功能已在新API中移除`
 
         return statusInfo
       } catch (error: any) {
@@ -1431,7 +1440,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 锁定账号（登录保持）
    * 用法: /mai锁定
+   * @deprecated 锁定功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai锁定 [targetUserId:text]', '锁定账号，防止他人登录')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -1528,11 +1539,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 锁定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 解锁账号（登出）
    * 用法: /mai解锁
+   * @deprecated 解锁功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai解锁 [targetUserId:text]', '解锁账号（仅限通过mai锁定指令锁定的账号）')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -1613,6 +1627,7 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 解锁失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 绑定水鱼Token
@@ -1830,23 +1845,79 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
+        // 获取qr_text（交互式或从绑定中获取）
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          if (qrTextResult.needRebind) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (!rebindResult.success) {
+              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            }
+            // 重新绑定成功后，使用新的binding
+            const updatedBinding = rebindResult.newBinding || binding
+            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 使用新的qrText继续
+            await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
+            const ticketResult = await api.getTicket(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              multiple,
+              retryQrText.qrText
+            )
+            if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
+              return '❌ 发放功能票失败：服务器返回未成功，请稍后再试'
+            }
+            return `✅ 已为 ${maskUserId(updatedBinding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+          }
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
         await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
-        const ticketResult = await api.getTicket(
-          binding.maiUid,
-          multiple,
-          machineInfo.clientId,
-          machineInfo.regionId,
-          machineInfo.placeId,
-          machineInfo.placeName,
-          machineInfo.regionName,
-        )
+        // 使用新API获取功能票（需要qr_text）
+        let ticketResult
+        try {
+          ticketResult = await api.getTicket(
+            machineInfo.regionId,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            multiple,
+            qrTextResult.qrText
+          )
+        } catch (error: any) {
+          // 如果API返回失败，可能需要重新绑定
+          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+            // 重新绑定成功，重试获取功能票
+            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+            }
+            ticketResult = await api.getTicket(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              multiple,
+              retryQrText.qrText
+            )
+          } else {
+            throw error
+          }
+        }
 
-        if (
-          ticketResult.LoginStatus === false ||
-          ticketResult.LogoutStatus === false ||
-          ticketResult.TicketStatus === false
-        ) {
+        if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
+          // 如果返回失败，可能需要重新绑定
+          if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (rebindResult.success && rebindResult.newBinding) {
+              return `✅ 重新绑定成功！请重新执行发票操作。`
+            }
+            return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+          }
           return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
         }
 
@@ -1866,7 +1937,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 舞里程发放 / 签到
    * 用法: /mai舞里程 <里程数>
+   * @deprecated 发舞里程功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai舞里程 <mile:number> [targetUserId:text]', '为账号发放舞里程（maimile）')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -1948,6 +2021,7 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 发放舞里程失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 上传B50到水鱼
@@ -1980,12 +2054,89 @@ export function apply(ctx: Context, config: Config) {
           return maintenanceMsg
         }
 
-        // 上传B50
-        const result = await api.uploadB50(binding.maiUid, binding.fishToken)
+        // 获取qr_text（交互式或从绑定中获取）
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          if (qrTextResult.needRebind) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (!rebindResult.success) {
+              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            }
+            // 重新绑定成功后，使用新的binding
+            const updatedBinding = rebindResult.newBinding || binding
+            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 使用新的qrText继续
+            const result = await api.uploadB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              binding.fishToken
+            )
+            if (!result.UploadStatus) {
+              if (result.msg === '该账号下存在未完成的任务') {
+                return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+              }
+              return `❌ 上传失败：${result.msg || '未知错误'}`
+            }
+            scheduleB50Notification(session, result.task_id)
+            return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
+          }
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        // 上传B50（使用新API，需要qr_text）
+        let result
+        try {
+          result = await api.uploadB50(
+            machineInfo.regionId,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            qrTextResult.qrText,
+            binding.fishToken
+          )
+        } catch (error: any) {
+          // 如果API返回失败，可能需要重新绑定
+          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+            // 重新绑定成功，重试上传
+            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+            }
+            result = await api.uploadB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              binding.fishToken
+            )
+          } else {
+            throw error
+          }
+        }
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
             return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+          }
+          return `❌ 上传失败：${result.msg || '未知错误'}`
+        }
+
+        if (!result.UploadStatus) {
+          if (result.msg === '该账号下存在未完成的任务') {
+            return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+          }
+          // 如果返回失败，可能需要重新绑定
+          if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (rebindResult.success && rebindResult.newBinding) {
+              return `✅ 重新绑定成功！请重新执行上传操作。`
+            }
+            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}`
           }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
@@ -2018,7 +2169,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 清空功能票
    * 用法: /mai清票
+   * @deprecated 清票功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai清票 [targetUserId:text]', '清空账号的所有功能票')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -2070,7 +2223,7 @@ export function apply(ctx: Context, config: Config) {
         // 如果4个状态都是 false，需要重新绑定二维码
         if (checkAllStatusFalse(result)) {
           await session.send('🔄 二维码已失效，需要重新绑定后才能继续操作')
-          const rebindResult = await promptForRebind(session, ctx, api, binding, rebindTimeout)
+          const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
           if (rebindResult.success && rebindResult.newBinding) {
             // 重新绑定成功后，尝试再次清票
             try {
@@ -2122,6 +2275,7 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 清票失败\n错误信息： ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 查询B50任务状态
@@ -2151,16 +2305,22 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 查询任务详情
-        const taskDetail = await api.getB50TaskById(taskStatus.alive_task_id)
+        const taskDetail = await api.getB50TaskById(String(taskStatus.alive_task_id))
 
+        const startTime = typeof taskStatus.alive_task_time === 'number' 
+          ? taskStatus.alive_task_time 
+          : parseInt(String(taskStatus.alive_task_time))
         let statusInfo = `📊 B50上传任务状态\n\n` +
                         `任务ID: ${taskStatus.alive_task_id}\n` +
-                        `开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n`
+                        `开始时间: ${new Date(startTime * 1000).toLocaleString('zh-CN')}\n`
 
         if (taskDetail.done) {
           statusInfo += `状态: ✅ 已完成\n`
           if (taskDetail.alive_task_end_time) {
-            statusInfo += `完成时间: ${new Date(parseInt(taskDetail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}\n`
+            const endTime = typeof taskDetail.alive_task_end_time === 'number'
+              ? taskDetail.alive_task_end_time
+              : parseInt(String(taskDetail.alive_task_end_time))
+            statusInfo += `完成时间: ${new Date(endTime * 1000).toLocaleString('zh-CN')}\n`
           }
           if (taskDetail.error) {
             statusInfo += `错误信息: ${taskDetail.error}\n`
@@ -2185,7 +2345,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 发收藏品
    * 用法: /mai发收藏品
+   * @deprecated 发收藏品功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai发收藏品 [targetUserId:text]', '发放收藏品')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -2266,11 +2428,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 发放失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 清收藏品
    * 用法: /mai清收藏品
+   * @deprecated 清收藏品功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai清收藏品 [targetUserId:text]', '清空收藏品')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -2354,11 +2519,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 清空失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 上传乐曲成绩
    * 用法: /mai上传乐曲成绩
+   * @deprecated 上传乐曲成绩功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai上传乐曲成绩 [targetUserId:text]', '上传游戏乐曲成绩')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
@@ -2442,7 +2610,7 @@ export function apply(ctx: Context, config: Config) {
           result.UserLogStatus === false
         ) {
           await session.send('🔄 二维码已失效，需要重新绑定后才能继续操作')
-          const rebindResult = await promptForRebind(session, ctx, api, binding, rebindTimeout)
+          const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
           if (rebindResult.success && rebindResult.newBinding) {
             // 重新绑定成功后，尝试再次上传
             try {
@@ -2507,6 +2675,7 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 上传失败\n错误信息： ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 上传落雪B50
@@ -2551,12 +2720,89 @@ export function apply(ctx: Context, config: Config) {
           return maintenanceMsg
         }
 
-        // 上传落雪B50
-        const result = await api.uploadLxB50(binding.maiUid, finalLxnsCode)
+        // 获取qr_text（交互式或从绑定中获取）
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          if (qrTextResult.needRebind) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (!rebindResult.success) {
+              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            }
+            // 重新绑定成功后，使用新的binding
+            const updatedBinding = rebindResult.newBinding || binding
+            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 使用新的qrText继续
+            const result = await api.uploadLxB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              finalLxnsCode
+            )
+            if (!result.UploadStatus) {
+              if (result.msg === '该账号下存在未完成的任务') {
+                return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+              }
+              return `❌ 上传失败：${result.msg || '未知错误'}`
+            }
+            scheduleLxB50Notification(session, result.task_id)
+            return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
+          }
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        // 上传落雪B50（使用新API，需要qr_text）
+        let result
+        try {
+          result = await api.uploadLxB50(
+            machineInfo.regionId,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            qrTextResult.qrText,
+            finalLxnsCode
+          )
+        } catch (error: any) {
+          // 如果API返回失败，可能需要重新绑定
+          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+            // 重新绑定成功，重试上传
+            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+            if (retryQrText.error) {
+              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+            }
+            result = await api.uploadLxB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              finalLxnsCode
+            )
+          } else {
+            throw error
+          }
+        }
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
             return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+          }
+          return `❌ 上传失败：${result.msg || '未知错误'}`
+        }
+
+        if (!result.UploadStatus) {
+          if (result.msg === '该账号下存在未完成的任务') {
+            return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+          }
+          // 如果返回失败，可能需要重新绑定
+          if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (rebindResult.success && rebindResult.newBinding) {
+              return `✅ 重新绑定成功！请重新执行上传操作。`
+            }
+            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}`
           }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
@@ -2614,16 +2860,22 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 查询任务详情
-        const taskDetail = await api.getLxB50TaskById(taskStatus.alive_task_id)
+        const taskDetail = await api.getLxB50TaskById(String(taskStatus.alive_task_id))
 
+        const startTime = typeof taskStatus.alive_task_time === 'number'
+          ? taskStatus.alive_task_time
+          : parseInt(String(taskStatus.alive_task_time))
         let statusInfo = `📊 落雪B50上传任务状态\n\n` +
                         `任务ID: ${taskStatus.alive_task_id}\n` +
-                        `开始时间: ${new Date(parseInt(taskStatus.alive_task_time) * 1000).toLocaleString('zh-CN')}\n`
+                        `开始时间: ${new Date(startTime * 1000).toLocaleString('zh-CN')}\n`
 
         if (taskDetail.done) {
           statusInfo += `状态: ✅ 已完成\n`
           if (taskDetail.alive_task_end_time) {
-            statusInfo += `完成时间: ${new Date(parseInt(taskDetail.alive_task_end_time) * 1000).toLocaleString('zh-CN')}\n`
+            const endTime = typeof taskDetail.alive_task_end_time === 'number'
+              ? taskDetail.alive_task_end_time
+              : parseInt(String(taskDetail.alive_task_end_time))
+            statusInfo += `完成时间: ${new Date(endTime * 1000).toLocaleString('zh-CN')}\n`
           }
           if (taskDetail.error) {
             statusInfo += `错误信息: ${taskDetail.error}\n`
@@ -2640,6 +2892,78 @@ export function apply(ctx: Context, config: Config) {
         ctx.logger('maibot').error('查询落雪B50任务状态失败:', error)
         if (maintenanceMode) {
           return maintenanceMessage
+        }
+        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+      }
+    })
+
+  /**
+   * 查询选项文件（OPT）
+   * 用法: /mai查询opt <title_ver>
+   * 权限: auth3
+   */
+  ctx.command('mai查询opt <titleVer:text>', '查询Mai2选项文件下载地址')
+    .userFields(['authority'])
+    .action(async ({ session }, titleVer) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      // 检查权限（auth3）
+      if (session.user?.authority !== 3) {
+        return '❌ 权限不足，此功能需要auth等级3'
+      }
+
+      if (!titleVer) {
+        return '❌ 请提供游戏版本号\n用法：/mai查询opt <title_ver>\n例如：/mai查询opt 1.00'
+      }
+
+      try {
+        const result = await api.getOpt(titleVer, machineInfo.clientId)
+
+        if (result.error) {
+          return `❌ 查询失败：${result.error}`
+        }
+
+        let message = `✅ 选项文件查询成功\n\n`
+        message += `游戏版本: ${titleVer}\n`
+        message += `客户端ID: ${machineInfo.clientId}\n\n`
+
+        if (result.app_url && result.app_url.length > 0) {
+          message += `📦 APP文件 (${result.app_url.length}个):\n`
+          result.app_url.forEach((url, index) => {
+            message += `${index + 1}. ${url}\n`
+          })
+          message += `\n`
+        } else {
+          message += `📦 APP文件: 无\n\n`
+        }
+
+        if (result.opt_url && result.opt_url.length > 0) {
+          message += `📦 OPT文件 (${result.opt_url.length}个):\n`
+          result.opt_url.forEach((url, index) => {
+            message += `${index + 1}. ${url}\n`
+          })
+          message += `\n`
+        } else {
+          message += `📦 OPT文件: 无\n\n`
+        }
+
+        if (result.latest_app_time) {
+          message += `最新APP发布时间: ${result.latest_app_time}\n`
+        }
+        if (result.latest_opt_time) {
+          message += `最新OPT发布时间: ${result.latest_opt_time}\n`
+        }
+
+        return message
+      } catch (error: any) {
+        logger.error('查询OPT失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
         return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
@@ -2698,9 +3022,14 @@ export function apply(ctx: Context, config: Config) {
       logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)
       
       // 获取当前登录状态
-      const preview = await api.preview(binding.maiUid)
-      const currentLoginStatus = parseLoginStatus(preview.IsLogin)
-      logger.info(`用户 ${binding.userId} 当前API返回的登录状态: ${currentLoginStatus} (IsLogin原始值: "${preview.IsLogin}", 类型: ${typeof preview.IsLogin})`)
+      // 使用新API获取用户信息（需要qr_text）
+      if (!binding.qrCode) {
+        logger.warn(`用户 ${binding.userId} 没有qrCode，跳过状态检查`)
+        return
+      }
+      const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
+      const currentLoginStatus = preview.IsLogin === true
+      logger.info(`用户 ${binding.userId} 当前API返回的登录状态: ${currentLoginStatus} (IsLogin: ${preview.IsLogin})`)
 
       // 比较数据库中的上一次状态和当前状态（在更新数据库之前比较）
       // 如果 lastSavedStatus 是 undefined，说明是首次检查，不发送消息
@@ -2862,7 +3191,9 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 刷新单个锁定账号的登录状态
+   * @deprecated 锁定功能已在新API中移除，已注释
    */
+  /*
   const refreshSingleLockedAccount = async (binding: UserBinding) => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
@@ -2920,7 +3251,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 保持锁定账号的登录状态
    * 使用并发处理和延迟对锁定的用户重新执行login
+   * @deprecated 锁定功能已在新API中移除，已注释
    */
+  /*
   const refreshLockedAccounts = async () => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
@@ -2980,10 +3313,13 @@ export function apply(ctx: Context, config: Config) {
     logger.info('执行首次锁定账号刷新...')
     refreshLockedAccounts()
   }, 30000) // 30秒后执行首次刷新
+  */
 
   /**
    * 保护模式：自动锁定单个账号（当检测到下线时）
+   * @deprecated 保护模式功能已在新API中移除，已注释
    */
+  /*
   const autoLockAccount = async (binding: UserBinding) => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
@@ -3008,8 +3344,13 @@ export function apply(ctx: Context, config: Config) {
       logger.debug(`保护模式：检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
       
       // 获取当前登录状态
-      const preview = await api.preview(binding.maiUid)
-      const currentLoginStatus = parseLoginStatus(preview.IsLogin)
+      // 使用新API获取用户信息（需要qr_text）
+      if (!binding.qrCode) {
+        logger.warn(`用户 ${binding.userId} 没有qrCode，跳过状态检查`)
+        return
+      }
+      const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
+      const currentLoginStatus = preview.IsLogin === true
       logger.debug(`用户 ${binding.userId} 当前登录状态: ${currentLoginStatus}`)
 
       // 如果账号已下线，尝试自动锁定
@@ -3096,7 +3437,9 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 保护模式：检查所有启用保护模式的账号，自动锁定已下线的账号
+   * @deprecated 保护模式功能已在新API中移除，已注释
    */
+  /*
   const checkProtectionMode = async () => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
@@ -3295,12 +3638,17 @@ export function apply(ctx: Context, config: Config) {
         if (newState && binding.lastLoginStatus === undefined) {
           try {
             logger.debug(`初始化用户 ${targetUserId} 的登录状态...`)
-            const preview = await api.preview(binding.maiUid)
-            const loginStatus = parseLoginStatus(preview.IsLogin)
+            // 使用新API获取用户信息（需要qr_text）
+            if (!binding.qrCode) {
+              logger.warn(`用户 ${targetUserId} 没有qrCode，跳过状态初始化`)
+              return
+            }
+            const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
+            const loginStatus = preview.IsLogin === true
             await ctx.database.set('maibot_bindings', { userId: targetUserId }, {
               lastLoginStatus: loginStatus,
             })
-            logger.info(`用户 ${targetUserId} 初始登录状态: ${loginStatus} (IsLogin原始值: "${preview.IsLogin}")`)
+            logger.info(`用户 ${targetUserId} 初始登录状态: ${loginStatus} (IsLogin: ${preview.IsLogin})`)
           } catch (error) {
             logger.warn(`初始化用户 ${targetUserId} 登录状态失败:`, error)
           }
@@ -3324,7 +3672,9 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 开关账号保护模式
    * 用法: /mai保护模式 [on|off]
+   * @deprecated 保护模式功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai保护模式 [state:text] [targetUserId:text]', '开关账号保护模式（自动锁定已下线的账号）')
     .userFields(['authority'])
     .action(async ({ session }, state, targetUserId) => {
@@ -3430,11 +3780,14 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
+  */
 
   /**
    * 管理员一键关闭所有人的锁定模式和保护模式
    * 用法: /mai管理员关闭所有锁定和保护
+   * @deprecated 锁定和保护模式功能已在新API中移除，已注释
    */
+  /*
   ctx.command('mai管理员关闭所有锁定和保护', '管理员一键关闭所有人的锁定模式和保护模式（需要auth等级3以上）')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
