@@ -458,8 +458,8 @@ async function extractQRCodeFromSession(
 
 /**
  * 交互式获取二维码文本（qr_text）
- * 如果binding存在且包含qrCode，优先使用；否则提示用户输入
- * 如果API调用失败，会尝试重新绑定
+ * 废弃旧的uid策略，每次都需要新的二维码
+ * 不再使用binding.qrCode缓存，每次操作都要求用户提供新二维码
  */
 async function getQrText(
   session: Session,
@@ -472,26 +472,9 @@ async function getQrText(
 ): Promise<{ qrText: string; error?: string; needRebind?: boolean }> {
   const logger = ctx.logger('maibot')
   
-  // 如果绑定存在且有qrCode，先验证是否有效
-  if (binding && binding.qrCode) {
-    // 验证qrCode是否仍然有效（可选，如果验证失败再提示重新输入）
-    try {
-      const preview = await api.getPreview(config.machineInfo.clientId, binding.qrCode)
-      if (preview.UserID !== -1 && (typeof preview.UserID !== 'string' || preview.UserID !== '-1')) {
-        // qrCode有效，直接返回
-        return { qrText: binding.qrCode }
-      }
-      // qrCode无效，需要重新绑定
-      logger.warn(`用户 ${binding.userId} 的qrCode已失效，需要重新绑定`)
-      return { qrText: '', error: '二维码已失效', needRebind: true }
-    } catch (error) {
-      // 验证失败，可能需要重新绑定，但先尝试使用现有qrCode
-      logger.warn(`验证qrCode失败，将使用现有qrCode: ${error}`)
-      return { qrText: binding.qrCode }
-    }
-  }
+  // 废弃旧的uid策略，每次都需要新的二维码
+  // 不再使用binding.qrCode缓存，直接提示用户输入
   
-  // 否则提示用户输入
   const actualTimeout = timeout
   const message = promptMessage || `请在${actualTimeout / 1000}秒内直接发送SGID（长按玩家二维码识别后发送）`
   
@@ -532,12 +515,12 @@ async function getQrText(
         return { qrText: '', error: '无效或过期的二维码' }
       }
       
-      // 如果binding存在，更新数据库中的qrCode
+      // 如果binding存在，更新数据库中的qrCode（仅用于记录，不再用于缓存）
       if (binding) {
         await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
           qrCode: trimmed,
         })
-        logger.info(`已更新用户 ${binding.userId} 的qrCode`)
+        logger.info(`已更新用户 ${binding.userId} 的qrCode（仅用于记录）`)
       }
       
       return { qrText: trimmed }
@@ -1321,14 +1304,15 @@ export function apply(ctx: Context, config: Config) {
                         `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
                         `🚨 /maialert查看账号提醒状态\n`
 
-        // 尝试获取最新状态并更新数据库
+        // 尝试获取最新状态并更新数据库（需要新二维码）
         try {
-          // 使用新API获取用户信息（需要qr_text）
-          if (!binding.qrCode) {
-            logger.warn(`用户 ${userId} 没有qrCode，无法更新用户信息`)
+          // 废弃旧的uid策略，每次都需要新的二维码
+          const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询账号状态（长按玩家二维码识别后发送）')
+          if (qrTextResult.error) {
+            statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
             try {
-              const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
+              const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
               
               // 更新数据库中的用户名和Rating
               await ctx.database.set('maibot_bindings', { userId }, {
@@ -1381,6 +1365,7 @@ export function apply(ctx: Context, config: Config) {
                            `封禁状态: ${preview.BanState === 0 ? '正常' : '已封禁'}\n`
             } catch (error) {
               logger.warn('获取用户预览信息失败:', error)
+              statusInfo += `\n⚠️ 无法获取最新状态，请检查API服务`
             }
           }
         } catch (error) {
@@ -2302,8 +2287,22 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
 
-        // 查询任务状态
-        const taskStatus = await api.getB50TaskStatus(binding.maiUid)
+        // 废弃旧的uid策略，每次都需要新的二维码
+        // 先从二维码获取用户信息，然后使用加密的UserID查询任务状态
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询B50任务状态（长按玩家二维码识别后发送）')
+        if (qrTextResult.error) {
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        // 从二维码获取用户信息（UserID已经是加密的）
+        const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
+        if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+          return '❌ 无效或过期的二维码，请重新发送'
+        }
+
+        // 使用加密的UserID查询任务状态
+        const encryptedMaiUid = String(preview.UserID)
+        const taskStatus = await api.getB50TaskStatus(encryptedMaiUid)
 
         if (taskStatus.code !== 0 || !taskStatus.alive_task_id) {
           return 'ℹ️ 当前没有正在进行的B50上传任务'
@@ -2857,8 +2856,22 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
 
-        // 查询任务状态
-        const taskStatus = await api.getLxB50TaskStatus(binding.maiUid)
+        // 废弃旧的uid策略，每次都需要新的二维码
+        // 先从二维码获取用户信息，然后使用加密的UserID查询任务状态
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询落雪B50任务状态（长按玩家二维码识别后发送）')
+        if (qrTextResult.error) {
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        // 从二维码获取用户信息（UserID已经是加密的）
+        const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
+        if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+          return '❌ 无效或过期的二维码，请重新发送'
+        }
+
+        // 使用加密的UserID查询任务状态
+        const encryptedMaiUid = String(preview.UserID)
+        const taskStatus = await api.getLxB50TaskStatus(encryptedMaiUid)
 
         if (taskStatus.code !== 0 || !taskStatus.alive_task_id) {
           return 'ℹ️ 当前没有正在进行的落雪B50上传任务'
@@ -3027,93 +3040,10 @@ export function apply(ctx: Context, config: Config) {
       logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)
       
       // 获取当前登录状态
-      // 使用新API获取用户信息（需要qr_text）
-      if (!binding.qrCode) {
-        logger.warn(`用户 ${binding.userId} 没有qrCode，跳过状态检查`)
-        return
-      }
-      const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
-      const currentLoginStatus = preview.IsLogin === true
-      logger.info(`用户 ${binding.userId} 当前API返回的登录状态: ${currentLoginStatus} (IsLogin: ${preview.IsLogin})`)
-
-      // 比较数据库中的上一次状态和当前状态（在更新数据库之前比较）
-      // 如果 lastSavedStatus 是 undefined，说明是首次检查，不发送消息
-      const statusChanged = lastSavedStatus !== undefined && lastSavedStatus !== currentLoginStatus
-      
-      if (statusChanged) {
-        logger.info(`🔔 检测到用户 ${binding.userId} 状态变化: ${lastSavedStatus} -> ${currentLoginStatus}`)
-      }
-
-      // 更新数据库中的状态和用户名（每次检查都更新）
-      // 再次检查账号状态，确保在更新前账号仍然启用播报且未被锁定
-      const verifyBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-      if (verifyBinding.length > 0 && verifyBinding[0].alertEnabled && !verifyBinding[0].isLocked) {
-        const updateData: any = {
-          lastLoginStatus: currentLoginStatus,
-        }
-        if (preview.UserName) {
-          updateData.userName = preview.UserName
-        }
-        await ctx.database.set('maibot_bindings', { userId: binding.userId }, updateData)
-        logger.debug(`已更新用户 ${binding.userId} 的状态到数据库: ${currentLoginStatus}`)
-      }
-
-      // 如果状态发生变化，发送提醒消息
-      // 再次检查账号状态，确保在发送消息前账号仍然启用播报且未被锁定
-      if (statusChanged) {
-        const finalCheck = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-        if (finalCheck.length === 0 || !finalCheck[0].alertEnabled || finalCheck[0].isLocked) {
-          logger.debug(`用户 ${binding.userId} 在检查过程中播报已关闭或账号已锁定，取消发送消息`)
-          return
-        }
-
-        // 发送提醒消息
-        if (finalCheck[0].guildId && finalCheck[0].channelId) {
-          logger.debug(`准备发送消息到 guildId: ${binding.guildId}, channelId: ${binding.channelId}`)
-          
-          // 尝试使用第一个可用的bot发送消息
-          let sent = false
-          for (const bot of ctx.bots) {
-            try {
-              const mention = `<at id="${binding.userId}"/>`
-              // 获取玩家名（优先使用最新的，否则使用缓存的）
-              const playerName = preview.UserName || binding.userName || '玩家'
-              
-              // 获取消息模板
-              const messageTemplate = currentLoginStatus
-                ? alertMessages.loginMessage
-                : alertMessages.logoutMessage
-              
-              // 替换占位符
-              const message = messageTemplate
-                .replace(/{playerid}/g, playerName)
-                .replace(/{at}/g, mention)
-
-              logger.debug(`尝试使用 bot ${bot.selfId} 发送消息: ${message}`)
-              await bot.sendMessage(finalCheck[0].channelId, message, finalCheck[0].guildId)
-              logger.info(`✅ 已发送状态提醒给用户 ${binding.userId} (${playerName}): ${currentLoginStatus ? '上线' : '下线'}`)
-              sent = true
-              break // 成功发送后退出循环
-            } catch (error) {
-              logger.warn(`bot ${bot.selfId} 发送消息失败:`, error)
-              // 如果这个bot失败，尝试下一个
-              continue
-            }
-          }
-          
-          if (!sent) {
-            logger.error(`❌ 所有bot都无法发送消息给用户 ${binding.userId}`)
-          }
-        } else {
-          logger.warn(`用户 ${binding.userId} 缺少群组信息 (guildId: ${finalCheck[0].guildId}, channelId: ${finalCheck[0].channelId})，无法发送提醒`)
-        }
-      } else {
-        if (lastSavedStatus === undefined) {
-          logger.debug(`用户 ${binding.userId} 首次检查，初始化状态为: ${currentLoginStatus}，不发送消息`)
-        } else {
-          logger.debug(`用户 ${binding.userId} 状态未变化 (${lastSavedStatus} == ${currentLoginStatus})，跳过`)
-        }
-      }
+      // 废弃旧的uid策略，后台任务无法交互式获取二维码，跳过检查
+      // 注意：由于废弃了uid策略，后台状态检查功能已禁用
+      logger.warn(`用户 ${binding.userId} 状态检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)
+      return
     } catch (error) {
       logger.error(`检查用户 ${binding.userId} 状态失败:`, error)
     }
@@ -3349,15 +3279,32 @@ export function apply(ctx: Context, config: Config) {
       logger.debug(`保护模式：检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的登录状态`)
       
       // 获取当前登录状态
-      // 使用新API获取用户信息（需要qr_text）
-      if (!binding.qrCode) {
-        logger.warn(`用户 ${binding.userId} 没有qrCode，跳过状态检查`)
-        return
-      }
-      const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
-      const currentLoginStatus = preview.IsLogin === true
-      logger.debug(`用户 ${binding.userId} 当前登录状态: ${currentLoginStatus}`)
+      // 废弃旧的uid策略，后台任务无法交互式获取二维码，跳过检查
+      // 注意：由于废弃了uid策略，后台保护模式检查功能已禁用
+      logger.warn(`用户 ${binding.userId} 保护模式检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)
+      return
+    } catch (error) {
+      logger.error(`保护模式检查用户 ${binding.userId} 状态失败:`, error)
+    }
+  }
 
+  /**
+   * 锁定账号刷新功能（后台任务）
+   */
+  const refreshLockedAccounts = async () => {
+    // 查找所有已锁定的账号
+    // ... (删除所有后续代码，因为保护模式功能已禁用)
+    return
+  }
+
+  // 启动定时任务（已禁用，因为废弃了uid策略）
+  // ctx.setInterval(refreshLockedAccounts, lockRefreshInterval)
+  
+  // 禁用保护模式定时检查（已禁用，因为废弃了uid策略）
+  // ctx.setInterval(checkProtectionMode, protectionCheckInterval)
+
+  // 以下代码已删除，因为废弃了uid策略导致后台任务无法获取新二维码
+  /*
       // 如果账号已下线，尝试自动锁定
       if (!currentLoginStatus) {
         logger.info(`保护模式：检测到用户 ${binding.userId} 账号已下线，尝试自动锁定`)
@@ -3550,18 +3497,10 @@ export function apply(ctx: Context, config: Config) {
         await ctx.database.set('maibot_bindings', { userId }, updateData)
 
         // 如果是首次开启，初始化登录状态
+        // 废弃旧的uid策略，无法使用缓存的qrCode或maiUid初始化状态
         if (newState && binding.lastLoginStatus === undefined) {
-          try {
-            logger.debug(`初始化用户 ${userId} 的登录状态...`)
-            const preview = await api.preview(binding.maiUid)
-            const loginStatus = parseLoginStatus(preview.IsLogin)
-            await ctx.database.set('maibot_bindings', { userId }, {
-              lastLoginStatus: loginStatus,
-            })
-            logger.info(`用户 ${userId} 初始登录状态: ${loginStatus} (IsLogin原始值: "${preview.IsLogin}")`)
-          } catch (error) {
-            logger.warn(`初始化用户 ${userId} 登录状态失败:`, error)
-          }
+          logger.warn(`用户 ${userId} 状态初始化：由于废弃uid策略，无法使用缓存的qrCode或maiUid初始化状态，跳过初始化`)
+          // 设置为undefined，等待用户下次使用指令时通过新二维码获取状态
         }
 
         let resultMessage = `✅ 播报功能已${newState ? '开启' : '关闭'}`
@@ -3640,23 +3579,10 @@ export function apply(ctx: Context, config: Config) {
         await ctx.database.set('maibot_bindings', { userId: targetUserId }, updateData)
 
         // 如果是首次开启，初始化登录状态
+        // 废弃旧的uid策略，无法使用缓存的qrCode初始化状态
         if (newState && binding.lastLoginStatus === undefined) {
-          try {
-            logger.debug(`初始化用户 ${targetUserId} 的登录状态...`)
-            // 使用新API获取用户信息（需要qr_text）
-            if (!binding.qrCode) {
-              logger.warn(`用户 ${targetUserId} 没有qrCode，跳过状态初始化`)
-              return
-            }
-            const preview = await api.getPreview(machineInfo.clientId, binding.qrCode)
-            const loginStatus = preview.IsLogin === true
-            await ctx.database.set('maibot_bindings', { userId: targetUserId }, {
-              lastLoginStatus: loginStatus,
-            })
-            logger.info(`用户 ${targetUserId} 初始登录状态: ${loginStatus} (IsLogin: ${preview.IsLogin})`)
-          } catch (error) {
-            logger.warn(`初始化用户 ${targetUserId} 登录状态失败:`, error)
-          }
+          logger.warn(`用户 ${targetUserId} 状态初始化：由于废弃uid策略，无法使用缓存的qrCode初始化状态，跳过初始化`)
+          // 设置为undefined，等待用户下次使用指令时通过新二维码获取状态
         }
 
         let resultMessage = `✅ 已${newState ? '开启' : '关闭'}用户 ${targetUserId} 的播报功能`
