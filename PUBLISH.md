@@ -71,4 +71,3 @@ npm version major  # 1.0.0 -> 2.0.0
 # 然后发布
 npm publish
 ```
-
