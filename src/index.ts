@@ -1119,12 +1119,13 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 帮助指令
-   * 用法: /mai 或 /mai帮助
+   * 用法: /mai 或 /mai帮助 [-h] 显示高级功能（发票、收藏品、舞里程等）
    */
   ctx.command('mai [help:text]', '查看所有可用指令')
     .alias('mai帮助')
     .userFields(['authority'])
-    .action(async ({ session }) => {
+    .option('h', '-h  显示高级功能（发票、收藏品、舞里程等）')
+    .action(async ({ session, options }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -1175,26 +1176,43 @@ export function apply(ctx: Context, config: Config) {
   /mai上传落雪b50 [lxns_code] [@用户] - 为他人上传落雪B50（需要auth等级${authLevelForProxy}以上）`
       }
 
-      helpText += `
+      // 只有在使用 -h 参数时才显示高级功能（发票、收藏品、舞里程等）
+      const showAdvanced = options?.h
+      
+      if (showAdvanced) {
+        helpText += `
 
 🎫 票券管理：
   /mai发票 [倍数] - 为账号发放功能票（2-6倍，默认2倍）
   /mai清票 - 清空账号的所有功能票`
 
-      if (canProxy) {
-        helpText += `
+        if (canProxy) {
+          helpText += `
   /mai发票 [倍数] [@用户] - 为他人发放功能票（需要auth等级${authLevelForProxy}以上）
   /mai清票 [@用户] - 清空他人的功能票（需要auth等级${authLevelForProxy}以上）`
-      }
+        }
 
-      helpText += `
+        helpText += `
 
 🎮 游戏功能：
   /mai舞里程 <里程数> - 为账号发放舞里程（必须是1000的倍数）`
 
-      if (canProxy) {
-        helpText += `
+        if (canProxy) {
+          helpText += `
   /mai舞里程 <里程数> [@用户] - 为他人发放舞里程（需要auth等级${authLevelForProxy}以上）`
+        }
+
+        helpText += `
+
+🎁 收藏品管理：
+  /mai发收藏品 - 发放收藏品（交互式选择类别和ID）
+  /mai清收藏品 - 清空收藏品（交互式选择类别和ID）`
+
+        if (canProxy) {
+          helpText += `
+  /mai发收藏品 [@用户] - 为他人发放收藏品（需要auth等级${authLevelForProxy}以上）
+  /mai清收藏品 [@用户] - 清空他人的收藏品（需要auth等级${authLevelForProxy}以上）`
+        }
       }
 
       helpText += `
