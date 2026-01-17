@@ -1119,12 +1119,12 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 帮助指令
-   * 用法: /mai 或 /mai帮助 [-h] 显示高级功能（发票、收藏品、舞里程等）
+   * 用法: /mai 或 /mai帮助 [--advanced] 显示高级功能（发票、收藏品、舞里程等）
    */
   ctx.command('mai [help:text]', '查看所有可用指令')
     .alias('mai帮助')
     .userFields(['authority'])
-    .option('h', '-h  显示高级功能（发票、收藏品、舞里程等）')
+    .option('advanced', '--advanced  显示高级功能（发票、收藏品、舞里程等）')
     .action(async ({ session, options }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
@@ -1176,8 +1176,8 @@ export function apply(ctx: Context, config: Config) {
   /mai上传落雪b50 [lxns_code] [@用户] - 为他人上传落雪B50（需要auth等级${authLevelForProxy}以上）`
       }
 
-      // 只有在使用 -h 参数时才显示高级功能（发票、收藏品、舞里程等）
-      const showAdvanced = options?.h
+      // 只有在使用 --advanced 参数时才显示高级功能（发票、收藏品、舞里程等）
+      const showAdvanced = options?.advanced
       
       if (showAdvanced) {
         helpText += `
