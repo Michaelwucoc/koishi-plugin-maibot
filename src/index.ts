@@ -40,6 +40,12 @@ export interface Config {
   maintenanceMode?: boolean  // 维护模式开关
   maintenanceMessage?: string  // 维护模式提示消息
   hideLockAndProtection?: boolean  // 隐藏锁定模式和保护模式功能
+  whitelist?: {
+    enabled: boolean  // 白名单开关
+    guildIds: string[]  // 允许使用的群ID列表
+    message: string  // 非白名单群的提示消息
+  }
+  autoRecall?: boolean  // 自动撤回用户发送的SGID消息
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -83,6 +89,16 @@ export const Config: Schema<Config> = Schema.object({
   maintenanceMode: Schema.boolean().default(false).description('维护模式开关，开启时所有指令都会提示维护信息'),
   maintenanceMessage: Schema.string().default('⚠️  Milk Server Studio 正在进行维护。具体清查阅 https://awmc.cc/').description('维护模式提示消息'),
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
+  whitelist: Schema.object({
+    enabled: Schema.boolean().default(false).description('白名单开关，开启后只有白名单内的群可以使用Bot功能'),
+    guildIds: Schema.array(Schema.string()).default(['1072033605']).description('允许使用Bot功能的群ID列表'),
+    message: Schema.string().default('本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。').description('非白名单群的提示消息'),
+  }).description('群白名单配置').default({
+    enabled: false,
+    guildIds: ['1072033605'],
+    message: '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。',
+  }),
+  autoRecall: Schema.boolean().default(true).description('自动撤回用户发送的SGID消息（尝试撤回，如不支持则忽略）'),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -457,6 +473,77 @@ async function extractQRCodeFromSession(
 }
 
 /**
+ * 检查群是否在白名单中（如果白名单功能启用）
+ */
+function checkWhitelist(session: Session | null, config: Config): { allowed: boolean; message?: string } {
+  if (!session) {
+    return { allowed: true }  // 私聊允许
+  }
+
+  const whitelistConfig = config.whitelist || { enabled: false, guildIds: [], message: '' }
+  
+  // 如果白名单未启用，允许所有群
+  if (!whitelistConfig.enabled) {
+    return { allowed: true }
+  }
+
+  // 如果是私聊，允许
+  if (!session.guildId) {
+    return { allowed: true }
+  }
+
+  // 检查群ID是否在白名单中
+  const guildId = String(session.guildId)
+  if (whitelistConfig.guildIds.includes(guildId)) {
+    return { allowed: true }
+  }
+
+  // 不在白名单中
+  return { 
+    allowed: false, 
+    message: whitelistConfig.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。' 
+  }
+}
+
+/**
+ * 尝试撤回用户消息（如果支持）
+ */
+async function tryRecallMessage(
+  session: Session,
+  ctx: Context,
+  config: Config,
+  messageId?: string
+): Promise<void> {
+  const logger = ctx.logger('maibot')
+  
+  // 如果配置中关闭了自动撤回，则跳过
+  if (config.autoRecall === false) {
+    return
+  }
+
+  try {
+    // 如果没有提供messageId，尝试从session中获取
+    const targetMessageId = messageId || session.messageId
+    
+    if (!targetMessageId || !session.channelId) {
+      logger.debug('无法撤回消息：缺少消息ID或频道ID')
+      return
+    }
+
+    // 尝试使用bot的deleteMessage方法
+    if (session.bot && typeof session.bot.deleteMessage === 'function') {
+      await session.bot.deleteMessage(session.channelId, targetMessageId)
+      logger.info(`已撤回用户 ${session.userId} 的消息: ${targetMessageId}`)
+    } else {
+      logger.debug('当前适配器不支持撤回消息功能')
+    }
+  } catch (error: any) {
+    // 撤回失败时不抛出错误，只记录日志
+    logger.debug(`尝试撤回消息失败（可能不支持该功能）: ${error?.message || '未知错误'}`)
+  }
+}
+
+/**
  * 交互式获取二维码文本（qr_text）
  * 废弃旧的uid策略，每次都需要新的二维码
  * 不再使用binding.qrCode缓存，每次操作都要求用户提供新二维码
@@ -535,6 +622,10 @@ async function getQrText(
     }
     
     logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrText.substring(0, 50)}...`)
+    
+    // 尝试撤回用户发送的消息（如果启用了自动撤回）
+    await tryRecallMessage(session, ctx, config)
+    
     await session.send('⏳ 正在处理，请稍候...')
     
     // 验证qrCode是否有效
@@ -764,6 +855,27 @@ export function apply(ctx: Context, config: Config) {
     timeout: config.apiTimeout,
   })
   const logger = ctx.logger('maibot')
+
+  // 监听用户消息，尝试自动撤回包含SGID的消息
+  if (config.autoRecall !== false) {
+    ctx.on('message', async (session) => {
+      // 只处理群聊消息
+      if (!session.guildId || !session.userId) {
+        return
+      }
+
+      // 检查消息内容是否包含SGID或二维码链接
+      const content = session.content?.trim() || ''
+      const isSGID = content.startsWith('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
+      
+      if (isSGID && session.messageId && session.channelId) {
+        // 延迟一小段时间后撤回（确保消息已被处理）
+        setTimeout(async () => {
+          await tryRecallMessage(session, ctx, config, session.messageId)
+        }, 1000)
+      }
+    })
+  }
 
   // 插件运行状态标志，用于在插件停止后阻止新的请求
   let isPluginActive = true
@@ -1130,6 +1242,12 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
       // 获取用户权限
       const userAuthority = (session.user as any)?.authority ?? 0
       const canProxy = userAuthority >= authLevelForProxy
@@ -1290,6 +1408,12 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
       try {
         await session.send('⏳ 正在测试机台连接...')
         const result = await api.maiPing()
@@ -1320,6 +1444,12 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }, qrCode) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       const userId = session.userId
@@ -1513,6 +1643,12 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
       const userId = session.userId
 
       try {
@@ -1546,6 +1682,12 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       try {
@@ -1884,6 +2026,12 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -1984,6 +2132,12 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }, lxnsCode, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       try {
@@ -2087,6 +2241,12 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session, options }, multipleInput, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       const multiple = multipleInput ? Number(multipleInput) : 2
@@ -2312,6 +2472,12 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       try {
@@ -2905,6 +3071,12 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -3139,7 +3311,7 @@ export function apply(ctx: Context, config: Config) {
   const checkUserStatus = async (binding: UserBinding) => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
-      logger.debug('插件已停止，跳过检查用户状态')
+      // logger.debug('插件已停止，跳过检查用户状态')  // 隐藏日志
       return
     }
 
@@ -3147,38 +3319,38 @@ export function apply(ctx: Context, config: Config) {
       // 在执行 preview 前，再次检查账号是否仍然启用播报且未被锁定（可能在并发执行过程中被修改了）
       const currentBinding = await ctx.database.get('maibot_bindings', { userId: binding.userId })
       if (currentBinding.length === 0) {
-        logger.debug(`用户 ${binding.userId} 绑定记录已删除，跳过检查`)
+        // logger.debug(`用户 ${binding.userId} 绑定记录已删除，跳过检查`)  // 隐藏日志
         return
       }
       
       const current = currentBinding[0]
       if (!current.alertEnabled || current.isLocked) {
-        logger.debug(`用户 ${binding.userId} 播报已关闭或账号已锁定，跳过检查 (alertEnabled: ${current.alertEnabled}, isLocked: ${current.isLocked})`)
+        // logger.debug(`用户 ${binding.userId} 播报已关闭或账号已锁定，跳过检查 (alertEnabled: ${current.alertEnabled}, isLocked: ${current.isLocked})`)  // 隐藏日志
         return
       }
 
       // 再次检查插件状态
       if (!isPluginActive) {
-        logger.debug('插件已停止，取消预览请求')
+        // logger.debug('插件已停止，取消预览请求')  // 隐藏日志
         return
       }
 
       // 再次检查插件状态
       if (!isPluginActive) {
-        logger.debug('插件已停止，取消预览请求')
+        // logger.debug('插件已停止，取消预览请求')  // 隐藏日志
         return
       }
 
-      logger.debug(`检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的状态`)
+      // logger.debug(`检查用户 ${binding.userId} (maiUid: ${maskUserId(binding.maiUid)}) 的状态`)  // 隐藏日志
       
       // 从数据库读取上一次保存的状态（用于比较）
       const lastSavedStatus = current.lastLoginStatus
-      logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)
+      // logger.debug(`用户 ${binding.userId} 数据库中保存的上一次状态: ${lastSavedStatus} (类型: ${typeof lastSavedStatus})`)  // 隐藏日志
       
       // 获取当前登录状态
       // 废弃旧的uid策略，后台任务无法交互式获取二维码，跳过检查
       // 注意：由于废弃了uid策略，后台状态检查功能已禁用
-      logger.warn(`用户 ${binding.userId} 状态检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)
+      // logger.warn(`用户 ${binding.userId} 状态检查：由于废弃uid策略，后台任务无法获取新二维码，跳过检查`)  // 隐藏日志
       return
     } catch (error) {
       logger.error(`检查用户 ${binding.userId} 状态失败:`, error)
@@ -3202,52 +3374,53 @@ export function apply(ctx: Context, config: Config) {
   const checkLoginStatus = async () => {
     // 检查插件是否还在运行
     if (!isPluginActive) {
-      logger.debug('插件已停止，取消检查登录状态任务')
+      // logger.debug('插件已停止，取消检查登录状态任务')  // 隐藏日志
       return
     }
 
     // 检查登录播报功能是否被管理员关闭
     if (!alertFeatureEnabled) {
-      logger.debug('登录播报功能已被管理员关闭，跳过检查')
+      // logger.debug('登录播报功能已被管理员关闭，跳过检查')  // 隐藏日志
       return
     }
 
-    logger.debug('开始检查登录状态...')
+    // logger.debug('开始检查登录状态...')  // 隐藏日志，减少刷屏
     try {
       // 获取所有绑定记录
       const allBindings = await ctx.database.get('maibot_bindings', {})
-      logger.debug(`总共有 ${allBindings.length} 个绑定记录`)
+      // logger.debug(`总共有 ${allBindings.length} 个绑定记录`)  // 隐藏日志
       
       // 过滤出启用播报的用户（alertEnabled 为 true），但排除已锁定的账号
       const bindings = allBindings.filter(b => {
         const enabled = b.alertEnabled === true
         const isLocked = b.isLocked === true
-        if (enabled && !isLocked) {
-          logger.debug(`用户 ${b.userId} 启用了播报 (alertEnabled: ${b.alertEnabled}, guildId: ${b.guildId}, channelId: ${b.channelId})`)
-        } else if (enabled && isLocked) {
-          logger.debug(`用户 ${b.userId} 启用了播报但账号已锁定，跳过推送`)
-        }
+        // 隐藏详细的用户状态日志
+        // if (enabled && !isLocked) {
+        //   logger.debug(`用户 ${b.userId} 启用了播报 (alertEnabled: ${b.alertEnabled}, guildId: ${b.guildId}, channelId: ${b.channelId})`)
+        // } else if (enabled && isLocked) {
+        //   logger.debug(`用户 ${b.userId} 启用了播报但账号已锁定，跳过推送`)
+        // }
         return enabled && !isLocked
       })
-      logger.info(`启用播报的用户数量: ${bindings.length}`)
+      // logger.info(`启用播报的用户数量: ${bindings.length}`)  // 隐藏日志
       
-      if (bindings.length > 0) {
-        logger.debug(`启用播报的用户列表: ${bindings.map(b => `${b.userId}(${maskUserId(b.maiUid)})`).join(', ')}`)
-      }
+      // if (bindings.length > 0) {
+      //   logger.debug(`启用播报的用户列表: ${bindings.map(b => `${b.userId}(${maskUserId(b.maiUid)})`).join(', ')}`)
+      // }
       
       if (bindings.length === 0) {
-        logger.debug('没有启用播报的用户，跳过检查')
+        // logger.debug('没有启用播报的用户，跳过检查')  // 隐藏日志
         return
       }
 
       // 使用并发处理
-      logger.debug(`使用并发数 ${concurrency} 检查 ${bindings.length} 个用户`)
+      // logger.debug(`使用并发数 ${concurrency} 检查 ${bindings.length} 个用户`)  // 隐藏日志
       await processBatch(bindings, concurrency, checkUserStatus)
       
     } catch (error) {
       logger.error('检查登录状态失败:', error)
     }
-    logger.debug('登录状态检查完成')
+    // logger.debug('登录状态检查完成')  // 隐藏日志，减少刷屏
   }
 
   // 启动定时任务，使用配置的间隔
@@ -3371,7 +3544,7 @@ export function apply(ctx: Context, config: Config) {
     } catch (error) {
       logger.error('刷新锁定账号登录状态失败:', error)
     }
-    logger.debug('锁定账号登录状态刷新完成')
+    // logger.debug('锁定账号登录状态刷新完成')  // 隐藏日志
   }
 
   // 启动锁定账号刷新任务，每1分钟执行一次
@@ -3564,7 +3737,7 @@ export function apply(ctx: Context, config: Config) {
     } catch (error) {
       logger.error('检查保护模式账号失败:', error)
     }
-    logger.debug('保护模式检查完成')
+    // logger.debug('保护模式检查完成')  // 隐藏日志
   }
 
   // 启动保护模式检查定时任务，使用配置的间隔
