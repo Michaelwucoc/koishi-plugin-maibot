@@ -476,11 +476,11 @@ async function getQrText(
   // 不再使用binding.qrCode缓存，直接提示用户输入
   
   const actualTimeout = timeout
-  const message = promptMessage || `请在${actualTimeout / 1000}秒内直接发送SGID（长按玩家二维码识别后发送）`
+  const message = promptMessage || `请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
   
   try {
     await session.send(message)
-    logger.info(`开始等待用户 ${session.userId} 输入SGID，超时时间: ${actualTimeout}ms`)
+    logger.info(`开始等待用户 ${session.userId} 输入SGID或网页地址，超时时间: ${actualTimeout}ms`)
     
     const promptText = await session.prompt(actualTimeout)
     
@@ -492,28 +492,52 @@ async function getQrText(
     const trimmed = promptText.trim()
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
-    // 链接直接传给API，不提取qrtext参数
-    const qrText = trimmed
+    let qrText = trimmed
     
-    // 检查是否为SGID格式或二维码链接格式
+    // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
     const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
     const isSGID = trimmed.startsWith('SGWCMAID')
     
-    if (!isLink && !isSGID) {
-      await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
-      return { qrText: '', error: '无效的二维码格式，必须是SGID文本或二维码链接' }
+    // 如果是网页地址，提取MAID并转换为SGWCMAID格式
+    if (isLink) {
+      try {
+        // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
+        // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
+        const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+        if (match && match[1]) {
+          const maid = match[1]
+          // 在前面加上 SGWC 变成 SGWCMAID...
+          qrText = 'SGWC' + maid
+          logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrText.substring(0, 24)}...`)
+        } else {
+          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+          return { qrText: '', error: '无法从网页地址中提取MAID' }
+        }
+      } catch (error) {
+        logger.warn('解析网页地址失败:', error)
+        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+        return { qrText: '', error: '网页地址格式错误' }
+      }
+    } else if (!isSGID) {
+      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
+      return { qrText: '', error: '无效的二维码格式，必须是SGID文本或网页地址' }
     }
     
-    // 如果是SGID格式，验证长度
-    if (isSGID && (qrText.length < 48 || qrText.length > 128)) {
+    // 验证SGID格式和长度
+    if (!qrText.startsWith('SGWCMAID')) {
+      await session.send('❌ 转换后的格式错误，必须以 SGWCMAID 开头')
+      return { qrText: '', error: 'SGID格式错误，必须以 SGWCMAID 开头' }
+    }
+    
+    if (qrText.length < 48 || qrText.length > 128) {
       await session.send('❌ SGID长度错误，应在48-128字符之间')
       return { qrText: '', error: '二维码长度错误，应在48-128字符之间' }
     }
     
-    logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrText.substring(0, 50)}...`)
+    logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrText.substring(0, 50)}...`)
     await session.send('⏳ 正在处理，请稍候...')
     
-    // 验证qrCode是否有效（如果是SGID格式，需要验证；如果是链接，直接传给API验证）
+    // 验证qrCode是否有效
     try {
       const preview = await api.getPreview(config.machineInfo.clientId, qrText)
       if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
@@ -596,7 +620,7 @@ async function promptForRebind(
   let promptMessageId: string | undefined
   try {
     const sentMessage = await session.send(
-      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内直接发送SGID（长按玩家二维码识别后发送）`
+      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
     )
     // 尝试从返回的消息中提取消息ID
     if (typeof sentMessage === 'string') {
@@ -622,30 +646,54 @@ async function promptForRebind(
     const trimmed = promptText.trim()
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
-    // 链接直接传给API，不提取qrtext参数
-    const qrCode = trimmed
+    let qrCode = trimmed
     
-    // 检查是否为SGID格式或二维码链接格式
+    // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
     const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
     const isSGID = trimmed.startsWith('SGWCMAID')
     
-    if (!isLink && !isSGID) {
-      await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
-      return { success: false, error: '无效的二维码格式，必须是SGID文本或二维码链接', messageId: promptMessageId }
+    // 如果是网页地址，提取MAID并转换为SGWCMAID格式
+    if (isLink) {
+      try {
+        // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
+        // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
+        const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+        if (match && match[1]) {
+          const maid = match[1]
+          // 在前面加上 SGWC 变成 SGWCMAID...
+          qrCode = 'SGWC' + maid
+          logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
+        } else {
+          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+          return { success: false, error: '无法从网页地址中提取MAID', messageId: promptMessageId }
+        }
+      } catch (error) {
+        logger.warn('解析网页地址失败:', error)
+        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+        return { success: false, error: '网页地址格式错误', messageId: promptMessageId }
+      }
+    } else if (!isSGID) {
+      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
+      return { success: false, error: '无效的二维码格式，必须是SGID文本或网页地址', messageId: promptMessageId }
     }
     
-    // 如果是SGID格式，验证长度
-    if (isSGID && (qrCode.length < 48 || qrCode.length > 128)) {
+    // 验证SGID格式和长度
+    if (!qrCode.startsWith('SGWCMAID')) {
+      await session.send('❌ 识别失败：格式错误，必须以 SGWCMAID 开头')
+      return { success: false, error: 'SGID格式错误，必须以 SGWCMAID 开头', messageId: promptMessageId }
+    }
+    
+    if (qrCode.length < 48 || qrCode.length > 128) {
       await session.send('❌ 识别失败：SGID长度错误，应在48-128字符之间')
       return { success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId }
     }
     
-    logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
+    logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
     
     // 发送识别中反馈
     await session.send('⏳ 正在处理，请稍候...')
 
-    // 使用新API获取用户信息（链接或SGID都直接传给API）
+    // 使用新API获取用户信息
     const machineInfo = config.machineInfo
     let previewResult
     try {
@@ -1088,10 +1136,10 @@ export function apply(ctx: Context, config: Config) {
       let helpText = `📖 舞萌DX机器人指令帮助
 
 🔐 账号管理：
-  /mai绑定 - 绑定舞萌DX账号（支持SGID文本或二维码链接）
+  /mai绑定 - 绑定舞萌DX账号（支持SGID文本或公众号提供的网页地址）
   /mai解绑 - 解绑舞萌DX账号
   /mai状态 - 查询绑定状态
-  /mai ping - 测试机台连接`
+  /maiping - 测试机台连接`
 
       // 有权限的代操作命令
       if (canProxy) {
@@ -1200,7 +1248,7 @@ export function apply(ctx: Context, config: Config) {
 如有问题或建议，请前往QQ群: 1072033605
 
 📝 说明：
-  - 绑定账号支持SGID文本或二维码链接（https://wq.wahlap.net/qrcode/req/?qrtext=...）`
+  - 绑定账号支持SGID文本或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）`
 
       if (canProxy) {
         helpText += `
@@ -1216,10 +1264,9 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * Ping功能
-   * 用法: /mai ping 或 /mai ping机台
+   * 用法: /maiping
    */
-  ctx.command('mai ping [target:text]', '测试机台连接')
-    .alias('mai ping机台')
+  ctx.command('maiping', '测试机台连接')
     .action(async ({ session }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
@@ -1272,7 +1319,7 @@ export function apply(ctx: Context, config: Config) {
           let promptMessageId: string | undefined
           try {
             const sentMessage = await session.send(
-              `请在${actualTimeout / 1000}秒内直接发送SGID（长按玩家二维码识别后发送）`
+              `请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
             )
             if (typeof sentMessage === 'string') {
               promptMessageId = sentMessage
@@ -1296,19 +1343,49 @@ export function apply(ctx: Context, config: Config) {
             const trimmed = promptText.trim()
             logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
             
-            // 链接直接传给API，不提取qrtext参数
             qrCode = trimmed
             
-            // 检查是否为SGID格式或二维码链接格式
+            // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
             const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
             const isSGID = trimmed.startsWith('SGWCMAID')
             
-            if (!isLink && !isSGID) {
-              await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
-              throw new Error('无效的二维码格式，必须是SGID文本或二维码链接')
+            // 如果是网页地址，提取MAID并转换为SGWCMAID格式
+            if (isLink) {
+              try {
+                // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
+                // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
+                const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+                if (match && match[1]) {
+                  const maid = match[1]
+                  // 在前面加上 SGWC 变成 SGWCMAID...
+                  qrCode = 'SGWC' + maid
+                  logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
+                } else {
+                  await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+                  throw new Error('无法从网页地址中提取MAID')
+                }
+              } catch (error) {
+                logger.warn('解析网页地址失败:', error)
+                await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+                throw new Error('网页地址格式错误')
+              }
+            } else if (!isSGID) {
+              await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
+              throw new Error('无效的二维码格式，必须是SGID文本或网页地址')
             }
             
-            logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
+            // 验证SGID格式和长度
+            if (!qrCode.startsWith('SGWCMAID')) {
+              await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+              throw new Error('无效的二维码格式，必须以 SGWCMAID 开头')
+            }
+            
+            if (qrCode.length < 48 || qrCode.length > 128) {
+              await session.send('❌ SGID长度错误，应在48-128字符之间')
+              throw new Error('二维码长度错误，应在48-128字符之间')
+            }
+            
+            logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
             
             // 发送识别中反馈
             await session.send('⏳ 正在处理，请稍候...')
@@ -1326,17 +1403,38 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 链接直接传给API，不提取qrtext参数
-        // 检查是否为SGID格式或二维码链接格式
+        // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
         const isLink = qrCode.includes('https://wq.wahlap.net/qrcode/req/')
         const isSGID = qrCode.startsWith('SGWCMAID')
         
-        if (!isLink && !isSGID) {
-          return '❌ 二维码格式错误，必须是SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）'
+        // 如果是网页地址，提取MAID并转换为SGWCMAID格式
+        if (isLink) {
+          try {
+            // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
+            // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
+            const match = qrCode.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+            if (match && match[1]) {
+              const maid = match[1]
+              // 在前面加上 SGWC 变成 SGWCMAID...
+              qrCode = 'SGWC' + maid
+              logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
+            } else {
+              return '❌ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址'
+            }
+          } catch (error) {
+            logger.warn('解析网页地址失败:', error)
+            return '❌ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址'
+          }
+        } else if (!isSGID) {
+          return '❌ 二维码格式错误，必须是SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）'
         }
         
-        // 如果是SGID格式，验证长度
-        if (isSGID && (qrCode.length < 48 || qrCode.length > 128)) {
+        // 验证SGID格式和长度
+        if (!qrCode.startsWith('SGWCMAID')) {
+          return '❌ 二维码格式错误，必须以 SGWCMAID 开头'
+        }
+        
+        if (qrCode.length < 48 || qrCode.length > 128) {
           return '❌ 二维码长度错误，应在48-128字符之间'
         }
 
@@ -1447,7 +1545,7 @@ export function apply(ctx: Context, config: Config) {
         // 尝试获取最新状态并更新数据库（需要新二维码）
         try {
           // 废弃旧的uid策略，每次都需要新的二维码
-          const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询账号状态（长按玩家二维码识别后发送）')
+          const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址以查询账号状态')
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
