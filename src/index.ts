@@ -856,7 +856,7 @@ export function apply(ctx: Context, config: Config) {
   })
   const logger = ctx.logger('maibot')
 
-  // 监听用户消息，尝试自动撤回包含SGID的消息
+  // 监听用户消息，尝试自动撤回包含SGID、水鱼token或落雪代码的消息
   if (config.autoRecall !== false) {
     ctx.on('message', async (session) => {
       // 只处理群聊消息
@@ -864,15 +864,22 @@ export function apply(ctx: Context, config: Config) {
         return
       }
 
-      // 检查消息内容是否包含SGID或二维码链接
       const content = session.content?.trim() || ''
+      
+      // 检查消息内容是否包含SGID或二维码链接
       const isSGID = content.startsWith('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
       
-      if (isSGID && session.messageId && session.channelId) {
+      // 检查是否是水鱼token（长度127-132字符，且看起来像token）
+      const isFishToken = content.length >= 127 && content.length <= 132 && /^[a-zA-Z0-9+\/=_-]+$/.test(content)
+      
+      // 检查是否是落雪代码（长度15字符，且看起来像代码）
+      const isLxnsCode = content.length === 15 && /^[a-zA-Z0-9]+$/.test(content)
+      
+      if ((isSGID || isFishToken || isLxnsCode) && session.messageId && session.channelId) {
         // 延迟一小段时间后撤回（确保消息已被处理）
         setTimeout(async () => {
           await tryRecallMessage(session, ctx, config, session.messageId)
-        }, 1000)
+        }, 300)  // 减少延迟到300ms，加快撤回速度
       }
     })
   }
