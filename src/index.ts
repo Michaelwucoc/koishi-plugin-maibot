@@ -492,24 +492,30 @@ async function getQrText(
     const trimmed = promptText.trim()
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
-    // 检查是否为SGID格式
-    if (!trimmed.startsWith('SGWCMAID')) {
-      await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）')
-      return { qrText: '', error: '无效的二维码格式，必须以 SGWCMAID 开头' }
+    // 链接直接传给API，不提取qrtext参数
+    const qrText = trimmed
+    
+    // 检查是否为SGID格式或二维码链接格式
+    const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    const isSGID = trimmed.startsWith('SGWCMAID')
+    
+    if (!isLink && !isSGID) {
+      await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
+      return { qrText: '', error: '无效的二维码格式，必须是SGID文本或二维码链接' }
     }
     
-    // 验证二维码格式
-    if (trimmed.length < 48 || trimmed.length > 128) {
+    // 如果是SGID格式，验证长度
+    if (isSGID && (qrText.length < 48 || qrText.length > 128)) {
       await session.send('❌ SGID长度错误，应在48-128字符之间')
       return { qrText: '', error: '二维码长度错误，应在48-128字符之间' }
     }
     
-    logger.info(`✅ 接收到SGID: ${trimmed.substring(0, 20)}...`)
-    await session.send('⏳ 正在处理SGID，请稍候...')
+    logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrText.substring(0, 50)}...`)
+    await session.send('⏳ 正在处理，请稍候...')
     
-    // 验证qrCode是否有效
+    // 验证qrCode是否有效（如果是SGID格式，需要验证；如果是链接，直接传给API验证）
     try {
-      const preview = await api.getPreview(config.machineInfo.clientId, trimmed)
+      const preview = await api.getPreview(config.machineInfo.clientId, qrText)
       if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
         await session.send('❌ 无效或过期的二维码，请重新发送')
         return { qrText: '', error: '无效或过期的二维码' }
@@ -518,12 +524,12 @@ async function getQrText(
       // 如果binding存在，更新数据库中的qrCode（仅用于记录，不再用于缓存）
       if (binding) {
         await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-          qrCode: trimmed,
+          qrCode: qrText,
         })
         logger.info(`已更新用户 ${binding.userId} 的qrCode（仅用于记录）`)
       }
       
-      return { qrText: trimmed }
+      return { qrText: qrText }
     } catch (error: any) {
       logger.error('验证qrCode失败:', error)
       await session.send(`❌ 验证二维码失败：${error?.message || '未知错误'}`)
@@ -616,27 +622,30 @@ async function promptForRebind(
     const trimmed = promptText.trim()
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
-    // 检查是否为SGID格式
-    if (!trimmed.startsWith('SGWCMAID')) {
-      await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）')
-      return { success: false, error: '无效的二维码格式，必须以 SGWCMAID 开头', messageId: promptMessageId }
+    // 链接直接传给API，不提取qrtext参数
+    const qrCode = trimmed
+    
+    // 检查是否为SGID格式或二维码链接格式
+    const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    const isSGID = trimmed.startsWith('SGWCMAID')
+    
+    if (!isLink && !isSGID) {
+      await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
+      return { success: false, error: '无效的二维码格式，必须是SGID文本或二维码链接', messageId: promptMessageId }
     }
     
-    const qrCode = trimmed
-    logger.info(`✅ 接收到SGID: ${qrCode.substring(0, 20)}...`)
-    
-    // 发送识别中反馈
-    await session.send('⏳ 正在处理SGID，请稍候...')
-
-    // 验证二维码格式
-    if (qrCode.length < 48 || qrCode.length > 128) {
+    // 如果是SGID格式，验证长度
+    if (isSGID && (qrCode.length < 48 || qrCode.length > 128)) {
       await session.send('❌ 识别失败：SGID长度错误，应在48-128字符之间')
       return { success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId }
     }
+    
+    logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
+    
+    // 发送识别中反馈
+    await session.send('⏳ 正在处理，请稍候...')
 
-    // 使用新API获取用户信息（需要client_id）
-    // 注意：这里需要从配置中获取client_id，但为了兼容性，我们先尝试使用getPreview
-    // 如果失败，可能需要提示用户输入client_id或从配置中获取
+    // 使用新API获取用户信息（链接或SGID都直接传给API）
     const machineInfo = config.machineInfo
     let previewResult
     try {
@@ -676,7 +685,7 @@ async function promptForRebind(
     })
 
     // 发送成功反馈
-    await session.send(`✅ 重新绑定成功！\n用户ID: ${maskUserId(maiUid)}${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}\n\n⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`)
+    await session.send(`✅ 重新绑定成功！${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}\n\n⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`)
 
     // 获取更新后的绑定
     const updated = await ctx.database.get('maibot_bindings', { userId: binding.userId })
@@ -912,22 +921,23 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const maxAttempts = 20
-    const interval = 1_000  // 减少到5秒轮询一次，更快响应
-    const initialDelay = 2_000  // 首次延迟3秒后开始检查
+    const maxAttempts = 300  // 10分钟超时：300次 * 2秒 = 600秒 = 10分钟
+    const interval = 2_000  // 每2秒轮询一次
+    const initialDelay = 2_000  // 首次延迟2秒后开始检查
     let attempts = 0
 
     const poll = async () => {
       attempts += 1
       try {
         const detail = await api.getB50TaskById(taskId)
-        if (!detail.done && attempts < maxAttempts) {
-          ctx.setTimeout(poll, interval)
-          return
-        }
-
-        if (detail.done) {
-          const statusText = detail.error
+        
+        // 检测 done === true 或者 error is not none 就停止
+        const hasError = detail.error !== null && detail.error !== undefined && detail.error !== ''
+        const isDone = detail.done === true
+        
+        if (isDone || hasError) {
+          // 任务完成或出错，发送通知并停止
+          const statusText = hasError
             ? `❌ 任务失败：${detail.error}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
@@ -938,6 +948,12 @@ export function apply(ctx: Context, config: Config) {
             `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
             guildId,
           )
+          return
+        }
+        
+        // 如果还没完成且没出错，继续轮询（在超时范围内）
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
           return
         }
 
@@ -984,8 +1000,8 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const maxAttempts = 20
-    const interval = 1_000  // 1秒轮询一次，更快响应
+    const maxAttempts = 300  // 10分钟超时：300次 * 2秒 = 600秒 = 10分钟
+    const interval = 2_000  // 每2秒轮询一次
     const initialDelay = 2_000  // 首次延迟2秒后开始检查
     let attempts = 0
 
@@ -993,13 +1009,14 @@ export function apply(ctx: Context, config: Config) {
       attempts += 1
       try {
         const detail = await api.getLxB50TaskById(taskId)
-        if (!detail.done && attempts < maxAttempts) {
-          ctx.setTimeout(poll, interval)
-          return
-        }
-
-        if (detail.done) {
-          const statusText = detail.error
+        
+        // 检测 done === true 或者 error is not none 就停止
+        const hasError = detail.error !== null && detail.error !== undefined && detail.error !== ''
+        const isDone = detail.done === true
+        
+        if (isDone || hasError) {
+          // 任务完成或出错，发送通知并停止
+          const statusText = hasError
             ? `❌ 任务失败：${detail.error}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
@@ -1010,6 +1027,12 @@ export function apply(ctx: Context, config: Config) {
             `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
             guildId,
           )
+          return
+        }
+        
+        // 如果还没完成且没出错，继续轮询（在超时范围内）
+        if (attempts < maxAttempts) {
+          ctx.setTimeout(poll, interval)
           return
         }
 
@@ -1052,67 +1075,177 @@ export function apply(ctx: Context, config: Config) {
    */
   ctx.command('mai [help:text]', '查看所有可用指令')
     .alias('mai帮助')
+    .userFields(['authority'])
     .action(async ({ session }) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
 
-      const helpText = `📖 舞萌DX机器人指令帮助
+      // 获取用户权限
+      const userAuthority = (session.user as any)?.authority ?? 0
+      const canProxy = userAuthority >= authLevelForProxy
+
+      let helpText = `📖 舞萌DX机器人指令帮助
 
 🔐 账号管理：
-  /mai绑定 <SGWCMAID...> - 绑定舞萌DX账号
+  /mai绑定 - 绑定舞萌DX账号（支持SGID文本或二维码链接）
   /mai解绑 - 解绑舞萌DX账号
-  /mai状态 [@用户] - 查询绑定状态（可查看他人，需要权限）
+  /mai状态 - 查询绑定状态
+  /mai ping - 测试机台连接`
 
-🔒 账号锁定：
-  /mai锁定 [@用户] - 锁定账号，防止他人登录
-  /mai解锁 [@用户] - 解锁账号（仅限通过mai锁定指令锁定的账号）
-  /mai逃离 - 解锁账号的别名
+      // 有权限的代操作命令
+      if (canProxy) {
+        helpText += `
+  /mai状态 [@用户] - 查询他人绑定状态（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 🐟 水鱼B50：
-  /mai绑定水鱼 <token> [@用户] - 绑定水鱼Token用于B50上传
-  /mai解绑水鱼 [@用户] - 解绑水鱼Token
-  /mai上传B50 [@用户] - 上传B50数据到水鱼
-  /mai查询B50 [@用户] - 查询B50上传任务状态
+  /mai绑定水鱼 <token> - 绑定水鱼Token用于B50上传
+  /mai解绑水鱼 - 解绑水鱼Token
+  /mai上传B50 - 上传B50数据到水鱼`
+
+      if (canProxy) {
+        helpText += `
+  /mai绑定水鱼 <token> [@用户] - 为他人绑定水鱼Token（需要auth等级${authLevelForProxy}以上）
+  /mai解绑水鱼 [@用户] - 解绑他人的水鱼Token（需要auth等级${authLevelForProxy}以上）
+  /mai上传B50 [@用户] - 为他人上传B50（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 ❄️ 落雪B50：
-  /mai绑定落雪 <lxns_code> [@用户] - 绑定落雪代码用于B50上传
-  /mai解绑落雪 [@用户] - 解绑落雪代码
-  /mai上传落雪b50 [lxns_code] [@用户] - 上传B50数据到落雪
-  /mai查询落雪B50 [@用户] - 查询落雪B50上传任务状态
+  /mai绑定落雪 <lxns_code> - 绑定落雪代码用于B50上传
+  /mai解绑落雪 - 解绑落雪代码
+  /mai上传落雪b50 [lxns_code] - 上传B50数据到落雪`
+
+      if (canProxy) {
+        helpText += `
+  /mai绑定落雪 <lxns_code> [@用户] - 为他人绑定落雪代码（需要auth等级${authLevelForProxy}以上）
+  /mai解绑落雪 [@用户] - 解绑他人的落雪代码（需要auth等级${authLevelForProxy}以上）
+  /mai上传落雪b50 [lxns_code] [@用户] - 为他人上传落雪B50（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 🎫 票券管理：
-  /mai发票 [倍数] [@用户] - 为账号发放功能票（2-6倍，默认2倍）
-  /mai清票 [@用户] - 清空账号的所有功能票
+  /mai发票 [倍数] - 为账号发放功能票（2-6倍，默认2倍）
+  /mai清票 - 清空账号的所有功能票`
+
+      if (canProxy) {
+        helpText += `
+  /mai发票 [倍数] [@用户] - 为他人发放功能票（需要auth等级${authLevelForProxy}以上）
+  /mai清票 [@用户] - 清空他人的功能票（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 🎮 游戏功能：
-  /mai舞里程 <里程数> [@用户] - 为账号发放舞里程（必须是1000的倍数）
-  /mai发收藏品 [@用户] - 发放收藏品（交互式选择）
-  /mai清收藏品 [@用户] - 清空收藏品（交互式选择）
-  /mai上传乐曲成绩 [@用户] - 上传游戏乐曲成绩（交互式输入）
+  /mai舞里程 <里程数> - 为账号发放舞里程（必须是1000的倍数）`
+
+      if (canProxy) {
+        helpText += `
+  /mai舞里程 <里程数> [@用户] - 为他人发放舞里程（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 🔔 提醒功能：
-  /maialert [on|off] - 开关账号状态播报功能
-  /maialert set <用户ID> [on|off] - 设置他人的播报状态（需要auth等级3以上）
+  /maialert [on|off] - 开关账号状态播报功能`
+
+      if (canProxy) {
+        helpText += `
+  /maialert set <用户ID> [on|off] - 设置他人的播报状态（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      // 隐藏锁定和保护模式功能（如果hideLockAndProtection为true）
+      if (!hideLockAndProtection) {
+        helpText += `
+
+🔒 账号锁定：
+  /mai锁定 - 锁定账号，防止他人登录
+  /mai解锁 - 解锁账号（仅限通过mai锁定指令锁定的账号）
+  /mai逃离 - 解锁账号的别名`
+
+        if (canProxy) {
+          helpText += `
+  /mai锁定 [@用户] - 锁定他人账号（需要auth等级${authLevelForProxy}以上）
+  /mai解锁 [@用户] - 解锁他人账号（需要auth等级${authLevelForProxy}以上）`
+        }
+
+        helpText += `
 
 🛡️ 保护模式：
-  /mai保护模式 [on|off] [@用户] - 开关账号保护模式（自动锁定已下线的账号）
+  /mai保护模式 [on|off] - 开关账号保护模式（自动锁定已下线的账号）`
+
+        if (canProxy) {
+          helpText += `
+  /mai保护模式 [on|off] [@用户] - 设置他人的保护模式（需要auth等级${authLevelForProxy}以上）`
+        }
+      }
+
+      if (canProxy) {
+        helpText += `
 
 👑 管理员指令：
-  /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级3以上）
-  /mai管理员关闭登录播报 - 关闭/开启登录播报功能（需要auth等级3以上）
-  /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级3以上）
+  /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级${authLevelForProxy}以上）
+  /mai管理员关闭登录播报 - 关闭/开启登录播报功能（需要auth等级${authLevelForProxy}以上）
+  /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      helpText += `
 
 💬 交流与反馈：
 如有问题或建议，请前往QQ群: 1072033605
 
 📝 说明：
-  - 所有指令支持 [@用户] 参数进行代操作（需要权限）
+  - 绑定账号支持SGID文本或二维码链接（https://wq.wahlap.net/qrcode/req/?qrtext=...）`
+
+      if (canProxy) {
+        helpText += `
+  - 支持 [@用户] 参数进行代操作（需要auth等级${authLevelForProxy}以上）`
+      }
+      
+      helpText += `
   - 部分指令支持 -bypass 参数绕过确认
   - 使用 /mai状态 --expired 可查看过期票券`
 
       return helpText
     })
+
+  /**
+   * Ping功能
+   * 用法: /mai ping 或 /mai ping机台
+   */
+  ctx.command('mai ping [target:text]', '测试机台连接')
+    .alias('mai ping机台')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      try {
+        await session.send('⏳ 正在测试机台连接...')
+        const result = await api.maiPing()
+        
+        if (result.returnCode === 1 && result.serverTime) {
+          const serverTime = new Date(result.serverTime * 1000).toLocaleString('zh-CN')
+          return `✅ 机台连接正常\n服务器时间: ${serverTime}`
+        } else if (result.result === 'down') {
+          return '❌ 机台连接失败，机台可能已下线'
+        } else {
+          return `⚠️ 机台状态未知\n返回结果: ${JSON.stringify(result)}`
+        }
+      } catch (error: any) {
+        ctx.logger('maibot').error('Ping机台失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        return `❌ Ping失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+      }
+    })
+
 // 这个 Fracture_Hikaritsu 不给我吃KFC，故挂在此处。 我很生气。
   /**
    * 绑定用户
@@ -1130,7 +1263,7 @@ export function apply(ctx: Context, config: Config) {
         // 检查是否已绑定
         const existing = await ctx.database.get('maibot_bindings', { userId })
         if (existing.length > 0) {
-          return `❌ 您已经绑定了账号\n用户ID: ${maskUserId(existing[0].maiUid)}\n绑定时间: ${new Date(existing[0].bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
+          return `❌ 您已经绑定了账号\n绑定时间: ${new Date(existing[0].bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
         }
 
         // 如果没有提供SGID，提示用户输入
@@ -1163,18 +1296,22 @@ export function apply(ctx: Context, config: Config) {
             const trimmed = promptText.trim()
             logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
             
-            // 检查是否为SGID格式
-            if (!trimmed.startsWith('SGWCMAID')) {
-              // 如果用户发送了内容但不是SGID，提示并继续等待（但prompt已经返回了，所以这里提示错误）
-              await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）')
-              throw new Error('无效的二维码格式，必须以 SGWCMAID 开头')
+            // 链接直接传给API，不提取qrtext参数
+            qrCode = trimmed
+            
+            // 检查是否为SGID格式或二维码链接格式
+            const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+            const isSGID = trimmed.startsWith('SGWCMAID')
+            
+            if (!isLink && !isSGID) {
+              await session.send('⚠️ 未识别到有效的SGID格式或二维码链接，请发送SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）')
+              throw new Error('无效的二维码格式，必须是SGID文本或二维码链接')
             }
             
-            qrCode = trimmed
-            logger.info(`✅ 接收到SGID: ${qrCode.substring(0, 20)}...`)
+            logger.info(`✅ 接收到${isLink ? '二维码链接' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
             
             // 发送识别中反馈
-            await session.send('⏳ 正在处理SGID，请稍候...')
+            await session.send('⏳ 正在处理，请稍候...')
           } catch (error: any) {
             logger.error(`等待用户输入二维码失败: ${error?.message}`, error)
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
@@ -1189,12 +1326,17 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 验证二维码格式
-        if (!qrCode.startsWith('SGWCMAID')) {
-          return '❌ 二维码格式错误，必须以 SGWCMAID 开头'
+        // 链接直接传给API，不提取qrtext参数
+        // 检查是否为SGID格式或二维码链接格式
+        const isLink = qrCode.includes('https://wq.wahlap.net/qrcode/req/')
+        const isSGID = qrCode.startsWith('SGWCMAID')
+        
+        if (!isLink && !isSGID) {
+          return '❌ 二维码格式错误，必须是SGID文本（SGWCMAID开头）或二维码链接（https://wq.wahlap.net/qrcode/req/...）'
         }
-
-        if (qrCode.length < 48 || qrCode.length > 128) {
+        
+        // 如果是SGID格式，验证长度
+        if (isSGID && (qrCode.length < 48 || qrCode.length > 128)) {
           return '❌ 二维码长度错误，应在48-128字符之间'
         }
 
@@ -1229,7 +1371,6 @@ export function apply(ctx: Context, config: Config) {
         })
 
         return `✅ 绑定成功！\n` +
-               `用户ID: ${maskUserId(maiUid)}\n` +
                (userName ? `用户名: ${userName}\n` : '') +
                (rating ? `Rating: ${rating}\n` : '') +
                `绑定时间: ${new Date().toLocaleString('zh-CN')}\n\n` +
@@ -1269,7 +1410,7 @@ export function apply(ctx: Context, config: Config) {
         // 删除绑定记录
         await ctx.database.remove('maibot_bindings', { userId })
 
-        return `✅ 解绑成功！\n已解绑的用户ID: ${maskUserId(bindings[0].maiUid)}`
+        return `✅ 解绑成功！`
       } catch (error: any) {
         ctx.logger('maibot').error('解绑失败:', error)
         if (maintenanceMode) {
@@ -1300,7 +1441,6 @@ export function apply(ctx: Context, config: Config) {
 
         const userId = binding.userId
         let statusInfo = `✅ 已绑定账号\n\n` +
-                        `用户ID: ${maskUserId(binding.maiUid)}\n` +
                         `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
                         `🚨 /maialert查看账号提醒状态\n`
 
@@ -1465,7 +1605,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 确认操作
         if (!options?.bypass) {
-          const confirm = await promptYesLocal(session, `⚠️ 即将锁定账号 ${maskUserId(binding.maiUid)}\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
+          const confirm = await promptYesLocal(session, `⚠️ 即将锁定账号\n锁定后账号将保持登录状态，防止他人登录\n确认继续？`)
           if (!confirm) {
             return '操作已取消'
           }
@@ -1505,7 +1645,6 @@ export function apply(ctx: Context, config: Config) {
         await ctx.database.set('maibot_bindings', { userId }, updateData)
 
         let message = `✅ 账号已锁定\n` +
-               `用户ID: ${maskUserId(binding.maiUid)}\n` +
                `锁定时间: ${new Date().toLocaleString('zh-CN')}\n\n`
         
         if (binding.alertEnabled === true) {
@@ -1569,7 +1708,7 @@ export function apply(ctx: Context, config: Config) {
         // 确认操作
         if (!options?.bypass) {
           const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
-          const confirm = await promptYesLocal(session, `⚠️ 即将解锁账号 ${maskUserId(binding.maiUid)}${proxyTip}\n确认继续？`)
+          const confirm = await promptYesLocal(session, `⚠️ 即将解锁账号${proxyTip}\n确认继续？`)
           if (!confirm) {
             return '操作已取消'
           }
@@ -1597,7 +1736,6 @@ export function apply(ctx: Context, config: Config) {
         })
 
         let message = `✅ 账号已解锁\n` +
-               `用户ID: ${maskUserId(binding.maiUid)}\n` +
                `建议稍等片刻再登录`
         
         // 如果开启了保护模式，提示用户保护模式会继续监控
@@ -1621,22 +1759,13 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 绑定水鱼Token
-   * 用法: /mai绑定水鱼 <fishToken>
+   * 用法: /mai绑定水鱼 [fishToken]
    */
-  ctx.command('mai绑定水鱼 <fishToken:text> [targetUserId:text]', '绑定水鱼Token用于B50上传')
+  ctx.command('mai绑定水鱼 [fishToken:text] [targetUserId:text]', '绑定水鱼Token用于B50上传')
     .userFields(['authority'])
     .action(async ({ session }, fishToken, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
-      }
-
-      if (!fishToken) {
-        return '请提供水鱼Token\n用法：/mai绑定水鱼 <token>\n\nToken长度应在127-132字符之间'
-      }
-
-      // 验证Token长度
-      if (fishToken.length < 127 || fishToken.length > 132) {
-        return '❌ Token长度错误，应在127-132字符之间'
       }
 
       try {
@@ -1647,6 +1776,33 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const userId = binding.userId
+
+        // 如果没有提供Token，提示用户交互式输入
+        if (!fishToken) {
+          const actualTimeout = rebindTimeout
+          try {
+            await session.send(`请在${actualTimeout / 1000}秒内发送水鱼Token（长度应在127-132字符之间）`)
+            
+            const promptText = await session.prompt(actualTimeout)
+            
+            if (!promptText || !promptText.trim()) {
+              return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
+            }
+            
+            fishToken = promptText.trim()
+          } catch (error: any) {
+            logger.error(`等待用户输入水鱼Token失败: ${error?.message}`, error)
+            if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
+              return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
+            }
+            return `❌ 绑定失败：${error?.message || '未知错误'}`
+          }
+        }
+
+        // 验证Token长度
+        if (fishToken.length < 127 || fishToken.length > 132) {
+          return '❌ Token长度错误，应在127-132字符之间'
+        }
 
         // 更新水鱼Token
         await ctx.database.set('maibot_bindings', { userId }, {
@@ -1705,22 +1861,13 @@ export function apply(ctx: Context, config: Config) {
 
   /**
    * 绑定落雪代码
-   * 用法: /mai绑定落雪 <lxnsCode>
+   * 用法: /mai绑定落雪 [lxnsCode]
    */
-  ctx.command('mai绑定落雪 <lxnsCode:text> [targetUserId:text]', '绑定落雪代码用于B50上传')
+  ctx.command('mai绑定落雪 [lxnsCode:text] [targetUserId:text]', '绑定落雪代码用于B50上传')
     .userFields(['authority'])
     .action(async ({ session }, lxnsCode, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
-      }
-
-      if (!lxnsCode) {
-        return '请提供落雪代码\n用法：/mai绑定落雪 <lxns_code>\n\n落雪代码长度必须为15'
-      }
-
-      // 验证代码长度
-      if (lxnsCode.length !== 15) {
-        return '❌ 落雪代码长度错误，必须为15个字符'
       }
 
       try {
@@ -1731,6 +1878,33 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const userId = binding.userId
+
+        // 如果没有提供落雪代码，提示用户交互式输入
+        if (!lxnsCode) {
+          const actualTimeout = rebindTimeout
+          try {
+            await session.send(`请在${actualTimeout / 1000}秒内发送落雪代码（长度必须为15个字符）`)
+            
+            const promptText = await session.prompt(actualTimeout)
+            
+            if (!promptText || !promptText.trim()) {
+              return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
+            }
+            
+            lxnsCode = promptText.trim()
+          } catch (error: any) {
+            logger.error(`等待用户输入落雪代码失败: ${error?.message}`, error)
+            if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
+              return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
+            }
+            return `❌ 绑定失败：${error?.message || '未知错误'}`
+          }
+        }
+
+        // 验证代码长度
+        if (lxnsCode.length !== 15) {
+          return '❌ 落雪代码长度错误，必须为15个字符'
+        }
 
         // 更新落雪代码
         await ctx.database.set('maibot_bindings', { userId }, {
@@ -1816,7 +1990,7 @@ export function apply(ctx: Context, config: Config) {
         
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
-          const baseTip = `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票${proxyTip}`
+          const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}`
           const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
           if (!confirmFirst) {
             return '操作已取消（第一次确认未通过）'
@@ -1861,7 +2035,7 @@ export function apply(ctx: Context, config: Config) {
             if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
               return '❌ 发放功能票失败：服务器返回未成功，请稍后再试'
             }
-            return `✅ 已为 ${maskUserId(updatedBinding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+            return `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
@@ -1911,7 +2085,7 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
         }
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+        return `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
       } catch (error: any) {
         logger.error('发票失败:', error)
         if (maintenanceMode) {
@@ -2068,12 +2242,12 @@ export function apply(ctx: Context, config: Config) {
             )
             if (!result.UploadStatus) {
               if (result.msg === '该账号下存在未完成的任务') {
-                return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+                return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后再试，无需重复上传。'
               }
               return `❌ 上传失败：${result.msg || '未知错误'}`
             }
             scheduleB50Notification(session, result.task_id)
-            return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
+            return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
@@ -2111,14 +2285,14 @@ export function apply(ctx: Context, config: Config) {
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+            return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后使用 /mai查询B50 查看任务状态，无需重复上传。'
+            return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
           // 如果返回失败，可能需要重新绑定
           if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
@@ -2133,7 +2307,7 @@ export function apply(ctx: Context, config: Config) {
 
         scheduleB50Notification(session, result.task_id)
 
-        return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询B50 查看任务状态`
+        return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
         if (maintenanceMode) {
@@ -2267,84 +2441,7 @@ export function apply(ctx: Context, config: Config) {
     })
   */
 
-  /**
-   * 查询B50任务状态
-   * 用法: /mai查询B50
-   */
-  ctx.command('mai查询B50 [targetUserId:text]', '查询B50上传任务状态')
-    .userFields(['authority'])
-    .action(async ({ session }, targetUserId) => {
-      if (!session) {
-        return '❌ 无法获取会话信息'
-      }
-
-      try {
-        // 获取目标用户绑定
-        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
-        if (error || !binding) {
-          return error || '❌ 获取用户绑定失败'
-        }
-
-        const userId = binding.userId
-
-        // 废弃旧的uid策略，每次都需要新的二维码
-        // 先从二维码获取用户信息，然后使用加密的UserID查询任务状态
-        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询B50任务状态（长按玩家二维码识别后发送）')
-        if (qrTextResult.error) {
-          return `❌ 获取二维码失败：${qrTextResult.error}`
-        }
-
-        // 从二维码获取用户信息（UserID已经是加密的）
-        const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
-        if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-          return '❌ 无效或过期的二维码，请重新发送'
-        }
-
-        // 使用加密的UserID查询任务状态
-        const encryptedMaiUid = String(preview.UserID)
-        const taskStatus = await api.getB50TaskStatus(encryptedMaiUid)
-
-        if (taskStatus.code !== 0 || !taskStatus.alive_task_id) {
-          return 'ℹ️ 当前没有正在进行的B50上传任务'
-        }
-
-        // 查询任务详情
-        const taskDetail = await api.getB50TaskById(String(taskStatus.alive_task_id))
-
-        const startTime = typeof taskStatus.alive_task_time === 'number' 
-          ? taskStatus.alive_task_time 
-          : parseInt(String(taskStatus.alive_task_time))
-        let statusInfo = `📊 B50上传任务状态\n\n` +
-                        `任务ID: ${taskStatus.alive_task_id}\n` +
-                        `开始时间: ${new Date(startTime * 1000).toLocaleString('zh-CN')}\n`
-
-        if (taskDetail.done) {
-          statusInfo += `状态: ✅ 已完成\n`
-          if (taskDetail.alive_task_end_time) {
-            const endTime = typeof taskDetail.alive_task_end_time === 'number'
-              ? taskDetail.alive_task_end_time
-              : parseInt(String(taskDetail.alive_task_end_time))
-            statusInfo += `完成时间: ${new Date(endTime * 1000).toLocaleString('zh-CN')}\n`
-          }
-          if (taskDetail.error) {
-            statusInfo += `错误信息: ${taskDetail.error}\n`
-          }
-        } else {
-          statusInfo += `状态: ⏳ 进行中\n`
-          if (taskDetail.error) {
-            statusInfo += `错误信息: ${taskDetail.error}\n`
-          }
-        }
-
-        return statusInfo
-      } catch (error: any) {
-        ctx.logger('maibot').error('查询B50任务状态失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
-      }
-    })
+  // 查询B50任务状态功能已暂时取消
 
   /**
    * 发收藏品
@@ -2748,12 +2845,12 @@ export function apply(ctx: Context, config: Config) {
             )
             if (!result.UploadStatus) {
               if (result.msg === '该账号下存在未完成的任务') {
-                return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+                return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后再试，无需重复上传。'
               }
               return `❌ 上传失败：${result.msg || '未知错误'}`
             }
             scheduleLxB50Notification(session, result.task_id)
-            return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
+            return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
@@ -2791,14 +2888,14 @@ export function apply(ctx: Context, config: Config) {
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+            return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
           return `❌ 上传失败：${result.msg || '未知错误'}`
         }
 
         if (!result.UploadStatus) {
           if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后使用 /mai查询落雪B50 查看任务状态，无需重复上传。'
+            return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
           // 如果返回失败，可能需要重新绑定
           if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
@@ -2813,7 +2910,7 @@ export function apply(ctx: Context, config: Config) {
 
         scheduleLxB50Notification(session, result.task_id)
 
-        return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n使用 /mai查询落雪B50 查看任务状态`
+        return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
       } catch (error: any) {
         ctx.logger('maibot').error('上传落雪B50失败:', error)
         if (maintenanceMode) {
@@ -2836,84 +2933,7 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  /**
-   * 查询落雪B50任务状态
-   * 用法: /mai查询落雪B50
-   */
-  ctx.command('mai查询落雪B50 [targetUserId:text]', '查询落雪B50上传任务状态')
-    .userFields(['authority'])
-    .action(async ({ session }, targetUserId) => {
-      if (!session) {
-        return '❌ 无法获取会话信息'
-      }
-
-      try {
-        // 获取目标用户绑定
-        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
-        if (error || !binding) {
-          return error || '❌ 获取用户绑定失败'
-        }
-
-        const userId = binding.userId
-
-        // 废弃旧的uid策略，每次都需要新的二维码
-        // 先从二维码获取用户信息，然后使用加密的UserID查询任务状态
-        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID以查询落雪B50任务状态（长按玩家二维码识别后发送）')
-        if (qrTextResult.error) {
-          return `❌ 获取二维码失败：${qrTextResult.error}`
-        }
-
-        // 从二维码获取用户信息（UserID已经是加密的）
-        const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
-        if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
-          return '❌ 无效或过期的二维码，请重新发送'
-        }
-
-        // 使用加密的UserID查询任务状态
-        const encryptedMaiUid = String(preview.UserID)
-        const taskStatus = await api.getLxB50TaskStatus(encryptedMaiUid)
-
-        if (taskStatus.code !== 0 || !taskStatus.alive_task_id) {
-          return 'ℹ️ 当前没有正在进行的落雪B50上传任务'
-        }
-
-        // 查询任务详情
-        const taskDetail = await api.getLxB50TaskById(String(taskStatus.alive_task_id))
-
-        const startTime = typeof taskStatus.alive_task_time === 'number'
-          ? taskStatus.alive_task_time
-          : parseInt(String(taskStatus.alive_task_time))
-        let statusInfo = `📊 落雪B50上传任务状态\n\n` +
-                        `任务ID: ${taskStatus.alive_task_id}\n` +
-                        `开始时间: ${new Date(startTime * 1000).toLocaleString('zh-CN')}\n`
-
-        if (taskDetail.done) {
-          statusInfo += `状态: ✅ 已完成\n`
-          if (taskDetail.alive_task_end_time) {
-            const endTime = typeof taskDetail.alive_task_end_time === 'number'
-              ? taskDetail.alive_task_end_time
-              : parseInt(String(taskDetail.alive_task_end_time))
-            statusInfo += `完成时间: ${new Date(endTime * 1000).toLocaleString('zh-CN')}\n`
-          }
-          if (taskDetail.error) {
-            statusInfo += `错误信息: ${taskDetail.error}\n`
-          }
-        } else {
-          statusInfo += `状态: ⏳ 进行中\n`
-          if (taskDetail.error) {
-            statusInfo += `错误信息: ${taskDetail.error}\n`
-          }
-        }
-
-        return statusInfo
-      } catch (error: any) {
-        ctx.logger('maibot').error('查询落雪B50任务状态失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
-      }
-    })
+  // 查询落雪B50任务状态功能已暂时取消
 
   /**
    * 查询选项文件（OPT）
