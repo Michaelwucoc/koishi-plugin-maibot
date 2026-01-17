@@ -1266,7 +1266,7 @@ export function apply(ctx: Context, config: Config) {
 如有问题或建议，请前往QQ群: 1072033605
 
 📝 说明：
-  - 绑定账号支持SGID文本或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）`
+  - 绑定账号支持SGID文本或公众号提供的网页地址`
 
       if (canProxy) {
         helpText += `
