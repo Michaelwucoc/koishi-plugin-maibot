@@ -494,6 +494,8 @@ class RequestQueue {
     resolve: () => void
     reject: (error: Error) => void
     timestamp: number
+    userId: string
+    channelId: string
   }> = []
   private processing = false
   private interval: number
@@ -505,9 +507,11 @@ class RequestQueue {
 
   /**
    * 加入队列并等待处理
+   * @param userId 用户ID
+   * @param channelId 频道ID
    * @returns Promise<number>，当轮到处理时resolve，返回加入队列时的位置（0表示直接执行，没有排队）
    */
-  async enqueue(): Promise<number> {
+  async enqueue(userId: string, channelId: string): Promise<number> {
     // 如果队列为空且距离上次处理已过间隔时间，直接执行
     if (this.queue.length === 0 && !this.processing) {
       const now = Date.now()
@@ -527,6 +531,8 @@ class RequestQueue {
         resolve: () => resolve(queuePosition),
         reject,
         timestamp: Date.now(),
+        userId,
+        channelId,
       })
 
       // 启动处理循环（如果还没启动）
@@ -572,6 +578,13 @@ class RequestQueue {
   }
 
   /**
+   * 检查是否正在处理
+   */
+  isProcessing(): boolean {
+    return this.processing
+  }
+
+  /**
    * 获取预计等待时间（秒）
    */
   getEstimatedWaitTime(): number {
@@ -579,6 +592,94 @@ class RequestQueue {
     const waitTime = position * (this.interval / 1000)
     return Math.ceil(waitTime)
   }
+
+  /**
+   * 获取用户在队列中的位置
+   * @param userId 用户ID
+   * @param channelId 频道ID（可选，用于更精确的匹配）
+   * @returns 用户在队列中的位置（0表示正在处理或不在队列中，>0表示前面还有多少人）
+   */
+  getUserQueuePosition(userId: string, channelId?: string): number {
+    for (let i = 0; i < this.queue.length; i++) {
+      const task = this.queue[i]
+      if (task.userId === userId && (channelId === undefined || task.channelId === channelId)) {
+        // 返回位置（前面的人数），索引0表示第一个等待的人
+        return i + 1
+      }
+    }
+    // 如果用户不在队列中，检查是否正在处理
+    if (this.processing && this.queue.length > 0) {
+      const firstTask = this.queue[0]
+      if (firstTask.userId === userId && (channelId === undefined || firstTask.channelId === channelId)) {
+        return 0  // 正在处理
+      }
+    }
+    return -1  // 不在队列中
+  }
+
+  /**
+   * 获取用户预计等待时间（秒）
+   * @param userId 用户ID
+   * @param channelId 频道ID（可选）
+   * @returns 预计等待时间（秒），-1表示不在队列中
+   */
+  getUserEstimatedWaitTime(userId: string, channelId?: string): number {
+    const position = this.getUserQueuePosition(userId, channelId)
+    if (position < 0) {
+      return -1
+    }
+    if (position === 0) {
+      return 0  // 正在处理
+    }
+    const waitTime = position * (this.interval / 1000)
+    return Math.ceil(waitTime)
+  }
+}
+
+/**
+ * 处理并转换SGID（从URL或直接SGID）
+ * @param input 用户输入的SGID或URL
+ * @returns 转换后的SGID，如果格式错误返回null
+ */
+function processSGID(input: string): { qrText: string } | null {
+  const trimmed = input.trim()
+  
+  // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
+  const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+  const isSGID = trimmed.startsWith('SGWCMAID')
+  
+  let qrText = trimmed
+  
+  // 如果是网页地址，提取MAID并转换为SGWCMAID格式
+  if (isLink) {
+    try {
+      // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
+      // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
+      const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+      if (match && match[1]) {
+        const maid = match[1]
+        // 在前面加上 SGWC 变成 SGWCMAID...
+        qrText = 'SGWC' + maid
+      } else {
+        return null
+      }
+    } catch (error) {
+      return null
+    }
+  } else if (!isSGID) {
+    return null
+  }
+  
+  // 验证SGID格式和长度
+  if (!qrText.startsWith('SGWCMAID')) {
+    return null
+  }
+  
+  if (qrText.length < 48 || qrText.length > 128) {
+    return null
+  }
+  
+  return { qrText }
 }
 
 /**
@@ -970,33 +1071,48 @@ export function apply(ctx: Context, config: Config) {
   const requestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
 
   /**
-   * 队列包装函数：将命令action包装在队列中
+   * 在API调用前加入队列并等待
+   * 这个函数应该在获取到SGID后、调用API前使用
    */
-  async function withQueue<T>(
-    session: Session,
-    action: () => Promise<T>
-  ): Promise<T> {
+  async function waitForQueue(session: Session): Promise<void> {
     if (!requestQueue) {
-      // 队列未启用，直接执行
-      return action()
+      // 队列未启用，直接返回
+      return
     }
 
-    // 加入队列并等待处理
-    const queuePosition = await requestQueue.enqueue()
+    // 检查必要的 session 属性
+    if (!session.userId || !session.channelId) {
+      logger.warn('无法加入队列：缺少 userId 或 channelId')
+      return
+    }
+
+    // 先获取当前队列位置（不等待）
+    const currentQueueLength = requestQueue.getQueuePosition()
+    const isProcessing = requestQueue.isProcessing()
     
-    // 如果前面有人（queuePosition > 0），说明用户排了队，发送队列提示
-    // 注意：这里queuePosition是加入队列时的位置，如果为0表示直接执行
-    if (queuePosition > 0) {
-      // 计算预计等待时间（基于加入时的位置）
+    // 检查是否需要排队（如果队列不为空或正在处理，需要排队）
+    // 注意：即使队列为空，如果正在处理，也需要排队等待
+    const needsQueue = currentQueueLength > 0 || isProcessing
+    
+    // 如果需要排队，立即发送队列提示消息（在加入队列前发送，确保及时性）
+    if (needsQueue) {
+      // 计算队列位置（当前队列长度 + 1，因为用户即将加入）
+      const queuePosition = currentQueueLength + 1
+      // 计算预计等待时间（基于队列位置）
       const estimatedWait = Math.ceil(queuePosition * (queueConfig.interval / 1000))
       const queueMessage = queueConfig.message
         .replace(/{queuePosition}/g, String(queuePosition))
         .replace(/{queueEST}/g, String(estimatedWait))
-      await session.send(queueMessage)
+      // 立即发送队列提示消息（不等待，使用 fire-and-forget 模式确保及时性）
+      // 使用 void 确保不等待 Promise 完成，同时捕获错误避免未处理的 Promise rejection
+      void session.send(queueMessage).catch(err => {
+        logger.warn('发送队列提示消息失败:', err)
+      })
     }
 
-    // 执行实际的操作
-    return action()
+    // 加入队列并等待处理
+    // 注意：即使发送了队列消息，这里仍然会等待队列处理完成
+    await requestQueue.enqueue(session.userId, session.channelId)
   }
 
   // 监听用户消息，尝试自动撤回包含SGID、水鱼token或落雪代码的消息
@@ -1009,14 +1125,21 @@ export function apply(ctx: Context, config: Config) {
 
       const content = session.content?.trim() || ''
       
-      // 检查消息内容是否包含SGID或二维码链接
-      const isSGID = content.startsWith('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
+      // 检查消息内容是否包含SGID或二维码链接（包括命令中的参数）
+      // 支持格式：/maiu SGWCMAID... 或 /maiu https://wq.wahlap.net/qrcode/req/...
+      // 支持格式：/maiul SGWCMAID... 或 /maiul https://wq.wahlap.net/qrcode/req/...
+      // 支持格式：/mai绑定 SGWCMAID... 或 /mai绑定 https://wq.wahlap.net/qrcode/req/...
+      const isSGID = content.includes('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
       
       // 检查是否是水鱼token（长度127-132字符，且看起来像token）
-      const isFishToken = content.length >= 127 && content.length <= 132 && /^[a-zA-Z0-9+\/=_-]+$/.test(content)
+      // 注意：命令参数中的token也需要检测，所以不能只检查整条消息长度
+      const tokenMatch = content.match(/\b[a-zA-Z0-9+\/=_-]{127,132}\b/)
+      const isFishToken = tokenMatch !== null
       
       // 检查是否是落雪代码（长度15字符，且看起来像代码）
-      const isLxnsCode = content.length === 15 && /^[a-zA-Z0-9]+$/.test(content)
+      // 注意：命令参数中的代码也需要检测
+      const codeMatch = content.match(/\b[a-zA-Z0-9]{15}\b/)
+      const isLxnsCode = codeMatch !== null && !isSGID  // 排除SGID的情况
       
       if ((isSGID || isFishToken || isLxnsCode) && session.messageId && session.channelId) {
         // 延迟一小段时间后撤回（确保消息已被处理）
@@ -1587,6 +1710,46 @@ export function apply(ctx: Context, config: Config) {
 
 // 这个 Fracture_Hikaritsu 不给我吃KFC，故挂在此处。 我很生气。
   /**
+   * 查询队列位置
+   * 用法: /maiqueue
+   */
+  ctx.command('maiqueue', '查询当前队列位置')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
+      // 检查队列是否启用
+      if (!requestQueue) {
+        return 'ℹ️ 队列系统未启用'
+      }
+
+      // 检查必要的 session 属性
+      if (!session.userId || !session.channelId) {
+        return '❌ 无法查询队列：缺少用户信息'
+      }
+
+      // 查询用户在队列中的位置
+      const position = requestQueue.getUserQueuePosition(session.userId, session.channelId)
+      const estimatedWait = requestQueue.getUserEstimatedWaitTime(session.userId, session.channelId)
+      const totalQueue = requestQueue.getQueuePosition()
+
+      if (position < 0) {
+        return `ℹ️ 您当前不在队列中\n队列总长度: ${totalQueue}`
+      } else if (position === 0) {
+        return `✅ 您的请求正在处理中\n队列总长度: ${totalQueue}`
+      } else {
+        return `⏳ 您当前在队列中的位置: 第 ${position} 位\n预计等待时间: ${estimatedWait} 秒\n队列总长度: ${totalQueue}`
+      }
+    })
+
+  /**
    * 绑定用户
    * 用法: /mai绑定 [SGWCMAID...]
    */
@@ -1603,8 +1766,6 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 使用队列系统
-      return withQueue(session, async () => {
-
       const userId = session.userId
 
       try {
@@ -1704,40 +1865,27 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-        const isLink = qrCode.includes('https://wq.wahlap.net/qrcode/req/')
-        const isSGID = qrCode.startsWith('SGWCMAID')
-        
-        // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-        if (isLink) {
-          try {
-            // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
-            // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
-            const match = qrCode.match(/qrcode\/req\/(MAID[^?\.]+)/i)
-            if (match && match[1]) {
-              const maid = match[1]
-              // 在前面加上 SGWC 变成 SGWCMAID...
-              qrCode = 'SGWC' + maid
-              logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
-            } else {
-              return '❌ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址'
-            }
-          } catch (error) {
-            logger.warn('解析网页地址失败:', error)
-            return '❌ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址'
+        // 如果直接提供了qrCode参数，尝试撤回并处理
+        // 注意：如果qrCode是通过交互式输入获取的，已经在getQrText中处理过了
+        // 这里只处理直接通过参数提供的qrCode
+        if (qrCode && !qrCode.startsWith('SGWCMAID')) {
+          // 如果qrCode不是SGWCMAID格式，可能是原始输入，需要处理
+          await tryRecallMessage(session, ctx, config)
+          
+          // 处理并转换SGID（从URL或直接SGID）
+          const processed = processSGID(qrCode)
+          if (!processed) {
+            return '❌ 二维码格式错误，必须是SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）'
           }
-        } else if (!isSGID) {
-          return '❌ 二维码格式错误，必须是SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）'
+          qrCode = processed.qrText
+          logger.info(`从参数中提取并转换SGID: ${qrCode.substring(0, 50)}...`)
+        } else if (qrCode && qrCode.startsWith('SGWCMAID')) {
+          // 如果已经是SGWCMAID格式，说明可能是直接参数传入的，尝试撤回
+          await tryRecallMessage(session, ctx, config)
         }
-        
-        // 验证SGID格式和长度
-        if (!qrCode.startsWith('SGWCMAID')) {
-          return '❌ 二维码格式错误，必须以 SGWCMAID 开头'
-        }
-        
-        if (qrCode.length < 48 || qrCode.length > 128) {
-          return '❌ 二维码长度错误，应在48-128字符之间'
-        }
+
+        // 在调用API前加入队列
+        await waitForQueue(session)
 
         // 使用新API获取用户信息（需要client_id）
         const machineInfo = config.machineInfo
@@ -1784,7 +1932,6 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
-      })
     })
 
   /**
@@ -1844,8 +1991,6 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      // 使用队列系统
-      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -1865,6 +2010,9 @@ export function apply(ctx: Context, config: Config) {
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            
             try {
               const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
               
@@ -1979,7 +2127,6 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
-      })
     })
 
   /**
@@ -2411,8 +2558,6 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3\n例如：/mai发票 6 @userid'
       }
 
-      // 使用队列系统
-      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -2458,6 +2603,8 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             // 使用新的qrText继续
             await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
             const ticketResult = await api.getTicket(
@@ -2474,6 +2621,9 @@ export function apply(ctx: Context, config: Config) {
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
+
+        // 在调用API前加入队列
+        await waitForQueue(session)
 
         await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
@@ -2531,7 +2681,6 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 发票失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
-      })
     })
 
   /**
@@ -2627,9 +2776,10 @@ export function apply(ctx: Context, config: Config) {
    * 上传B50到水鱼
    * 用法: /mai上传B50 [@用户id]
    */
-  ctx.command('mai上传B50 [targetUserId:text]', '上传B50数据到水鱼')
+  ctx.command('mai上传B50 [qrCodeOrTarget:text]', '上传B50数据到水鱼')
+    .alias('maiu')
     .userFields(['authority'])
-    .action(async ({ session }, targetUserId) => {
+    .action(async ({ session }, qrCodeOrTarget) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -2640,9 +2790,24 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      // 使用队列系统
-      return withQueue(session, async () => {
       try {
+        // 解析参数：可能是SGID或targetUserId
+        let qrCode: string | undefined
+        let targetUserId: string | undefined
+        
+        // 检查第一个参数是否是SGID或URL
+        if (qrCodeOrTarget) {
+          const processed = processSGID(qrCodeOrTarget)
+          if (processed) {
+            // 是SGID或URL，尝试撤回
+            await tryRecallMessage(session, ctx, config)
+            qrCode = processed.qrText
+          } else {
+            // 不是SGID，可能是targetUserId
+            targetUserId = qrCodeOrTarget
+          }
+        }
+
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
         if (error || !binding) {
@@ -2662,8 +2827,23 @@ export function apply(ctx: Context, config: Config) {
           return maintenanceMsg
         }
 
-        // 获取qr_text（交互式或从绑定中获取）
-        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
+        let qrTextResult
+        if (qrCode) {
+          // 验证qrCode是否有效
+          try {
+            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+              return '❌ 无效或过期的二维码，请重新发送'
+            }
+            qrTextResult = { qrText: qrCode }
+          } catch (error: any) {
+            return `❌ 验证二维码失败：${error?.message || '未知错误'}`
+          }
+        } else {
+          // 交互式获取
+          qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        }
         if (qrTextResult.error) {
           if (qrTextResult.needRebind) {
             const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
@@ -2676,6 +2856,8 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             // 使用新的qrText继续
             const result = await api.uploadB50(
               machineInfo.regionId,
@@ -2697,6 +2879,9 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
+        // 在调用API前加入队列
+        await waitForQueue(session)
+
         // 上传B50（使用新API，需要qr_text）
         let result
         try {
@@ -2716,6 +2901,8 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             result = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -2768,7 +2955,6 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
-      })
     })
 
   /**
@@ -3223,9 +3409,10 @@ export function apply(ctx: Context, config: Config) {
    * 上传落雪B50
    * 用法: /mai上传落雪b50 [lxns_code] [@用户id]
    */
-  ctx.command('mai上传落雪b50 [lxnsCode:text] [targetUserId:text]', '上传B50数据到落雪')
+  ctx.command('mai上传落雪b50 [qrCodeOrLxnsCode:text] [targetUserId:text]', '上传B50数据到落雪')
+    .alias('maiul')
     .userFields(['authority'])
-    .action(async ({ session }, lxnsCode, targetUserId) => {
+    .action(async ({ session }, qrCodeOrLxnsCode, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
       }
@@ -3236,11 +3423,30 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      // 使用队列系统
-      return withQueue(session, async () => {
       try {
+        // 解析参数：第一个参数可能是SGID/URL或落雪代码
+        let qrCode: string | undefined
+        let lxnsCode: string | undefined
+        let actualTargetUserId: string | undefined = targetUserId
+        
+        // 检查第一个参数是否是SGID或URL
+        if (qrCodeOrLxnsCode) {
+          const processed = processSGID(qrCodeOrLxnsCode)
+          if (processed) {
+            // 是SGID或URL，尝试撤回
+            await tryRecallMessage(session, ctx, config)
+            qrCode = processed.qrText
+          } else if (qrCodeOrLxnsCode.length === 15) {
+            // 可能是落雪代码（15个字符）
+            lxnsCode = qrCodeOrLxnsCode
+          } else {
+            // 可能是targetUserId
+            actualTargetUserId = qrCodeOrLxnsCode
+          }
+        }
+
         // 获取目标用户绑定
-        const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
+        const { binding, isProxy, error } = await getTargetBinding(session, actualTargetUserId)
         if (error || !binding) {
           return error || '❌ 获取用户绑定失败'
         }
@@ -3251,10 +3457,6 @@ export function apply(ctx: Context, config: Config) {
         let finalLxnsCode: string
         if (lxnsCode) {
           // 如果提供了参数，使用参数
-          // 验证落雪代码长度
-          if (lxnsCode.length !== 15) {
-            return '❌ 落雪代码长度错误，必须为15个字符'
-          }
           finalLxnsCode = lxnsCode
         } else {
           // 如果没有提供参数，使用绑定的代码
@@ -3270,8 +3472,23 @@ export function apply(ctx: Context, config: Config) {
           return maintenanceMsg
         }
 
-        // 获取qr_text（交互式或从绑定中获取）
-        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
+        let qrTextResult
+        if (qrCode) {
+          // 验证qrCode是否有效
+          try {
+            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+              return '❌ 无效或过期的二维码，请重新发送'
+            }
+            qrTextResult = { qrText: qrCode }
+          } catch (error: any) {
+            return `❌ 验证二维码失败：${error?.message || '未知错误'}`
+          }
+        } else {
+          // 交互式获取
+          qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        }
         if (qrTextResult.error) {
           if (qrTextResult.needRebind) {
             const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
@@ -3284,6 +3501,8 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             // 使用新的qrText继续
             const result = await api.uploadLxB50(
               machineInfo.regionId,
@@ -3305,6 +3524,9 @@ export function apply(ctx: Context, config: Config) {
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
+        // 在调用API前加入队列
+        await waitForQueue(session)
+
         // 上传落雪B50（使用新API，需要qr_text）
         let result
         try {
@@ -3324,6 +3546,8 @@ export function apply(ctx: Context, config: Config) {
             if (retryQrText.error) {
               return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             result = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -3376,7 +3600,6 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
-      })
     })
 
   // 查询落雪B50任务状态功能已暂时取消
