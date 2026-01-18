@@ -46,6 +46,11 @@ export interface Config {
     message: string  // 非白名单群的提示消息
   }
   autoRecall?: boolean  // 自动撤回用户发送的SGID消息
+  queue?: {
+    enabled: boolean  // 队列系统开关
+    interval: number  // 处理间隔（毫秒），默认10秒
+    message: string  // 队列提示消息模板（支持占位符：{queuePosition} 队列位置，{queueEST} 预计等待秒数）
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -99,6 +104,15 @@ export const Config: Schema<Config> = Schema.object({
     message: '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。',
   }),
   autoRecall: Schema.boolean().default(true).description('自动撤回用户发送的SGID消息（尝试撤回，如不支持则忽略）'),
+  queue: Schema.object({
+    enabled: Schema.boolean().default(false).description('队列系统开关，开启后限制并发请求'),
+    interval: Schema.number().default(10000).description('处理间隔（毫秒），默认10秒（10000毫秒），每间隔时间只处理一个请求'),
+    message: Schema.string().default('你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。').description('队列提示消息模板（支持占位符：{queuePosition} 队列位置，{queueEST} 预计等待秒数）'),
+  }).description('请求队列配置').default({
+    enabled: false,
+    interval: 10000,
+    message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。',
+  }),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -470,6 +484,101 @@ async function extractQRCodeFromSession(
   }
 
   return null
+}
+
+/**
+ * 队列管理器
+ */
+class RequestQueue {
+  private queue: Array<{
+    resolve: () => void
+    reject: (error: Error) => void
+    timestamp: number
+  }> = []
+  private processing = false
+  private interval: number
+  private lastProcessTime = 0
+
+  constructor(interval: number) {
+    this.interval = interval
+  }
+
+  /**
+   * 加入队列并等待处理
+   * @returns Promise<number>，当轮到处理时resolve，返回加入队列时的位置（0表示直接执行，没有排队）
+   */
+  async enqueue(): Promise<number> {
+    // 如果队列为空且距离上次处理已过间隔时间，直接执行
+    if (this.queue.length === 0 && !this.processing) {
+      const now = Date.now()
+      const timeSinceLastProcess = now - this.lastProcessTime
+      if (timeSinceLastProcess >= this.interval) {
+        this.lastProcessTime = now
+        return Promise.resolve(0)  // 0表示直接执行，没有排队
+      }
+    }
+
+    // 需要加入队列
+    return new Promise<number>((resolve, reject) => {
+      // 记录加入队列时的位置（这是用户前面的人数）
+      const queuePosition = this.queue.length
+      
+      this.queue.push({
+        resolve: () => resolve(queuePosition),
+        reject,
+        timestamp: Date.now(),
+      })
+
+      // 启动处理循环（如果还没启动）
+      if (!this.processing) {
+        // 使用setTimeout避免阻塞
+        setTimeout(() => {
+          this.processQueue()
+        }, 0)
+      }
+    })
+  }
+
+  /**
+   * 处理队列
+   */
+  private async processQueue(): Promise<void> {
+    while (this.queue.length > 0) {
+      this.processing = true
+
+      // 等待间隔时间
+      const now = Date.now()
+      const timeSinceLastProcess = now - this.lastProcessTime
+      if (timeSinceLastProcess < this.interval) {
+        await new Promise(resolve => setTimeout(resolve, this.interval - timeSinceLastProcess))
+      }
+
+      // 处理队列中的第一个任务
+      if (this.queue.length > 0) {
+        const task = this.queue.shift()!
+        this.lastProcessTime = Date.now()
+        task.resolve()
+      }
+    }
+
+    this.processing = false
+  }
+
+  /**
+   * 获取队列位置
+   */
+  getQueuePosition(): number {
+    return this.queue.length
+  }
+
+  /**
+   * 获取预计等待时间（秒）
+   */
+  getEstimatedWaitTime(): number {
+    const position = this.getQueuePosition()
+    const waitTime = position * (this.interval / 1000)
+    return Math.ceil(waitTime)
+  }
 }
 
 /**
@@ -855,6 +964,40 @@ export function apply(ctx: Context, config: Config) {
     timeout: config.apiTimeout,
   })
   const logger = ctx.logger('maibot')
+
+  // 初始化队列系统
+  const queueConfig = config.queue || { enabled: false, interval: 10000, message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。' }
+  const requestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
+
+  /**
+   * 队列包装函数：将命令action包装在队列中
+   */
+  async function withQueue<T>(
+    session: Session,
+    action: () => Promise<T>
+  ): Promise<T> {
+    if (!requestQueue) {
+      // 队列未启用，直接执行
+      return action()
+    }
+
+    // 加入队列并等待处理
+    const queuePosition = await requestQueue.enqueue()
+    
+    // 如果前面有人（queuePosition > 0），说明用户排了队，发送队列提示
+    // 注意：这里queuePosition是加入队列时的位置，如果为0表示直接执行
+    if (queuePosition > 0) {
+      // 计算预计等待时间（基于加入时的位置）
+      const estimatedWait = Math.ceil(queuePosition * (queueConfig.interval / 1000))
+      const queueMessage = queueConfig.message
+        .replace(/{queuePosition}/g, String(queuePosition))
+        .replace(/{queueEST}/g, String(estimatedWait))
+      await session.send(queueMessage)
+    }
+
+    // 执行实际的操作
+    return action()
+  }
 
   // 监听用户消息，尝试自动撤回包含SGID、水鱼token或落雪代码的消息
   if (config.autoRecall !== false) {
@@ -1459,6 +1602,9 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      // 使用队列系统
+      return withQueue(session, async () => {
+
       const userId = session.userId
 
       try {
@@ -1638,6 +1784,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+      })
     })
 
   /**
@@ -1697,6 +1844,8 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      // 使用队列系统
+      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -1830,6 +1979,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 查询失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+      })
     })
 
   /**
@@ -2261,6 +2411,8 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 倍数必须是2-6之间的整数\n例如：/mai发票 3\n例如：/mai发票 6 @userid'
       }
 
+      // 使用队列系统
+      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -2379,6 +2531,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 发票失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+      })
     })
 
   /**
@@ -2487,6 +2640,8 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      // 使用队列系统
+      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -2613,6 +2768,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+      })
     })
 
   /**
@@ -3080,6 +3236,8 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      // 使用队列系统
+      return withQueue(session, async () => {
       try {
         // 获取目标用户绑定
         const { binding, isProxy, error } = await getTargetBinding(session, targetUserId)
@@ -3218,6 +3376,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
+      })
     })
 
   // 查询落雪B50任务状态功能已暂时取消
