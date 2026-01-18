@@ -2533,7 +2533,8 @@ export function apply(ctx: Context, config: Config) {
               if (result.msg === '该账号下存在未完成的任务') {
                 return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后再试，无需重复上传。'
               }
-              return `❌ 上传失败：${result.msg || '未知错误'}`
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
             scheduleB50Notification(session, result.task_id)
             return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
@@ -2576,22 +2577,17 @@ export function apply(ctx: Context, config: Config) {
           if (result.msg === '该账号下存在未完成的任务') {
             return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
-          return `❌ 上传失败：${result.msg || '未知错误'}`
-        }
-
-        if (!result.UploadStatus) {
-          if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
-          }
           // 如果返回失败，可能需要重新绑定
           if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
             const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
             if (rebindResult.success && rebindResult.newBinding) {
               return `✅ 重新绑定成功！请重新执行上传操作。`
             }
-            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
           }
-          return `❌ 上传失败：${result.msg || '未知错误'}`
+          const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+          return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
         }
 
         scheduleB50Notification(session, result.task_id)
@@ -3142,7 +3138,8 @@ export function apply(ctx: Context, config: Config) {
               if (result.msg === '该账号下存在未完成的任务') {
                 return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后再试，无需重复上传。'
               }
-              return `❌ 上传失败：${result.msg || '未知错误'}`
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
             scheduleLxB50Notification(session, result.task_id)
             return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
@@ -3185,22 +3182,17 @@ export function apply(ctx: Context, config: Config) {
           if (result.msg === '该账号下存在未完成的任务') {
             return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
           }
-          return `❌ 上传失败：${result.msg || '未知错误'}`
-        }
-
-        if (!result.UploadStatus) {
-          if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
-          }
           // 如果返回失败，可能需要重新绑定
           if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
             const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
             if (rebindResult.success && rebindResult.newBinding) {
               return `✅ 重新绑定成功！请重新执行上传操作。`
             }
-            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
           }
-          return `❌ 上传失败：${result.msg || '未知错误'}`
+          const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+          return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
         }
 
         scheduleLxB50Notification(session, result.task_id)
