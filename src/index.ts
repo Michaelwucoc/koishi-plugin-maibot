@@ -1691,20 +1691,23 @@ export function apply(ctx: Context, config: Config) {
         await session.send('⏳ 正在测试机台连接...')
         const result = await api.maiPing()
         
-        if (result.returnCode === 1 && result.serverTime) {
+        // 检查返回结果是否为 {"result":"Pong"}
+        if (result.result === 'Pong') {
+          return `✅ 机台连接正常\n\n📊 查看所有服务状态: https://status.awmc.cc`
+        } else if (result.returnCode === 1 && result.serverTime) {
           const serverTime = new Date(result.serverTime * 1000).toLocaleString('zh-CN')
-          return `✅ 机台连接正常\n服务器时间: ${serverTime}`
+          return `✅ 机台连接正常\n服务器时间: ${serverTime}\n\n📊 查看所有服务状态: https://status.awmc.cc`
         } else if (result.result === 'down') {
-          return '❌ 机台连接失败，机台可能已下线'
+          return `❌ 机台连接失败，机台可能已下线\n\n📊 查看所有服务状态: https://status.awmc.cc`
         } else {
-          return `⚠️ 机台状态未知\n返回结果: ${JSON.stringify(result)}`
+          return `⚠️ 机台状态未知\n返回结果: ${JSON.stringify(result)}\n\n📊 查看所有服务状态: https://status.awmc.cc`
         }
       } catch (error: any) {
         ctx.logger('maibot').error('Ping机台失败:', error)
         if (maintenanceMode) {
-          return maintenanceMessage
+          return `${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
         }
-        return `❌ Ping失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+        return `❌ Ping失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
       }
     })
 
