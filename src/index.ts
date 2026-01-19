@@ -500,6 +500,7 @@ class RequestQueue {
   private processing = false
   private interval: number
   private lastProcessTime = 0
+  private closed = false
 
   constructor(interval: number) {
     this.interval = interval
@@ -512,6 +513,10 @@ class RequestQueue {
    * @returns Promise<number>，当轮到处理时resolve，返回加入队列时的位置（0表示直接执行，没有排队）
    */
   async enqueue(userId: string, channelId: string): Promise<number> {
+    if (this.closed) {
+      return Promise.reject(new Error('队列已关闭'))
+    }
+
     // 如果队列为空且距离上次处理已过间隔时间，直接执行
     if (this.queue.length === 0 && !this.processing) {
       const now = Date.now()
@@ -524,6 +529,11 @@ class RequestQueue {
 
     // 需要加入队列
     return new Promise<number>((resolve, reject) => {
+      if (this.closed) {
+        reject(new Error('队列已关闭'))
+        return
+      }
+
       // 记录加入队列时的位置（这是用户前面的人数）
       const queuePosition = this.queue.length
       
@@ -549,7 +559,7 @@ class RequestQueue {
    * 处理队列
    */
   private async processQueue(): Promise<void> {
-    while (this.queue.length > 0) {
+    while (this.queue.length > 0 && !this.closed) {
       this.processing = true
 
       // 等待间隔时间
@@ -585,12 +595,66 @@ class RequestQueue {
   }
 
   /**
+   * 获取下一次可处理的剩余时间（毫秒）
+   */
+  private getNextDelayMs(): number {
+    const now = Date.now()
+    const timeSinceLastProcess = now - this.lastProcessTime
+    if (timeSinceLastProcess < 0) {
+      return this.interval
+    }
+    return Math.max(0, this.interval - timeSinceLastProcess)
+  }
+
+  /**
+   * 获取处理间隔（毫秒）
+   */
+  getInterval(): number {
+    return this.interval
+  }
+
+  /**
+   * 获取上次处理时间戳
+   */
+  getLastProcessTime(): number {
+    return this.lastProcessTime
+  }
+
+  /**
+   * 关闭队列并清空等待任务
+   */
+  close(reason: string = '队列已关闭'): void {
+    if (this.closed) return
+    this.closed = true
+    this.processing = false
+    const error = new Error(reason)
+    while (this.queue.length > 0) {
+      const task = this.queue.shift()
+      if (task) {
+        task.reject(error)
+      }
+    }
+  }
+
+  /**
    * 获取预计等待时间（秒）
    */
   getEstimatedWaitTime(): number {
     const position = this.getQueuePosition()
-    const waitTime = position * (this.interval / 1000)
-    return Math.ceil(waitTime)
+    return this.getEstimatedWaitTimeForPosition(position)
+  }
+
+  /**
+   * 根据位置计算预计等待时间（秒）
+   * position=1 表示下一个被处理
+   */
+  getEstimatedWaitTimeForPosition(position: number): number {
+    if (position <= 0) {
+      return 0
+    }
+    const nextDelayMs = this.getNextDelayMs()
+    const waitMs = nextDelayMs + (position - 1) * this.interval
+    return Math.ceil(waitMs / 1000)
   }
 
   /**
@@ -631,8 +695,7 @@ class RequestQueue {
     if (position === 0) {
       return 0  // 正在处理
     }
-    const waitTime = position * (this.interval / 1000)
-    return Math.ceil(waitTime)
+    return this.getEstimatedWaitTimeForPosition(position)
   }
 }
 
@@ -1089,30 +1152,42 @@ export function apply(ctx: Context, config: Config) {
     // 先获取当前队列位置（不等待）
     const currentQueueLength = requestQueue.getQueuePosition()
     const isProcessing = requestQueue.isProcessing()
+    const timeSinceLastProcess = Date.now() - requestQueue.getLastProcessTime()
+    const needsQueue = currentQueueLength > 0 ||
+      isProcessing ||
+      timeSinceLastProcess < requestQueue.getInterval()
     
-    // 检查是否需要排队（如果队列不为空或正在处理，需要排队）
-    // 注意：即使队列为空，如果正在处理，也需要排队等待
-    const needsQueue = currentQueueLength > 0 || isProcessing
-    
-    // 如果需要排队，立即发送队列提示消息（在加入队列前发送，确保及时性）
+    // 无论是否需要排队，都发送队列信息（确保用户能看到状态）
     if (needsQueue) {
-      // 计算队列位置（当前队列长度 + 1，因为用户即将加入）
+      // 需要排队：计算队列位置（当前队列长度 + 1，因为用户即将加入）
       const queuePosition = currentQueueLength + 1
-      // 计算预计等待时间（基于队列位置）
-      const estimatedWait = Math.ceil(queuePosition * (queueConfig.interval / 1000))
+      // 计算预计等待时间（考虑下一次可处理的剩余时间）
+      const estimatedWait = requestQueue.getEstimatedWaitTimeForPosition(queuePosition)
       const queueMessage = queueConfig.message
         .replace(/{queuePosition}/g, String(queuePosition))
         .replace(/{queueEST}/g, String(estimatedWait))
-      // 立即发送队列提示消息（不等待，使用 fire-and-forget 模式确保及时性）
-      // 使用 void 确保不等待 Promise 完成，同时捕获错误避免未处理的 Promise rejection
-      void session.send(queueMessage).catch(err => {
+      // 立即发送队列提示消息（等待发送完成，确保消息及时送达）
+      try {
+        await session.send(queueMessage)
+      } catch (err) {
         logger.warn('发送队列提示消息失败:', err)
-      })
+      }
+    } else {
+      // 不需要排队：发送"正在处理"的消息
+      try {
+        await session.send('⏳ 正在处理您的请求，请稍候...')
+      } catch (err) {
+        logger.warn('发送处理中消息失败:', err)
+      }
     }
 
     // 加入队列并等待处理
     // 注意：即使发送了队列消息，这里仍然会等待队列处理完成
-    await requestQueue.enqueue(session.userId, session.channelId)
+    try {
+      await requestQueue.enqueue(session.userId, session.channelId)
+    } catch (error: any) {
+      logger.warn(`加入队列失败: ${error?.message || '未知错误'}`)
+    }
   }
 
   // 监听用户消息，尝试自动撤回包含SGID、水鱼token或落雪代码的消息
@@ -1128,6 +1203,7 @@ export function apply(ctx: Context, config: Config) {
       // 检查消息内容是否包含SGID或二维码链接（包括命令中的参数）
       // 支持格式：/maiu SGWCMAID... 或 /maiu https://wq.wahlap.net/qrcode/req/...
       // 支持格式：/maiul SGWCMAID... 或 /maiul https://wq.wahlap.net/qrcode/req/...
+      // 支持格式：/maiua SGWCMAID... 或 /maiua https://wq.wahlap.net/qrcode/req/...
       // 支持格式：/mai绑定 SGWCMAID... 或 /mai绑定 https://wq.wahlap.net/qrcode/req/...
       const isSGID = content.includes('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
       
@@ -1155,6 +1231,9 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('dispose', () => {
     isPluginActive = false
     logger.info('插件已停止，将不再执行新的定时任务')
+    if (requestQueue) {
+      requestQueue.close('插件已停止，队列已关闭')
+    }
   })
 
   // 登录播报功能全局开关（管理员可控制）
@@ -1544,13 +1623,15 @@ export function apply(ctx: Context, config: Config) {
 🐟 水鱼B50：
   /mai绑定水鱼 <token> - 绑定水鱼Token用于B50上传
   /mai解绑水鱼 - 解绑水鱼Token
-  /mai上传B50 - 上传B50数据到水鱼`
+  /mai上传B50 - 上传B50数据到水鱼
+  /maiua - 同时上传B50到水鱼和落雪（SGID只需一次）`
 
       if (canProxy) {
         helpText += `
   /mai绑定水鱼 <token> [@用户] - 为他人绑定水鱼Token（需要auth等级${authLevelForProxy}以上）
   /mai解绑水鱼 [@用户] - 解绑他人的水鱼Token（需要auth等级${authLevelForProxy}以上）
-  /mai上传B50 [@用户] - 为他人上传B50（需要auth等级${authLevelForProxy}以上）`
+  /mai上传B50 [@用户] - 为他人上传B50（需要auth等级${authLevelForProxy}以上）
+  /maiua [@用户] - 为他人同时上传B50（需要auth等级${authLevelForProxy}以上）`
       }
 
       helpText += `
@@ -2957,6 +3038,227 @@ export function apply(ctx: Context, config: Config) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
         return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+      }
+    })
+
+  /**
+   * 同时上传B50到水鱼和落雪（SGID输入一次）
+   * 用法: /maiua [SGID/网页地址] [@用户id]
+   */
+  ctx.command('maiua [qrCodeOrLxnsCode:text] [targetUserId:text]', '同时上传B50到水鱼和落雪（SGID只需一次）')
+    .userFields(['authority'])
+    .action(async ({ session }, qrCodeOrLxnsCode, targetUserId) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+
+      try {
+        // 解析参数：可能是SGID/URL或落雪代码或目标用户
+        let qrCode: string | undefined
+        let lxnsCode: string | undefined
+        let actualTargetUserId: string | undefined = targetUserId
+
+        if (qrCodeOrLxnsCode) {
+          const processed = processSGID(qrCodeOrLxnsCode)
+          if (processed) {
+            await tryRecallMessage(session, ctx, config)
+            qrCode = processed.qrText
+          } else if (qrCodeOrLxnsCode.length === 15) {
+            lxnsCode = qrCodeOrLxnsCode
+          } else {
+            actualTargetUserId = qrCodeOrLxnsCode
+          }
+        }
+
+        const { binding, isProxy, error } = await getTargetBinding(session, actualTargetUserId)
+        if (error || !binding) {
+          return error || '❌ 获取用户绑定失败'
+        }
+
+        const userId = binding.userId
+        const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
+
+        if (!binding.fishToken && !binding.lxnsCode && !lxnsCode) {
+          return '❌ 请先绑定水鱼Token和落雪代码\n使用 /mai绑定水鱼 <token> 和 /mai绑定落雪 <lxns_code> 进行绑定'
+        }
+        if (!binding.fishToken) {
+          return '❌ 请先绑定水鱼Token\n使用 /mai绑定水鱼 <token> 进行绑定'
+        }
+        const fishToken = binding.fishToken as string
+
+        const finalLxnsCode = lxnsCode || binding.lxnsCode
+        if (!finalLxnsCode) {
+          return '❌ 请先绑定落雪代码或提供落雪代码参数\n使用 /mai绑定落雪 <lxns_code> 进行绑定\n或使用 /maiua <lxns_code> 直接提供代码'
+        }
+
+        const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+        if (maintenanceMsg) {
+          return maintenanceMsg
+        }
+
+        // 获取qr_text（SGID输入一次）
+        let qrTextResult
+        if (qrCode) {
+          try {
+            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
+              return '❌ 无效或过期的二维码，请重新发送'
+            }
+            qrTextResult = { qrText: qrCode }
+          } catch (error: any) {
+            return `❌ 验证二维码失败：${error?.message || '未知错误'}`
+          }
+        } else {
+          qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        }
+
+        if (qrTextResult.error) {
+          if (qrTextResult.needRebind) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (!rebindResult.success) {
+              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            }
+            return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+          }
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        const results: string[] = []
+
+        // 上传水鱼B50
+        const fishAbort = await (async (): Promise<string | null> => {
+          try {
+            await waitForQueue(session)
+            const fishResult = await api.uploadB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              qrTextResult.qrText,
+              fishToken
+            )
+
+            if (!fishResult.UploadStatus) {
+              if (fishResult.msg === '该账号下存在未完成的任务') {
+                results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+                return null
+              }
+
+              if (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效')) {
+                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+                if (rebindResult.success && rebindResult.newBinding) {
+                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+                }
+                const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+                return `❌ 水鱼上传失败：${fishResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              }
+
+              const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+              results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
+              return null
+            }
+
+            scheduleB50Notification(session, fishResult.task_id)
+            results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+            return null
+          } catch (error: any) {
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+            }
+            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+              results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
+              return null
+            }
+            if (error?.response) {
+              results.push(`🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
+              return null
+            }
+            results.push(`🐟 水鱼: ❌ 上传失败: ${error?.message || '未知错误'}`)
+            return null
+          }
+        })()
+
+        if (fishAbort) {
+          return fishAbort
+        }
+
+        // 上传落雪B50
+        const lxnsAbort = await (async (): Promise<string | null> => {
+          try {
+            await waitForQueue(session)
+            const lxResult = await api.uploadLxB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              qrTextResult.qrText,
+              finalLxnsCode
+            )
+
+            if (!lxResult.UploadStatus) {
+              if (lxResult.msg === '该账号下存在未完成的任务') {
+                results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+                return null
+              }
+
+              if (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效')) {
+                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+                if (rebindResult.success && rebindResult.newBinding) {
+                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+                }
+                const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+                return `❌ 落雪上传失败：${lxResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              }
+
+              const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+              results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
+              return null
+            }
+
+            scheduleLxB50Notification(session, lxResult.task_id)
+            results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+            return null
+          } catch (error: any) {
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+            }
+            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+              results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
+              return null
+            }
+            if (error?.response) {
+              results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
+              return null
+            }
+            results.push(`❄️ 落雪: ❌ 上传失败: ${error?.message || '未知错误'}`)
+            return null
+          }
+        })()
+
+        if (lxnsAbort) {
+          return lxnsAbort
+        }
+
+        if (results.length === 0) {
+          return `⚠️ 未能发起上传请求${proxyTip}`
+        }
+
+        return `${results.join('\n\n')}${proxyTip ? `\n${proxyTip}` : ''}`
+      } catch (error: any) {
+        logger.error('双上传B50失败:', error)
+        if (maintenanceMode) {
+          return maintenanceMessage
+        }
+        if (error?.response) {
+          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+        }
+        return `❌ 双上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
 
