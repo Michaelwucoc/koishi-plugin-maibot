@@ -817,6 +817,43 @@ async function tryRecallMessage(
 }
 
 /**
+ * 等待用户下一条输入消息（返回完整 Session 便于撤回）
+ */
+async function waitForUserReply(
+  session: Session,
+  ctx: Context,
+  timeout: number
+): Promise<Session | null> {
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined
+    const stop = ctx.on('message', (replySession) => {
+      if (!replySession.userId || !replySession.channelId) {
+        return
+      }
+      if (replySession.userId !== session.userId) {
+        return
+      }
+      if (session.guildId) {
+        if (replySession.guildId !== session.guildId) {
+          return
+        }
+      } else if (replySession.channelId !== session.channelId) {
+        return
+      }
+      if (timer) {
+        clearTimeout(timer)
+      }
+      stop()
+      resolve(replySession)
+    })
+    timer = setTimeout(() => {
+      stop()
+      resolve(null)
+    }, timeout)
+  })
+}
+
+/**
  * 交互式获取二维码文本（qr_text）
  * 废弃旧的uid策略，每次都需要新的二维码
  * 不再使用binding.qrCode缓存，每次操作都要求用户提供新二维码
@@ -842,16 +879,18 @@ async function getQrText(
     await session.send(message)
     logger.info(`开始等待用户 ${session.userId} 输入SGID或网页地址，超时时间: ${actualTimeout}ms`)
     
-    const promptText = await session.prompt(actualTimeout)
-    
-    if (!promptText || !promptText.trim()) {
+    const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+    const promptText = promptSession?.content?.trim() || ''
+    if (!promptText) {
       await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
       return { qrText: '', error: '超时未收到响应' }
     }
-    
+
     const trimmed = promptText.trim()
-    // 交互式输入的敏感信息，尝试撤回
-    await tryRecallMessage(session, ctx, config)
+    // 交互式输入的敏感信息，撤回用户输入消息
+    if (promptSession) {
+      await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
+    }
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
     let qrText = trimmed
@@ -1002,14 +1041,18 @@ async function promptForRebind(
   try {
     logger.info(`开始等待用户 ${session.userId} 重新绑定SGID，超时时间: ${actualTimeout}ms`)
     
-    const promptText = await session.prompt(actualTimeout)
-    
-    if (!promptText || !promptText.trim()) {
+    const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+    const promptText = promptSession?.content?.trim() || ''
+    if (!promptText) {
       await session.send(`❌ 重新绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定二维码`)
       return { success: false, error: '超时未收到响应', messageId: promptMessageId }
     }
-    
+
     const trimmed = promptText.trim()
+    // 交互式输入的敏感信息，撤回用户输入消息
+    if (promptSession) {
+      await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
+    }
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
     let qrCode = trimmed
@@ -1847,16 +1890,18 @@ export function apply(ctx: Context, config: Config) {
           try {
             logger.info(`开始等待用户 ${session.userId} 输入SGID，超时时间: ${actualTimeout}ms`)
             
-            // 使用session.prompt等待用户输入SGID文本
-            const promptText = await session.prompt(actualTimeout)
-            
-            if (!promptText || !promptText.trim()) {
+            // 等待用户输入SGID文本（获取完整 Session 便于撤回）
+            const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+            const promptText = promptSession?.content?.trim() || ''
+            if (!promptText) {
               throw new Error('超时未收到响应')
             }
-            
+
             const trimmed = promptText.trim()
-            // 交互式输入的敏感信息，尝试撤回
-            await tryRecallMessage(session, ctx, config)
+            // 交互式输入的敏感信息，撤回用户输入消息
+            if (promptSession) {
+              await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
+            }
             logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
             
             qrCode = trimmed
@@ -2405,13 +2450,17 @@ export function apply(ctx: Context, config: Config) {
           try {
             await session.send(`请在${actualTimeout / 1000}秒内发送水鱼Token（长度应在127-132字符之间）`)
             
-            const promptText = await session.prompt(actualTimeout)
-            
-            if (!promptText || !promptText.trim()) {
+            const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+            const promptText = promptSession?.content?.trim() || ''
+            if (!promptText) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
-            
+
             fishToken = promptText.trim()
+            // 交互式输入的敏感信息，撤回用户输入消息
+            if (promptSession) {
+              await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
+            }
           } catch (error: any) {
             logger.error(`等待用户输入水鱼Token失败: ${error?.message}`, error)
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
@@ -2421,7 +2470,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 命令参数或交互式输入的敏感信息，尝试撤回
+        // 命令参数的敏感信息，尝试撤回
         await tryRecallMessage(session, ctx, config)
 
         // 验证Token长度
@@ -2516,13 +2565,17 @@ export function apply(ctx: Context, config: Config) {
           try {
             await session.send(`请在${actualTimeout / 1000}秒内发送落雪代码（长度必须为15个字符）`)
             
-            const promptText = await session.prompt(actualTimeout)
-            
-            if (!promptText || !promptText.trim()) {
+            const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+            const promptText = promptSession?.content?.trim() || ''
+            if (!promptText) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
-            
+
             lxnsCode = promptText.trim()
+            // 交互式输入的敏感信息，撤回用户输入消息
+            if (promptSession) {
+              await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
+            }
           } catch (error: any) {
             logger.error(`等待用户输入落雪代码失败: ${error?.message}`, error)
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
@@ -2532,7 +2585,7 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 命令参数或交互式输入的敏感信息，尝试撤回
+        // 命令参数的敏感信息，尝试撤回
         await tryRecallMessage(session, ctx, config)
 
         // 验证代码长度
