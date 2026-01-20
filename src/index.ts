@@ -45,7 +45,7 @@ export interface Config {
     guildIds: string[]  // 允许使用的群ID列表
     message: string  // 非白名单群的提示消息
   }
-  autoRecall?: boolean  // 自动撤回用户发送的SGID消息
+  autoRecall?: boolean  // 仅在交互输入或命令参数时自动撤回敏感消息
   queue?: {
     enabled: boolean  // 队列系统开关
     interval: number  // 处理间隔（毫秒），默认10秒
@@ -103,7 +103,7 @@ export const Config: Schema<Config> = Schema.object({
     guildIds: ['1072033605'],
     message: '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。',
   }),
-  autoRecall: Schema.boolean().default(true).description('自动撤回用户发送的SGID消息（尝试撤回，如不支持则忽略）'),
+  autoRecall: Schema.boolean().default(true).description('仅在交互输入或命令参数时自动撤回敏感消息（尝试撤回，如不支持则忽略）'),
   queue: Schema.object({
     enabled: Schema.boolean().default(false).description('队列系统开关，开启后限制并发请求'),
     interval: Schema.number().default(10000).description('处理间隔（毫秒），默认10秒（10000毫秒），每间隔时间只处理一个请求'),
@@ -850,6 +850,8 @@ async function getQrText(
     }
     
     const trimmed = promptText.trim()
+    // 交互式输入的敏感信息，尝试撤回
+    await tryRecallMessage(session, ctx, config)
     logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
     
     let qrText = trimmed
@@ -1190,41 +1192,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 监听用户消息，尝试自动撤回包含SGID、水鱼token或落雪代码的消息
-  if (config.autoRecall !== false) {
-    ctx.on('message', async (session) => {
-      // 只处理群聊消息
-      if (!session.guildId || !session.userId) {
-        return
-      }
-
-      const content = session.content?.trim() || ''
-      
-      // 检查消息内容是否包含SGID或二维码链接（包括命令中的参数）
-      // 支持格式：/maiu SGWCMAID... 或 /maiu https://wq.wahlap.net/qrcode/req/...
-      // 支持格式：/maiul SGWCMAID... 或 /maiul https://wq.wahlap.net/qrcode/req/...
-      // 支持格式：/maiua SGWCMAID... 或 /maiua https://wq.wahlap.net/qrcode/req/...
-      // 支持格式：/mai绑定 SGWCMAID... 或 /mai绑定 https://wq.wahlap.net/qrcode/req/...
-      const isSGID = content.includes('SGWCMAID') || content.includes('https://wq.wahlap.net/qrcode/req/')
-      
-      // 检查是否是水鱼token（长度127-132字符，且看起来像token）
-      // 注意：命令参数中的token也需要检测，所以不能只检查整条消息长度
-      const tokenMatch = content.match(/\b[a-zA-Z0-9+\/=_-]{127,132}\b/)
-      const isFishToken = tokenMatch !== null
-      
-      // 检查是否是落雪代码（长度15字符，且看起来像代码）
-      // 注意：命令参数中的代码也需要检测
-      const codeMatch = content.match(/\b[a-zA-Z0-9]{15}\b/)
-      const isLxnsCode = codeMatch !== null && !isSGID  // 排除SGID的情况
-      
-      if ((isSGID || isFishToken || isLxnsCode) && session.messageId && session.channelId) {
-        // 延迟一小段时间后撤回（确保消息已被处理）
-        setTimeout(async () => {
-          await tryRecallMessage(session, ctx, config, session.messageId)
-        }, 300)  // 减少延迟到300ms，加快撤回速度
-      }
-    })
-  }
+  // 自动撤回仅在交互式输入或命令参数触发
 
   // 插件运行状态标志，用于在插件停止后阻止新的请求
   let isPluginActive = true
@@ -1887,6 +1855,8 @@ export function apply(ctx: Context, config: Config) {
             }
             
             const trimmed = promptText.trim()
+            // 交互式输入的敏感信息，尝试撤回
+            await tryRecallMessage(session, ctx, config)
             logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
             
             qrCode = trimmed
@@ -2451,6 +2421,9 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
+        // 命令参数或交互式输入的敏感信息，尝试撤回
+        await tryRecallMessage(session, ctx, config)
+
         // 验证Token长度
         if (fishToken.length < 127 || fishToken.length > 132) {
           return '❌ Token长度错误，应在127-132字符之间'
@@ -2558,6 +2531,9 @@ export function apply(ctx: Context, config: Config) {
             return `❌ 绑定失败：${error?.message || '未知错误'}`
           }
         }
+
+        // 命令参数或交互式输入的敏感信息，尝试撤回
+        await tryRecallMessage(session, ctx, config)
 
         // 验证代码长度
         if (lxnsCode.length !== 15) {
