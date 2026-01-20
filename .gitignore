@@ -38,3 +38,6 @@ logs/
 *.tmp
 *.temp
 .cache/
+
+# Sensitive file
+src/constants.ts
