@@ -300,6 +300,81 @@ export class MaiBotAPI {
     return response.data
   }
 
+  /**
+   * 获取用户功能票
+   * GET /api/public/get_charge
+   * 需要: region_id, client_id, place_id, qr_text
+   */
+  async getCharge(
+    regionId: number,
+    clientId: string,
+    placeId: number,
+    qrText: string
+  ): Promise<{
+    ChargeStatus: boolean
+    LoginStatus: boolean
+    LogoutStatus: boolean
+    QrStatus: boolean
+    userChargeList?: Array<{
+      chargeId: number
+      extNum1: number
+      purchaseDate: string
+      stock: number
+      validDate: string
+    }>
+    userFreeChargeList?: Array<{
+      chargeId: number
+      stock: number
+    }>
+  }> {
+    const response = await this.client.get('/api/public/get_charge', {
+      params: {
+        region_id: regionId,
+        client_id: clientId,
+        place_id: placeId,
+        qr_text: qrText,
+      },
+    })
+    return response.data
+  }
+
+  /**
+   * 获取收藏品
+   * POST /api/private/get_item
+   * 需要: region_id, region_name, client_id, place_id, place_name, item_id, item_kind, item_stock, qr_text
+   */
+  async getItem(
+    regionId: number,
+    regionName: string,
+    clientId: string,
+    placeId: number,
+    placeName: string,
+    itemId: number,
+    itemKind: number,
+    itemStock: number,
+    qrText: string
+  ): Promise<{
+    QrStatus: boolean
+    LoginStatus: boolean
+    LogoutStatus: boolean
+    UserAllStatus: boolean
+  }> {
+    const response = await this.client.post('/api/private/get_item', null, {
+      params: {
+        region_id: regionId,
+        region_name: regionName,
+        client_id: clientId,
+        place_id: placeId,
+        place_name: placeName,
+        item_id: itemId,
+        item_kind: itemKind,
+        item_stock: itemStock,
+        qr_text: qrText,
+      },
+    })
+    return response.data
+  }
+
   // ========== 以下为旧API，已不再支持，保留用于兼容性 ==========
 
   /**

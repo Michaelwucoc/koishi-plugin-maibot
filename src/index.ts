@@ -855,8 +855,8 @@ async function waitForUserReply(
 
 /**
  * 交互式获取二维码文本（qr_text）
- * 废弃旧的uid策略，每次都需要新的二维码
- * 不再使用binding.qrCode缓存，每次操作都要求用户提供新二维码
+ * 支持10分钟内使用上次输入的SGID缓存
+ * 如果缓存存在且有效，直接使用；否则提示用户输入
  */
 async function getQrText(
   session: Session,
@@ -865,13 +865,26 @@ async function getQrText(
   binding: UserBinding | null,
   config: Config,
   timeout: number = 60000,
-  promptMessage?: string
-): Promise<{ qrText: string; error?: string; needRebind?: boolean }> {
+  promptMessage?: string,
+  useCache: boolean = true  // 是否使用缓存（默认启用）
+): Promise<{ qrText: string; error?: string; needRebind?: boolean; fromCache?: boolean }> {
   const logger = ctx.logger('maibot')
   
-  // 废弃旧的uid策略，每次都需要新的二维码
-  // 不再使用binding.qrCode缓存，直接提示用户输入
+  // 如果启用缓存且binding存在，检查是否有10分钟内的SGID缓存
+  if (useCache && binding && binding.lastQrCode && binding.lastQrCodeTime) {
+    const cacheAge = Date.now() - new Date(binding.lastQrCodeTime).getTime()
+    const cacheValidDuration = 10 * 60 * 1000  // 10分钟
+    
+    if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
+      logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
+      // 直接返回缓存的SGID，不验证（让调用方验证，如果失败再提示输入）
+      return { qrText: binding.lastQrCode, fromCache: true }
+    } else {
+      logger.debug(`缓存已过期（${Math.floor(cacheAge / 1000)}秒前输入，超过10分钟）`)
+    }
+  }
   
+  // 没有有效缓存，提示用户输入
   const actualTimeout = timeout
   const message = promptMessage || `请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
   
@@ -950,12 +963,14 @@ async function getQrText(
         return { qrText: '', error: '无效或过期的二维码' }
       }
       
-      // 如果binding存在，更新数据库中的qrCode（仅用于记录，不再用于缓存）
+      // 如果binding存在，更新数据库中的qrCode和缓存
       if (binding) {
         await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
           qrCode: qrText,
+          lastQrCode: qrText,  // 更新缓存
+          lastQrCodeTime: new Date(),  // 更新时间戳
         })
-        logger.info(`已更新用户 ${binding.userId} 的qrCode（仅用于记录）`)
+        logger.info(`已更新用户 ${binding.userId} 的qrCode和缓存`)
       }
       
       return { qrText: qrText }
@@ -1139,6 +1154,8 @@ async function promptForRebind(
       bindTime: new Date(),
       userName,
       rating,
+      lastQrCode: qrCode,  // 保存为缓存
+      lastQrCodeTime: new Date(),  // 保存时间戳
     })
 
     // 发送成功反馈
@@ -2014,6 +2031,8 @@ export function apply(ctx: Context, config: Config) {
           bindTime: new Date(),
           userName,
           rating,
+          lastQrCode: qrCode,  // 保存为缓存
+          lastQrCodeTime: new Date(),  // 保存时间戳
         })
 
         return `✅ 绑定成功！\n` +
@@ -2103,9 +2122,11 @@ export function apply(ctx: Context, config: Config) {
                         `🚨 /maialert查看账号提醒状态\n`
 
         // 尝试获取最新状态并更新数据库（需要新二维码）
+        let qrTextResultForCharge: { qrText: string; error?: string } | null = null
         try {
           // 废弃旧的uid策略，每次都需要新的二维码
           const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, '请在60秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址以查询账号状态')
+          qrTextResultForCharge = qrTextResult
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
@@ -2214,9 +2235,77 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        // 显示票券信息
-        // @deprecated getCharge功能已在新API中移除，已注释
-        statusInfo += `\n\n🎫 票券情况: 此功能已在新API中移除`
+        // 显示票券信息（使用新的getCharge API）
+        try {
+          if (qrTextResultForCharge && !qrTextResultForCharge.error) {
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            
+            const chargeResult = await api.getCharge(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              qrTextResultForCharge.qrText
+            )
+            
+            if (chargeResult.ChargeStatus && chargeResult.userChargeList) {
+              const now = new Date()
+              const validTickets: Array<{ chargeId: number; stock: number; validDate: string; purchaseDate: string }> = []
+              const expiredTickets: Array<{ chargeId: number; stock: number; validDate: string; purchaseDate: string }> = []
+              
+              for (const ticket of chargeResult.userChargeList) {
+                const validDate = new Date(ticket.validDate)
+                if (validDate > now) {
+                  validTickets.push(ticket)
+                } else {
+                  expiredTickets.push(ticket)
+                }
+              }
+              
+              // 显示有效票券
+              if (validTickets.length > 0 || (options?.expired && expiredTickets.length > 0)) {
+                statusInfo += `\n\n🎫 票券情况：`
+                
+                if (validTickets.length > 0) {
+                  statusInfo += `\n有效票券：`
+                  for (const ticket of validTickets) {
+                    const ticketName = getTicketName(ticket.chargeId)
+                    const validDateStr = new Date(ticket.validDate).toLocaleString('zh-CN')
+                    statusInfo += `\n  ${ticketName}: ${ticket.stock} 张（有效期至 ${validDateStr}）`
+                  }
+                }
+                
+                // 如果使用 --expired 选项，显示过期票券
+                if (options?.expired && expiredTickets.length > 0) {
+                  statusInfo += `\n过期票券：`
+                  for (const ticket of expiredTickets) {
+                    const ticketName = getTicketName(ticket.chargeId)
+                    const validDateStr = new Date(ticket.validDate).toLocaleString('zh-CN')
+                    statusInfo += `\n  ${ticketName}: ${ticket.stock} 张（已过期，过期时间 ${validDateStr}）`
+                  }
+                } else if (expiredTickets.length > 0) {
+                  statusInfo += `\n（还有 ${expiredTickets.length} 种过期票券，使用 --expired 查看）`
+                }
+                
+                // 显示免费票券
+                if (chargeResult.userFreeChargeList && chargeResult.userFreeChargeList.length > 0) {
+                  statusInfo += `\n免费票券：`
+                  for (const freeTicket of chargeResult.userFreeChargeList) {
+                    const ticketName = getTicketName(freeTicket.chargeId)
+                    statusInfo += `\n  ${ticketName}: ${freeTicket.stock} 张`
+                  }
+                }
+              } else {
+                statusInfo += `\n\n🎫 票券情况: 暂无有效票券`
+              }
+            } else {
+              statusInfo += `\n\n🎫 票券情况: 获取失败（${chargeResult.ChargeStatus === false ? 'API返回失败' : '数据格式错误'}）`
+            }
+          }
+        } catch (error: any) {
+          logger.warn('获取票券信息失败:', error)
+          statusInfo += `\n\n🎫 票券情况: 获取失败（${error?.message || '未知错误'}）`
+        }
 
         return statusInfo
       } catch (error: any) {
@@ -2683,21 +2772,24 @@ export function apply(ctx: Context, config: Config) {
         
         // 确认操作（如果未使用 -bypass）
         if (!options?.bypass) {
-          const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}`
-          const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
-          if (!confirmFirst) {
-            return '操作已取消（第一次确认未通过）'
-          }
+          if (multiple >= 4) {
+            // 4-6倍：提示失败风险并二次确认
+            const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}\n\n⚠️ 警告：4倍及以上票券极有可能失败，请谨慎操作！`
+            const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎`)
+            if (!confirmFirst) {
+              return '操作已取消（第一次确认未通过）'
+            }
 
-          const confirmSecond = await promptYesLocal(session, '二次确认：若理解风险，请再次输入 Y 执行')
-          if (!confirmSecond) {
-            return '操作已取消（第二次确认未通过）'
-          }
-
-          if (multiple >= 3) {
-            const confirmThird = await promptYesLocal(session, '第三次确认：3倍及以上票券风险更高，确定继续？')
-            if (!confirmThird) {
-              return '操作已取消（第三次确认未通过）'
+            const confirmSecond = await promptYesLocal(session, `二次确认：${multiple}倍票券失败风险极高，确定要继续吗？\n若理解风险，请再次输入 Y 执行`)
+            if (!confirmSecond) {
+              return '操作已取消（第二次确认未通过）'
+            }
+          } else {
+            // 2-3倍：一次确认
+            const baseTip = `⚠️ 即将发放 ${multiple} 倍票${proxyTip}`
+            const confirmFirst = await promptYesLocal(session, `${baseTip}\n操作具有风险，请谨慎\n确认继续？`)
+            if (!confirmFirst) {
+              return '操作已取消（确认未通过）'
             }
           }
         }
@@ -2742,6 +2834,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 使用新API获取功能票（需要qr_text）
         let ticketResult
+        let usedCache = qrTextResult.fromCache === true
         try {
           ticketResult = await api.getTicket(
             machineInfo.regionId,
@@ -2751,14 +2844,15 @@ export function apply(ctx: Context, config: Config) {
             qrTextResult.qrText
           )
         } catch (error: any) {
-          // 如果API返回失败，可能需要重新绑定
-          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-            // 重新绑定成功，重试获取功能票
-            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
-              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              return `❌ 获取二维码失败：${retryQrText.error}`
             }
+            // 在调用API前加入队列
+            await waitForQueue(session)
             ticketResult = await api.getTicket(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -2767,20 +2861,67 @@ export function apply(ctx: Context, config: Config) {
               retryQrText.qrText
             )
           } else {
-            throw error
+            // 如果API返回失败，可能需要重新绑定
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              // 重新绑定成功，重试获取功能票
+              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+              if (retryQrText.error) {
+                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              ticketResult = await api.getTicket(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                multiple,
+                retryQrText.qrText
+              )
+            } else {
+              throw error
+            }
           }
         }
 
         if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
-          // 如果返回失败，可能需要重新绑定
-          if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (rebindResult.success && rebindResult.newBinding) {
-              return `✅ 重新绑定成功！请重新执行发票操作。`
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache && (!ticketResult.QrStatus || ticketResult.LoginStatus === false)) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            ticketResult = await api.getTicket(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              multiple,
+              retryQrText.qrText
+            )
+            if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
+              if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
+                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+                if (rebindResult.success && rebindResult.newBinding) {
+                  return `✅ 重新绑定成功！请重新执行发票操作。`
+                }
+                return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+              }
+              return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
+            }
+          } else {
+            // 如果返回失败，可能需要重新绑定
+            if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return `✅ 重新绑定成功！请重新执行发票操作。`
+              }
+              return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            }
+            return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
           }
-          return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
         }
 
         return `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
@@ -2997,6 +3138,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 上传B50（使用新API，需要qr_text）
         let result
+        let usedCache = qrTextResult.fromCache === true
         try {
           result = await api.uploadB50(
             machineInfo.regionId,
@@ -3006,13 +3148,12 @@ export function apply(ctx: Context, config: Config) {
             binding.fishToken
           )
         } catch (error: any) {
-          // 如果API返回失败，可能需要重新绑定
-          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-            // 重新绑定成功，重试上传
-            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
-              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
             await waitForQueue(session)
@@ -3024,25 +3165,70 @@ export function apply(ctx: Context, config: Config) {
               binding.fishToken
             )
           } else {
-            throw error
+            // 如果API返回失败，可能需要重新绑定
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              // 重新绑定成功，重试上传
+              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+              if (retryQrText.error) {
+                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              result = await api.uploadB50(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                retryQrText.qrText,
+                binding.fishToken
+              )
+            } else {
+              throw error
+            }
           }
         }
 
         if (!result.UploadStatus) {
-          if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
-          }
-          // 如果返回失败，可能需要重新绑定
-          if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (rebindResult.success && rebindResult.newBinding) {
-              return `✅ 重新绑定成功！请重新执行上传操作。`
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache && (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效'))) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
+            }
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            result = await api.uploadB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              binding.fishToken
+            )
+            if (!result.UploadStatus) {
+              if (result.msg === '该账号下存在未完成的任务') {
+                return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
+              }
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+            }
+          } else {
+            if (result.msg === '该账号下存在未完成的任务') {
+              return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
+            }
+            // 如果返回失败，可能需要重新绑定
+            if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return `✅ 重新绑定成功！请重新执行上传操作。`
+              }
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
           }
-          const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-          return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
         }
 
         scheduleB50Notification(session, result.task_id)
@@ -3164,13 +3350,33 @@ export function apply(ctx: Context, config: Config) {
         const fishAbort = await (async (): Promise<string | null> => {
           try {
             await waitForQueue(session)
-            const fishResult = await api.uploadB50(
+            let fishResult = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
               machineInfo.placeId,
               qrTextResult.qrText,
               fishToken
             )
+
+            // 如果使用了缓存且失败，尝试重新获取SGID
+            if (qrTextResult.fromCache && !fishResult.UploadStatus && (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效'))) {
+              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+              if (retryQrText.error) {
+                const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+                results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
+                return null
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              fishResult = await api.uploadB50(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                retryQrText.qrText,
+                fishToken
+              )
+            }
 
             if (!fishResult.UploadStatus) {
               if (fishResult.msg === '该账号下存在未完成的任务') {
@@ -3196,20 +3402,68 @@ export function apply(ctx: Context, config: Config) {
             results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
             return null
           } catch (error: any) {
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-            }
-            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
-              results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
+            // 如果使用了缓存且失败，尝试重新获取SGID
+            if (qrTextResult.fromCache) {
+              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+              if (retryQrText.error) {
+                results.push(`🐟 水鱼: ❌ 获取二维码失败：${retryQrText.error}`)
+                return null
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              try {
+                const fishResult = await api.uploadB50(
+                  machineInfo.regionId,
+                  machineInfo.clientId,
+                  machineInfo.placeId,
+                  retryQrText.qrText,
+                  fishToken
+                )
+                if (!fishResult.UploadStatus) {
+                  if (fishResult.msg === '该账号下存在未完成的任务') {
+                    results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+                    return null
+                  }
+                  const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+                  results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
+                  return null
+                }
+                scheduleB50Notification(session, fishResult.task_id)
+                results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+                return null
+              } catch (retryError: any) {
+                const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
+                if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+                }
+                if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
+                  results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
+                  return null
+                }
+                if (retryError?.response) {
+                  results.push(`🐟 水鱼: ❌ API请求失败: ${retryError.response.status} ${retryError.response.statusText}`)
+                  return null
+                }
+                results.push(`🐟 水鱼: ❌ 上传失败: ${retryError?.message || '未知错误'}`)
+                return null
+              }
+            } else {
+              const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+              if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+              }
+              if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+                results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
+                return null
+              }
+              if (error?.response) {
+                results.push(`🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
+                return null
+              }
+              results.push(`🐟 水鱼: ❌ 上传失败: ${error?.message || '未知错误'}`)
               return null
             }
-            if (error?.response) {
-              results.push(`🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
-              return null
-            }
-            results.push(`🐟 水鱼: ❌ 上传失败: ${error?.message || '未知错误'}`)
-            return null
           }
         })()
 
@@ -3221,13 +3475,33 @@ export function apply(ctx: Context, config: Config) {
         const lxnsAbort = await (async (): Promise<string | null> => {
           try {
             await waitForQueue(session)
-            const lxResult = await api.uploadLxB50(
+            let lxResult = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
               machineInfo.placeId,
               qrTextResult.qrText,
               finalLxnsCode
             )
+
+            // 如果使用了缓存且失败，尝试重新获取SGID
+            if (qrTextResult.fromCache && !lxResult.UploadStatus && (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效'))) {
+              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+              if (retryQrText.error) {
+                const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+                results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
+                return null
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              lxResult = await api.uploadLxB50(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                retryQrText.qrText,
+                finalLxnsCode
+              )
+            }
 
             if (!lxResult.UploadStatus) {
               if (lxResult.msg === '该账号下存在未完成的任务') {
@@ -3253,20 +3527,68 @@ export function apply(ctx: Context, config: Config) {
             results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
             return null
           } catch (error: any) {
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-            }
-            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
-              results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
+            // 如果使用了缓存且失败，尝试重新获取SGID
+            if (qrTextResult.fromCache) {
+              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+              if (retryQrText.error) {
+                results.push(`❄️ 落雪: ❌ 获取二维码失败：${retryQrText.error}`)
+                return null
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              try {
+                const lxResult = await api.uploadLxB50(
+                  machineInfo.regionId,
+                  machineInfo.clientId,
+                  machineInfo.placeId,
+                  retryQrText.qrText,
+                  finalLxnsCode
+                )
+                if (!lxResult.UploadStatus) {
+                  if (lxResult.msg === '该账号下存在未完成的任务') {
+                    results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+                    return null
+                  }
+                  const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+                  results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
+                  return null
+                }
+                scheduleLxB50Notification(session, lxResult.task_id)
+                results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+                return null
+              } catch (retryError: any) {
+                const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
+                if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+                }
+                if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
+                  results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
+                  return null
+                }
+                if (retryError?.response) {
+                  results.push(`❄️ 落雪: ❌ API请求失败: ${retryError.response.status} ${retryError.response.statusText}`)
+                  return null
+                }
+                results.push(`❄️ 落雪: ❌ 上传失败: ${retryError?.message || '未知错误'}`)
+                return null
+              }
+            } else {
+              const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+              if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+              }
+              if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+                results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
+                return null
+              }
+              if (error?.response) {
+                results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
+                return null
+              }
+              results.push(`❄️ 落雪: ❌ 上传失败: ${error?.message || '未知错误'}`)
               return null
             }
-            if (error?.response) {
-              results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
-              return null
-            }
-            results.push(`❄️ 落雪: ❌ 上传失败: ${error?.message || '未知错误'}`)
-            return null
           }
         })()
 
@@ -3407,15 +3729,19 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 发收藏品
    * 用法: /mai发收藏品
-   * @deprecated 发收藏品功能已在新API中移除，已注释
    */
-  /*
   ctx.command('mai发收藏品 [targetUserId:text]', '发放收藏品')
     .userFields(['authority'])
     .option('bypass', '-bypass  绕过确认')
     .action(async ({ session, options }, targetUserId) => {
       if (!session) {
         return '❌ 无法获取会话信息'
+      }
+
+      // 检查白名单
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
       try {
@@ -3426,6 +3752,7 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const userId = binding.userId
+        const proxyTip = isProxy ? `（代操作用户 ${userId}）` : ''
 
         // 交互式选择收藏品类别
         const itemKind = await promptCollectionType(session)
@@ -3442,8 +3769,9 @@ export function apply(ctx: Context, config: Config) {
           `输入0取消操作`
         )
 
-        const itemIdInput = await session.prompt(60000)
-        if (!itemIdInput || itemIdInput.trim() === '0') {
+        const promptSession = await waitForUserReply(session, ctx, 60000)
+        const itemIdInput = promptSession?.content?.trim() || ''
+        if (!itemIdInput || itemIdInput === '0') {
           return '操作已取消'
         }
 
@@ -3453,32 +3781,145 @@ export function apply(ctx: Context, config: Config) {
           return '❌ ID必须是数字，请重新输入'
         }
 
-        const confirm = await promptYesLocal(
-          session,
-          `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
-        )
-        if (!confirm) {
-          return '操作已取消'
+        // 确认操作（如果未使用 -bypass）
+        if (!options?.bypass) {
+          const confirm = await promptYesLocal(
+            session,
+            `⚠️ 即将为 ${maskUserId(binding.maiUid)} 发放收藏品${proxyTip}\n类型: ${selectedType?.label} (${itemKind})\nID: ${itemId}\n确认继续？`
+          )
+          if (!confirm) {
+            return '操作已取消'
+          }
         }
+
+        // 获取qr_text（交互式或从绑定中获取）
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
+        if (qrTextResult.error) {
+          if (qrTextResult.needRebind) {
+            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+            if (!rebindResult.success) {
+              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
+            }
+            return '✅ 重新绑定成功！请重新执行 /mai发收藏品 操作。'
+          }
+          return `❌ 获取二维码失败：${qrTextResult.error}`
+        }
+
+        // 在调用API前加入队列
+        await waitForQueue(session)
 
         await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
 
-        const result = await api.getItem(
-          binding.maiUid,
-          itemId,
-          itemKind.toString(),
-          machineInfo.clientId,
-          machineInfo.regionId,
-          machineInfo.placeId,
-          machineInfo.placeName,
-          machineInfo.regionName,
-        )
-
-        if (result.ItemStatus === false || result.LoginStatus === false || result.LogoutStatus === false) {
-          return '❌ 发放失败：服务器未返回成功状态，请稍后再试或点击获取二维码刷新账号后再试。'
+        // 使用新API获取收藏品（需要qr_text）
+        const machineInfo = config.machineInfo
+        let result
+        let usedCache = qrTextResult.fromCache === true
+        try {
+          result = await api.getItem(
+            machineInfo.regionId,
+            machineInfo.regionName,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            machineInfo.placeName,
+            parseInt(itemId, 10),
+            itemKind,
+            1, // item_stock: 1
+            qrTextResult.qrText
+          )
+        } catch (error: any) {
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            result = await api.getItem(
+              machineInfo.regionId,
+              machineInfo.regionName,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              machineInfo.placeName,
+              parseInt(itemId, 10),
+              itemKind,
+              1, // item_stock: 1
+              retryQrText.qrText
+            )
+          } else {
+            // 如果API返回失败，可能需要重新绑定
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              // 重新绑定成功，重试获取收藏品
+              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+              if (retryQrText.error) {
+                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              result = await api.getItem(
+                machineInfo.regionId,
+                machineInfo.regionName,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                machineInfo.placeName,
+                parseInt(itemId, 10),
+                itemKind,
+                1, // item_stock: 1
+                retryQrText.qrText
+              )
+            } else {
+              throw error
+            }
+          }
         }
 
-        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放收藏品\n类型: ${selectedType?.label}\nID: ${itemId}`
+        if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache && (!result.QrStatus || result.LoginStatus === false)) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              return `❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            result = await api.getItem(
+              machineInfo.regionId,
+              machineInfo.regionName,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              machineInfo.placeName,
+              parseInt(itemId, 10),
+              itemKind,
+              1, // item_stock: 1
+              retryQrText.qrText
+            )
+            if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
+              if (!result.QrStatus || result.LoginStatus === false) {
+                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+                if (rebindResult.success && rebindResult.newBinding) {
+                  return `✅ 重新绑定成功！请重新执行发收藏品操作。`
+                }
+                return `❌ 发放收藏品失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+              }
+              return '❌ 发放收藏品失败：服务器返回未成功，请确认是否已在短时间内多次执行发收藏品指令或稍后再试或点击获取二维码刷新账号后再试。'
+            }
+          } else {
+            // 如果返回失败，可能需要重新绑定
+            if (!result.QrStatus || result.LoginStatus === false) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return `✅ 重新绑定成功！请重新执行发收藏品操作。`
+              }
+              return `❌ 发放收藏品失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            }
+            return '❌ 发放收藏品失败：服务器返回未成功，请确认是否已在短时间内多次执行发收藏品指令或稍后再试或点击获取二维码刷新账号后再试。'
+          }
+        }
+
+        return `✅ 已为 ${maskUserId(binding.maiUid)} 发放收藏品${proxyTip}\n类型: ${selectedType?.label}\nID: ${itemId}`
       } catch (error: any) {
         logger.error('发收藏品失败:', error)
         if (maintenanceMode) {
@@ -3490,7 +3931,6 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 发放失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
       }
     })
-  */
 
   /**
    * 清收藏品
@@ -3863,6 +4303,7 @@ export function apply(ctx: Context, config: Config) {
 
         // 上传落雪B50（使用新API，需要qr_text）
         let result
+        let usedCache = qrTextResult.fromCache === true
         try {
           result = await api.uploadLxB50(
             machineInfo.regionId,
@@ -3872,13 +4313,12 @@ export function apply(ctx: Context, config: Config) {
             finalLxnsCode
           )
         } catch (error: any) {
-          // 如果API返回失败，可能需要重新绑定
-          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-          if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-            // 重新绑定成功，重试上传
-            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
-              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
             await waitForQueue(session)
@@ -3890,25 +4330,70 @@ export function apply(ctx: Context, config: Config) {
               finalLxnsCode
             )
           } else {
-            throw error
+            // 如果API返回失败，可能需要重新绑定
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              // 重新绑定成功，重试上传
+              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
+              if (retryQrText.error) {
+                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
+              }
+              // 在调用API前加入队列
+              await waitForQueue(session)
+              result = await api.uploadLxB50(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                retryQrText.qrText,
+                finalLxnsCode
+              )
+            } else {
+              throw error
+            }
           }
         }
 
         if (!result.UploadStatus) {
-          if (result.msg === '该账号下存在未完成的任务') {
-            return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
-          }
-          // 如果返回失败，可能需要重新绑定
-          if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (rebindResult.success && rebindResult.newBinding) {
-              return `✅ 重新绑定成功！请重新执行上传操作。`
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (usedCache && (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效'))) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
+            }
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            result = await api.uploadLxB50(
+              machineInfo.regionId,
+              machineInfo.clientId,
+              machineInfo.placeId,
+              retryQrText.qrText,
+              finalLxnsCode
+            )
+            if (!result.UploadStatus) {
+              if (result.msg === '该账号下存在未完成的任务') {
+                return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
+              }
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+            }
+          } else {
+            if (result.msg === '该账号下存在未完成的任务') {
+              return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
+            }
+            // 如果返回失败，可能需要重新绑定
+            if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return `✅ 重新绑定成功！请重新执行上传操作。`
+              }
+              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
+              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-            return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
           }
-          const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-          return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
         }
 
         scheduleLxB50Notification(session, result.task_id)

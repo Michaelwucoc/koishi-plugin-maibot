@@ -18,6 +18,8 @@ export interface UserBinding {
   lockTime?: Date  // 锁定时间
   lockLoginId?: number  // 锁定时的LoginId
   protectionMode?: boolean  // 是否开启保护模式
+  lastQrCode?: string  // 最近输入的SGID（用于10分钟内缓存）
+  lastQrCodeTime?: Date  // 最近输入SGID的时间戳
 }
 
 export interface MaiBotSetting {
@@ -52,10 +54,12 @@ export function extendDatabase(ctx: Context) {
     lockTime: 'timestamp',  // 锁定时间
     lockLoginId: 'unsigned',  // 锁定时的LoginId
     protectionMode: 'boolean',  // 是否开启保护模式
+    lastQrCode: 'string',  // 最近输入的SGID（用于10分钟内缓存）
+    lastQrCodeTime: 'timestamp',  // 最近输入SGID的时间戳
   }, {
     primary: 'id',
     autoInc: true,
-    // userName、rating、fishToken、lxnsCode、alertEnabled、lastLoginStatus、guildId、channelId 可以为空
+    // userName、rating、fishToken、lxnsCode、alertEnabled、lastLoginStatus、guildId、channelId、lastQrCode、lastQrCodeTime 可以为空
     unique: ['userId'], // 每个用户只能绑定一个账号
   })
 
