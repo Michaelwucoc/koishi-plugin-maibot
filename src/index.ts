@@ -1522,7 +1522,7 @@ export function apply(ctx: Context, config: Config) {
     return { binding: bindings[0], isProxy: true, error: null }
   }
 
-  const scheduleB50Notification = (session: Session, taskId: string) => {
+  const scheduleB50Notification = (session: Session, taskId: string, initialRefId?: string) => {
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -1554,9 +1554,21 @@ export function apply(ctx: Context, config: Config) {
           const finishTime = detail.alive_task_end_time
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
+          
+          // 记录任务完成/失败的操作日志
+          const taskRefId = await logOperation({
+            command: 'mai上传B50-任务完成',
+            session,
+            status: hasError ? 'failure' : 'success',
+            result: `${statusText}${finishTime}`,
+            errorMessage: hasError ? detail.error || '未知错误' : undefined,
+            apiResponse: detail,
+          })
+          
+          const finalMessage = `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
           await bot.sendMessage(
             channelId,
-            `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
+            appendRefId(finalMessage, taskRefId),
             guildId,
           )
           return
@@ -1568,6 +1580,14 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
+        // 超时情况
+        const timeoutRefId = await logOperation({
+          command: 'mai上传B50-任务超时',
+          session,
+          status: 'failure',
+          errorMessage: '任务轮询超时（10分钟）',
+        })
+        
         let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
@@ -1575,7 +1595,7 @@ export function apply(ctx: Context, config: Config) {
         }
         await bot.sendMessage(
           channelId,
-          msg,
+          appendRefId(msg, timeoutRefId),
           guildId,
         )
       } catch (error) {
@@ -1584,6 +1604,15 @@ export function apply(ctx: Context, config: Config) {
           ctx.setTimeout(poll, interval)
           return
         }
+        
+        // 轮询异常情况
+        const errorRefId = await logOperation({
+          command: 'mai上传B50-轮询异常',
+          session,
+          status: 'error',
+          errorMessage: error instanceof Error ? error.message : '未知错误',
+        })
+        
         let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
@@ -1591,7 +1620,7 @@ export function apply(ctx: Context, config: Config) {
         }
         await bot.sendMessage(
           channelId,
-          msg,
+          appendRefId(msg, errorRefId),
           guildId,
         )
       }
@@ -1601,7 +1630,7 @@ export function apply(ctx: Context, config: Config) {
     ctx.setTimeout(poll, initialDelay)
   }
 
-  const scheduleLxB50Notification = (session: Session, taskId: string) => {
+  const scheduleLxB50Notification = (session: Session, taskId: string, initialRefId?: string) => {
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -1633,9 +1662,21 @@ export function apply(ctx: Context, config: Config) {
           const finishTime = detail.alive_task_end_time
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
+          
+          // 记录任务完成/失败的操作日志
+          const taskRefId = await logOperation({
+            command: 'mai上传落雪b50-任务完成',
+            session,
+            status: hasError ? 'failure' : 'success',
+            result: `${statusText}${finishTime}`,
+            errorMessage: hasError ? detail.error || '未知错误' : undefined,
+            apiResponse: detail,
+          })
+          
+          const finalMessage = `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
           await bot.sendMessage(
             channelId,
-            `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`,
+            appendRefId(finalMessage, taskRefId),
             guildId,
           )
           return
@@ -1647,6 +1688,14 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
+        // 超时情况
+        const timeoutRefId = await logOperation({
+          command: 'mai上传落雪b50-任务超时',
+          session,
+          status: 'failure',
+          errorMessage: '任务轮询超时（10分钟）',
+        })
+        
         let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
@@ -1654,7 +1703,7 @@ export function apply(ctx: Context, config: Config) {
         }
         await bot.sendMessage(
           channelId,
-          msg,
+          appendRefId(msg, timeoutRefId),
           guildId,
         )
       } catch (error) {
@@ -1663,6 +1712,15 @@ export function apply(ctx: Context, config: Config) {
           ctx.setTimeout(poll, interval)
           return
         }
+        
+        // 轮询异常情况
+        const errorRefId = await logOperation({
+          command: 'mai上传落雪b50-轮询异常',
+          session,
+          status: 'error',
+          errorMessage: error instanceof Error ? error.message : '未知错误',
+        })
+        
         let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
@@ -1670,7 +1728,7 @@ export function apply(ctx: Context, config: Config) {
         }
         await bot.sendMessage(
           channelId,
-          msg,
+          appendRefId(msg, errorRefId),
           guildId,
         )
       }
@@ -3282,7 +3340,6 @@ export function apply(ctx: Context, config: Config) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
               return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
-            scheduleB50Notification(session, result.task_id)
             const successMessage = `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
             const refId = await logOperation({
               command: 'mai上传B50',
@@ -3292,6 +3349,7 @@ export function apply(ctx: Context, config: Config) {
               result: successMessage,
               apiResponse: result,
             })
+            scheduleB50Notification(session, result.task_id, refId)
             return appendRefId(successMessage, refId)
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
@@ -3395,9 +3453,19 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        scheduleB50Notification(session, result.task_id)
+        const successMessage = `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const refId = await logOperation({
+          command: 'mai上传B50',
+          session,
+          targetUserId,
+          status: 'success',
+          result: successMessage,
+          apiResponse: result,
+        })
+        
+        scheduleB50Notification(session, result.task_id, refId)
 
-        return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        return appendRefId(successMessage, refId)
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
         if (maintenanceMode) {
@@ -3555,8 +3623,17 @@ export function apply(ctx: Context, config: Config) {
               results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
             }
           } else {
-            scheduleB50Notification(session, fishResult.task_id)
-            results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+            const successMessage = `🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+            const refId = await logOperation({
+              command: 'maiua-水鱼B50',
+              session,
+              targetUserId: actualTargetUserId,
+              status: 'success',
+              result: successMessage,
+              apiResponse: fishResult,
+            })
+            scheduleB50Notification(session, fishResult.task_id, refId)
+            results.push(appendRefId(successMessage, refId))
           }
         } catch (error: any) {
           // 如果使用了缓存且失败，尝试重新获取SGID
@@ -3662,8 +3739,17 @@ export function apply(ctx: Context, config: Config) {
               results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
             }
           } else {
-            scheduleLxB50Notification(session, lxResult.task_id)
-            results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+            const successMessage = `❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+            const refId = await logOperation({
+              command: 'maiua-落雪B50',
+              session,
+              targetUserId: actualTargetUserId,
+              status: 'success',
+              result: successMessage,
+              apiResponse: lxResult,
+            })
+            scheduleLxB50Notification(session, lxResult.task_id, refId)
+            results.push(appendRefId(successMessage, refId))
           }
         } catch (error: any) {
           // 如果使用了缓存且失败，尝试重新获取SGID
@@ -3691,8 +3777,17 @@ export function apply(ctx: Context, config: Config) {
                     results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
                   }
                 } else {
-                  scheduleLxB50Notification(session, lxResult.task_id)
-                  results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+                  const successMessage = `❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`
+                  const refId = await logOperation({
+                    command: 'maiua-落雪B50',
+                    session,
+                    targetUserId: actualTargetUserId,
+                    status: 'success',
+                    result: successMessage,
+                    apiResponse: lxResult,
+                  })
+                  scheduleLxB50Notification(session, lxResult.task_id, refId)
+                  results.push(appendRefId(successMessage, refId))
                 }
               } catch (retryError: any) {
                 const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
@@ -4324,11 +4419,12 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
+      // 解析参数：第一个参数可能是SGID/URL或落雪代码
+      let qrCode: string | undefined
+      let lxnsCode: string | undefined
+      let actualTargetUserId: string | undefined = targetUserId
+
       try {
-        // 解析参数：第一个参数可能是SGID/URL或落雪代码
-        let qrCode: string | undefined
-        let lxnsCode: string | undefined
-        let actualTargetUserId: string | undefined = targetUserId
         
         // 检查第一个参数是否是SGID或URL
         if (qrCodeOrLxnsCode) {
@@ -4419,8 +4515,17 @@ export function apply(ctx: Context, config: Config) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
               return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
-            scheduleLxB50Notification(session, result.task_id)
-            return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const successMessage = `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const refId = await logOperation({
+              command: 'mai上传落雪b50',
+              session,
+              targetUserId: actualTargetUserId,
+              status: 'success',
+              result: successMessage,
+              apiResponse: result,
+            })
+            scheduleLxB50Notification(session, result.task_id, refId)
+            return appendRefId(successMessage, refId)
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
@@ -4523,28 +4628,47 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        scheduleLxB50Notification(session, result.task_id)
+        const successMessage = `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const refId = await logOperation({
+          command: 'mai上传落雪b50',
+          session,
+          targetUserId: actualTargetUserId || undefined,
+          status: 'success',
+          result: successMessage,
+          apiResponse: result,
+        })
+        
+        scheduleLxB50Notification(session, result.task_id, refId)
 
-        return `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        return appendRefId(successMessage, refId)
       } catch (error: any) {
         ctx.logger('maibot').error('上传落雪B50失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        // 处理请求超时类错误，统一提示
-        if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
-          let msg = '落雪B50任务 上传失败，请稍后再试一次。'
-          const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
-          if (maintenanceMsg) {
-            msg += `\n${maintenanceMsg}`
-          }
-          msg += `\n\n${maintenanceMessage}`
-          return msg
-        }
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-        }
-        return `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+        const errorMessage = maintenanceMode 
+          ? maintenanceMessage
+          : (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')
+            ? (() => {
+                let msg = '落雪B50任务 上传失败，请稍后再试一次。'
+                const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
+                if (maintenanceMsg) {
+                  msg += `\n${maintenanceMsg}`
+                }
+                msg += `\n\n${maintenanceMessage}`
+                return msg
+              })()
+            : (error?.response 
+              ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+              : `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`))
+        
+        const refId = await logOperation({
+          command: 'mai上传落雪b50',
+          session,
+          targetUserId: (typeof actualTargetUserId !== 'undefined' ? actualTargetUserId : targetUserId) || undefined,
+          status: 'error',
+          errorMessage: error?.message || '未知错误',
+          apiResponse: error?.response?.data,
+        })
+        
+        return appendRefId(errorMessage, refId)
       }
     })
 
@@ -5542,19 +5666,35 @@ export function apply(ctx: Context, config: Config) {
         const todayLogs = allLogs.filter(log => new Date(log.createdAt).getTime() >= todayStart)
 
         // 统计各命令执行次数
+        // 将任务完成/失败等子命令合并到主命令中
         const commandStats: Record<string, { total: number; success: number; failure: number; error: number }> = {}
         
+        // 命令名称映射：将子命令合并到主命令
+        const commandMapping: Record<string, string> = {
+          'mai上传B50-任务完成': 'mai上传B50',
+          'mai上传B50-任务超时': 'mai上传B50',
+          'mai上传B50-轮询异常': 'mai上传B50',
+          'mai上传落雪b50-任务完成': 'mai上传落雪b50',
+          'mai上传落雪b50-任务超时': 'mai上传落雪b50',
+          'mai上传落雪b50-轮询异常': 'mai上传落雪b50',
+          'maiua-水鱼B50': 'maiua',
+          'maiua-落雪B50': 'maiua',
+        }
+        
         for (const log of todayLogs) {
-          if (!commandStats[log.command]) {
-            commandStats[log.command] = { total: 0, success: 0, failure: 0, error: 0 }
+          // 使用映射后的命令名称，如果没有映射则使用原命令名称
+          const commandName = commandMapping[log.command] || log.command
+          
+          if (!commandStats[commandName]) {
+            commandStats[commandName] = { total: 0, success: 0, failure: 0, error: 0 }
           }
-          commandStats[log.command].total++
+          commandStats[commandName].total++
           if (log.status === 'success') {
-            commandStats[log.command].success++
+            commandStats[commandName].success++
           } else if (log.status === 'failure') {
-            commandStats[log.command].failure++
+            commandStats[commandName].failure++
           } else if (log.status === 'error') {
-            commandStats[log.command].error++
+            commandStats[commandName].error++
           }
         }
 
