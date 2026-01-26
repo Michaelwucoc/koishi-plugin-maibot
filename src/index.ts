@@ -51,6 +51,10 @@ export interface Config {
     interval: number  // 处理间隔（毫秒），默认10秒
     message: string  // 队列提示消息模板（支持占位符：{queuePosition} 队列位置，{queueEST} 预计等待秒数）
   }
+  operationLog?: {
+    enabled: boolean  // 操作记录开关
+    refIdLabel: string  // Ref_ID 显示标签（可自定义），默认 'Ref_ID'
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -112,6 +116,13 @@ export const Config: Schema<Config> = Schema.object({
     enabled: false,
     interval: 10000,
     message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。',
+  }),
+  operationLog: Schema.object({
+    enabled: Schema.boolean().default(true).description('操作记录开关，开启后记录所有操作'),
+    refIdLabel: Schema.string().default('Ref_ID').description('Ref_ID 显示标签（可自定义），默认 "Ref_ID"'),
+  }).description('操作记录配置').default({
+    enabled: true,
+    refIdLabel: 'Ref_ID',
   }),
 })
 
@@ -1195,6 +1206,66 @@ export function apply(ctx: Context, config: Config) {
   const queueConfig = config.queue || { enabled: false, interval: 10000, message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。' }
   const requestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
 
+  // 操作记录配置
+  const operationLogConfig = config.operationLog || { enabled: true, refIdLabel: 'Ref_ID' }
+
+  /**
+   * 生成唯一的 ref_id
+   */
+  function generateRefId(): string {
+    const timestamp = Date.now().toString(36)
+    const random = Math.random().toString(36).substring(2, 9)
+    return `${timestamp}-${random}`.toUpperCase()
+  }
+
+  /**
+   * 记录操作日志
+   */
+  async function logOperation(params: {
+    command: string
+    session: Session
+    targetUserId?: string
+    status: 'success' | 'failure' | 'error'
+    result?: string
+    errorMessage?: string
+    apiResponse?: any
+  }): Promise<string> {
+    if (!operationLogConfig.enabled) {
+      return ''
+    }
+
+    const refId = generateRefId()
+    try {
+      await ctx.database.create('maibot_operation_logs', {
+        refId,
+        command: params.command,
+        userId: params.session.userId || '',
+        targetUserId: params.targetUserId,
+        guildId: params.session.guildId || undefined,
+        channelId: params.session.channelId || undefined,
+        status: params.status,
+        result: params.result,
+        errorMessage: params.errorMessage,
+        apiResponse: params.apiResponse ? JSON.stringify(params.apiResponse) : undefined,
+        createdAt: new Date(),
+      })
+    } catch (error: any) {
+      logger.warn(`记录操作日志失败: ${error?.message || '未知错误'}`)
+    }
+    return refId
+  }
+
+  /**
+   * 在结果消息中添加 Ref_ID
+   */
+  function appendRefId(message: string, refId: string): string {
+    if (!refId || !operationLogConfig.enabled) {
+      return message
+    }
+    const label = operationLogConfig.refIdLabel || 'Ref_ID'
+    return `${message}\n${label}: ${refId}`
+  }
+
   /**
    * 在API调用前加入队列并等待
    * 这个函数应该在获取到SGID后、调用API前使用
@@ -2010,12 +2081,28 @@ export function apply(ctx: Context, config: Config) {
           previewResult = await api.getPreview(machineInfo.clientId, qrCode)
         } catch (error: any) {
           ctx.logger('maibot').error('获取用户预览信息失败:', error)
-          return `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${error?.message || '未知错误'}`
+          const errorMessage = `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${error?.message || '未知错误'}`
+          const refId = await logOperation({
+            command: 'mai绑定',
+            session,
+            status: 'error',
+            errorMessage: error?.message || '未知错误',
+            apiResponse: error?.response?.data,
+          })
+          return appendRefId(errorMessage, refId)
         }
 
         // 检查是否获取成功
         if (previewResult.UserID === -1 || (typeof previewResult.UserID === 'string' && previewResult.UserID === '-1')) {
-          return `❌ 绑定失败：无效或过期的二维码`
+          const errorMessage = `❌ 绑定失败：无效或过期的二维码`
+          const refId = await logOperation({
+            command: 'mai绑定',
+            session,
+            status: 'failure',
+            errorMessage: '无效或过期的二维码',
+            apiResponse: previewResult,
+          })
+          return appendRefId(errorMessage, refId)
         }
 
         // UserID在新API中是加密的字符串
@@ -2035,20 +2122,37 @@ export function apply(ctx: Context, config: Config) {
           lastQrCodeTime: new Date(),  // 保存时间戳
         })
 
-        return `✅ 绑定成功！\n` +
+        const successMessage = `✅ 绑定成功！\n` +
                (userName ? `用户名: ${userName}\n` : '') +
                (rating ? `Rating: ${rating}\n` : '') +
                `绑定时间: ${new Date().toLocaleString('zh-CN')}\n\n` +
                `⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`
+        
+        const refId = await logOperation({
+          command: 'mai绑定',
+          session,
+          status: 'success',
+          result: successMessage,
+        })
+        
+        return appendRefId(successMessage, refId)
       } catch (error: any) {
         ctx.logger('maibot').error('绑定失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-        }
-        return `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+        const errorMessage = maintenanceMode 
+          ? maintenanceMessage
+          : (error?.response 
+            ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+            : `❌ 绑定失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`)
+        
+        const refId = await logOperation({
+          command: 'mai绑定',
+          session,
+          status: 'error',
+          errorMessage: error?.message || '未知错误',
+          apiResponse: error?.response?.data,
+        })
+        
+        return appendRefId(errorMessage, refId)
       }
     })
 
@@ -2130,11 +2234,20 @@ export function apply(ctx: Context, config: Config) {
           if (qrTextResult.error) {
             statusInfo += `\n⚠️ 无法获取最新状态：${qrTextResult.error}`
           } else {
-            // 在调用API前加入队列
+            // 在调用API前加入队列（只调用一次）
             await waitForQueue(session)
             
             try {
-              const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
+              // 同时获取 preview 和 getCharge（并行执行，避免重复排队）
+              const [preview, chargeResult] = await Promise.all([
+                api.getPreview(machineInfo.clientId, qrTextResult.qrText),
+                api.getCharge(
+                  machineInfo.regionId,
+                  machineInfo.clientId,
+                  machineInfo.placeId,
+                  qrTextResult.qrText
+                )
+              ])
               
               // 更新数据库中的用户名和Rating
               await ctx.database.set('maibot_bindings', { userId }, {
@@ -2185,6 +2298,10 @@ export function apply(ctx: Context, config: Config) {
                            (versionInfo ? versionInfo : '') +
                            `登录状态: ${preview.IsLogin === true ? '已登录' : '未登录'}\n` +
                            `封禁状态: ${preview.BanState === 0 ? '正常' : '已封禁'}\n`
+              
+              // 保存 chargeResult 供后续使用
+              qrTextResultForCharge = { ...qrTextResult } as any
+              ;(qrTextResultForCharge as any).chargeResult = chargeResult
             } catch (error) {
               logger.warn('获取用户预览信息失败:', error)
               statusInfo += `\n⚠️ 无法获取最新状态，请检查API服务`
@@ -2238,15 +2355,21 @@ export function apply(ctx: Context, config: Config) {
         // 显示票券信息（使用新的getCharge API）
         try {
           if (qrTextResultForCharge && !qrTextResultForCharge.error) {
-            // 在调用API前加入队列
-            await waitForQueue(session)
-            
-            const chargeResult = await api.getCharge(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              qrTextResultForCharge.qrText
-            )
+            // 如果已经在上面获取了 chargeResult，直接使用；否则重新获取
+            let chargeResult: any
+            if ((qrTextResultForCharge as any).chargeResult) {
+              // 已经在上面并行获取了，直接使用
+              chargeResult = (qrTextResultForCharge as any).chargeResult
+            } else {
+              // 如果上面获取失败，这里重新获取（需要排队）
+              await waitForQueue(session)
+              chargeResult = await api.getCharge(
+                machineInfo.regionId,
+                machineInfo.clientId,
+                machineInfo.placeId,
+                qrTextResultForCharge.qrText
+              )
+            }
             
             if (chargeResult.ChargeStatus && chargeResult.userChargeList) {
               const now = new Date()
@@ -2307,9 +2430,26 @@ export function apply(ctx: Context, config: Config) {
           statusInfo += `\n\n🎫 票券情况: 获取失败（${error?.message || '未知错误'}）`
         }
 
-        return statusInfo
+        const refId = await logOperation({
+          command: 'mai状态',
+          session,
+          targetUserId,
+          status: 'success',
+          result: statusInfo,
+        })
+        
+        return appendRefId(statusInfo, refId)
       } catch (error: any) {
         ctx.logger('maibot').error('查询状态失败:', error)
+        const errorMessage = `❌ 查询状态失败: ${error?.message || '未知错误'}`
+        const refId = await logOperation({
+          command: 'mai状态',
+          session,
+          targetUserId,
+          status: 'error',
+          errorMessage: error?.message || '未知错误',
+        })
+        return appendRefId(errorMessage, refId)
         if (maintenanceMode) {
           return maintenanceMessage
         }
@@ -2924,16 +3064,31 @@ export function apply(ctx: Context, config: Config) {
           }
         }
 
-        return `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+        const successMessage = `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
+        const refId = await logOperation({
+          command: 'mai发票',
+          session,
+          targetUserId,
+          status: 'success',
+          result: successMessage,
+        })
+        return appendRefId(successMessage, refId)
       } catch (error: any) {
         logger.error('发票失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        if (error?.response) {
-          return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-        }
-        return `❌ 发票失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+        const errorMessage = maintenanceMode 
+          ? maintenanceMessage
+          : (error?.response 
+            ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
+            : `❌ 发票失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`)
+        const refId = await logOperation({
+          command: 'mai发票',
+          session,
+          targetUserId,
+          status: 'error',
+          errorMessage: error?.message || '未知错误',
+          apiResponse: error?.response?.data,
+        })
+        return appendRefId(errorMessage, refId)
       }
     })
 
@@ -3128,7 +3283,16 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
             }
             scheduleB50Notification(session, result.task_id)
-            return `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const successMessage = `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const refId = await logOperation({
+              command: 'mai上传B50',
+              session,
+              targetUserId,
+              status: 'success',
+              result: successMessage,
+              apiResponse: result,
+            })
+            return appendRefId(successMessage, refId)
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
@@ -3346,152 +3510,131 @@ export function apply(ctx: Context, config: Config) {
 
         const results: string[] = []
 
-        // 上传水鱼B50
-        const fishAbort = await (async (): Promise<string | null> => {
-          try {
+        // 先上传水鱼B50，等待完成后再上传落雪（串行执行，避免同时登录）
+        try {
+          await waitForQueue(session)
+          let fishResult = await api.uploadB50(
+            machineInfo.regionId,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            qrTextResult.qrText,
+            fishToken
+          )
+
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (qrTextResult.fromCache && !fishResult.UploadStatus && (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效'))) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+              return `🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
+            }
+            // 在调用API前加入队列
             await waitForQueue(session)
-            let fishResult = await api.uploadB50(
+            fishResult = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
               machineInfo.placeId,
-              qrTextResult.qrText,
+              retryQrText.qrText,
               fishToken
             )
+          }
 
-            // 如果使用了缓存且失败，尝试重新获取SGID
-            if (qrTextResult.fromCache && !fishResult.UploadStatus && (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效'))) {
-              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
-              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
-              if (retryQrText.error) {
-                const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
-                results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
-                return null
+          if (!fishResult.UploadStatus) {
+            if (fishResult.msg === '该账号下存在未完成的任务') {
+              results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+            } else if (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效')) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
               }
-              // 在调用API前加入队列
-              await waitForQueue(session)
-              fishResult = await api.uploadB50(
+              const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+              return `❌ 水鱼上传失败：${fishResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+            } else {
+              const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
+              results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
+            }
+          } else {
+            scheduleB50Notification(session, fishResult.task_id)
+            results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
+          }
+        } catch (error: any) {
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (qrTextResult.fromCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              return `🐟 水鱼: ❌ 获取二维码失败：${retryQrText.error}`
+            }
+            // 在调用API前加入队列
+            await waitForQueue(session)
+            try {
+              const fishResult = await api.uploadB50(
                 machineInfo.regionId,
                 machineInfo.clientId,
                 machineInfo.placeId,
                 retryQrText.qrText,
                 fishToken
               )
-            }
-
-            if (!fishResult.UploadStatus) {
-              if (fishResult.msg === '该账号下存在未完成的任务') {
-                results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
-                return null
-              }
-
-              if (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效')) {
-                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-                if (rebindResult.success && rebindResult.newBinding) {
-                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-                }
-                const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
-                return `❌ 水鱼上传失败：${fishResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
-              }
-
-              const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
-              results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
-              return null
-            }
-
-            scheduleB50Notification(session, fishResult.task_id)
-            results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
-            return null
-          } catch (error: any) {
-            // 如果使用了缓存且失败，尝试重新获取SGID
-            if (qrTextResult.fromCache) {
-              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
-              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
-              if (retryQrText.error) {
-                results.push(`🐟 水鱼: ❌ 获取二维码失败：${retryQrText.error}`)
-                return null
-              }
-              // 在调用API前加入队列
-              await waitForQueue(session)
-              try {
-                const fishResult = await api.uploadB50(
-                  machineInfo.regionId,
-                  machineInfo.clientId,
-                  machineInfo.placeId,
-                  retryQrText.qrText,
-                  fishToken
-                )
-                if (!fishResult.UploadStatus) {
-                  if (fishResult.msg === '该账号下存在未完成的任务') {
-                    results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
-                    return null
-                  }
+              if (!fishResult.UploadStatus) {
+                if (fishResult.msg === '该账号下存在未完成的任务') {
+                  results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+                } else {
                   const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
-                  results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
-                  return null
+                  return `🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`
                 }
+              } else {
                 scheduleB50Notification(session, fishResult.task_id)
                 results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
-                return null
-              } catch (retryError: any) {
-                const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
-                if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-                }
-                if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
-                  results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
-                  return null
-                }
-                if (retryError?.response) {
-                  results.push(`🐟 水鱼: ❌ API请求失败: ${retryError.response.status} ${retryError.response.statusText}`)
-                  return null
-                }
-                results.push(`🐟 水鱼: ❌ 上传失败: ${retryError?.message || '未知错误'}`)
-                return null
               }
-            } else {
-              const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            } catch (retryError: any) {
+              const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
               if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
                 return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
               }
-              if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
-                results.push('🐟 水鱼: ❌ 上传超时，请稍后再试一次。')
-                return null
+              if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
+                return '🐟 水鱼: ❌ 上传超时，请稍后再试一次。'
               }
-              if (error?.response) {
-                results.push(`🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
-                return null
+              if (retryError?.response) {
+                return `🐟 水鱼: ❌ API请求失败: ${retryError.response.status} ${retryError.response.statusText}`
               }
-              results.push(`🐟 水鱼: ❌ 上传失败: ${error?.message || '未知错误'}`)
-              return null
+              return `🐟 水鱼: ❌ 上传失败: ${retryError?.message || '未知错误'}`
             }
+          } else {
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+            }
+            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+              return '🐟 水鱼: ❌ 上传超时，请稍后再试一次。'
+            }
+            if (error?.response) {
+              return `🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`
+            }
+            return `🐟 水鱼: ❌ 上传失败: ${error?.message || '未知错误'}`
           }
-        })()
-
-        if (fishAbort) {
-          return fishAbort
         }
 
+        // 等待水鱼上传完成后再上传落雪（避免同时登录导致失败）
         // 上传落雪B50
-        const lxnsAbort = await (async (): Promise<string | null> => {
-          try {
-            await waitForQueue(session)
-            let lxResult = await api.uploadLxB50(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              qrTextResult.qrText,
-              finalLxnsCode
-            )
+        try {
+          await waitForQueue(session)
+          let lxResult = await api.uploadLxB50(
+            machineInfo.regionId,
+            machineInfo.clientId,
+            machineInfo.placeId,
+            qrTextResult.qrText,
+            finalLxnsCode
+          )
 
-            // 如果使用了缓存且失败，尝试重新获取SGID
-            if (qrTextResult.fromCache && !lxResult.UploadStatus && (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效'))) {
-              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
-              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
-              if (retryQrText.error) {
-                const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
-                results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
-                return null
-              }
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (qrTextResult.fromCache && !lxResult.UploadStatus && (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效'))) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+              results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`)
+            } else {
               // 在调用API前加入队列
               await waitForQueue(session)
               lxResult = await api.uploadLxB50(
@@ -3502,39 +3645,34 @@ export function apply(ctx: Context, config: Config) {
                 finalLxnsCode
               )
             }
+          }
 
-            if (!lxResult.UploadStatus) {
-              if (lxResult.msg === '该账号下存在未完成的任务') {
-                results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
-                return null
+          if (!lxResult.UploadStatus) {
+            if (lxResult.msg === '该账号下存在未完成的任务') {
+              results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
+            } else if (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效')) {
+              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
+              if (rebindResult.success && rebindResult.newBinding) {
+                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
               }
-
-              if (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效')) {
-                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-                if (rebindResult.success && rebindResult.newBinding) {
-                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-                }
-                const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
-                return `❌ 落雪上传失败：${lxResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
-              }
-
+              const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+              return `❌ 落雪上传失败：${lxResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+            } else {
               const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
               results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
-              return null
             }
-
+          } else {
             scheduleLxB50Notification(session, lxResult.task_id)
             results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
-            return null
-          } catch (error: any) {
-            // 如果使用了缓存且失败，尝试重新获取SGID
-            if (qrTextResult.fromCache) {
-              logger.info('使用缓存的SGID失败，尝试重新获取SGID')
-              const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
-              if (retryQrText.error) {
-                results.push(`❄️ 落雪: ❌ 获取二维码失败：${retryQrText.error}`)
-                return null
-              }
+          }
+        } catch (error: any) {
+          // 如果使用了缓存且失败，尝试重新获取SGID
+          if (qrTextResult.fromCache) {
+            logger.info('使用缓存的SGID失败，尝试重新获取SGID')
+            const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
+            if (retryQrText.error) {
+              results.push(`❄️ 落雪: ❌ 获取二维码失败：${retryQrText.error}`)
+            } else {
               // 在调用API前加入队列
               await waitForQueue(session)
               try {
@@ -3548,15 +3686,14 @@ export function apply(ctx: Context, config: Config) {
                 if (!lxResult.UploadStatus) {
                   if (lxResult.msg === '该账号下存在未完成的任务') {
                     results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
-                    return null
+                  } else {
+                    const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
+                    results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
                   }
-                  const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
-                  results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
-                  return null
+                } else {
+                  scheduleLxB50Notification(session, lxResult.task_id)
+                  results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
                 }
-                scheduleLxB50Notification(session, lxResult.task_id)
-                results.push(`❄️ 落雪: ✅ B50任务已提交！\n任务ID: ${lxResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
-                return null
               } catch (retryError: any) {
                 const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
                 if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
@@ -3564,36 +3701,26 @@ export function apply(ctx: Context, config: Config) {
                 }
                 if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
                   results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
-                  return null
-                }
-                if (retryError?.response) {
+                } else if (retryError?.response) {
                   results.push(`❄️ 落雪: ❌ API请求失败: ${retryError.response.status} ${retryError.response.statusText}`)
-                  return null
+                } else {
+                  results.push(`❄️ 落雪: ❌ 上传失败: ${retryError?.message || '未知错误'}`)
                 }
-                results.push(`❄️ 落雪: ❌ 上传失败: ${retryError?.message || '未知错误'}`)
-                return null
               }
+            }
+          } else {
+            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
+            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
+              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
+            }
+            if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
+              results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
+            } else if (error?.response) {
+              results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
             } else {
-              const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-              if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-              }
-              if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
-                results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
-                return null
-              }
-              if (error?.response) {
-                results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
-                return null
-              }
               results.push(`❄️ 落雪: ❌ 上传失败: ${error?.message || '未知错误'}`)
-              return null
             }
           }
-        })()
-
-        if (lxnsAbort) {
-          return lxnsAbort
         }
 
         if (results.length === 0) {
@@ -5302,13 +5429,159 @@ export function apply(ctx: Context, config: Config) {
           resultMessage = `ℹ️ 没有需要更新的用户\n所有用户都未开启锁定模式和保护模式`
         }
 
-        return resultMessage
-      } catch (error: any) {
-        logger.error('管理员一键关闭操作失败:', error)
-        if (maintenanceMode) {
-          return maintenanceMessage
+      const refId = await logOperation({
+        command: 'mai管理员一键关闭',
+        session,
+        status: 'success',
+        result: resultMessage,
+      })
+      
+      return appendRefId(resultMessage, refId)
+    } catch (error: any) {
+      logger.error('管理员一键关闭操作失败:', error)
+      const errorMessage = maintenanceMode 
+        ? maintenanceMessage
+        : `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+      
+      const refId = await logOperation({
+        command: 'mai管理员一键关闭',
+        session,
+        status: 'error',
+        errorMessage: error?.message || '未知错误',
+      })
+      
+      return appendRefId(errorMessage, refId)
+    }
+  })
+
+  /**
+   * 管理员查询操作记录（通过 ref_id）
+   * 用法: /mai管理员查询操作 <ref_id>
+   */
+  ctx.command('mai管理员查询操作 <refId:text>', '通过 Ref_ID 查询操作详细信息（需要auth等级3以上）')
+    .userFields(['authority'])
+    .action(async ({ session }, refId) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
+      }
+
+      try {
+        const logs = await ctx.database.get('maibot_operation_logs', { refId: refId.trim() })
+        if (logs.length === 0) {
+          return `❌ 未找到 Ref_ID 为 "${refId}" 的操作记录`
         }
-        return `❌ 操作失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`
+
+        const log = logs[0]
+        const statusText = {
+          success: '✅ 成功',
+          failure: '❌ 失败',
+          error: '⚠️ 错误',
+        }[log.status] || log.status
+
+        let result = `📋 操作记录详情\n\n`
+        result += `Ref_ID: ${log.refId}\n`
+        result += `命令: ${log.command}\n`
+        result += `操作人: ${log.userId}\n`
+        if (log.targetUserId) {
+          result += `目标用户: ${log.targetUserId}\n`
+        }
+        result += `状态: ${statusText}\n`
+        result += `操作时间: ${new Date(log.createdAt).toLocaleString('zh-CN')}\n`
+        if (log.guildId) {
+          result += `群组ID: ${log.guildId}\n`
+        }
+        if (log.channelId) {
+          result += `频道ID: ${log.channelId}\n`
+        }
+        if (log.result) {
+          result += `\n操作结果:\n${log.result}\n`
+        }
+        if (log.errorMessage) {
+          result += `\n错误信息:\n${log.errorMessage}\n`
+        }
+        if (log.apiResponse) {
+          try {
+            const apiResp = JSON.parse(log.apiResponse)
+            result += `\nAPI响应:\n${JSON.stringify(apiResp, null, 2)}\n`
+          } catch {
+            result += `\nAPI响应:\n${log.apiResponse}\n`
+          }
+        }
+
+        return result
+      } catch (error: any) {
+        logger.error('查询操作记录失败:', error)
+        return `❌ 查询失败: ${error?.message || '未知错误'}`
+      }
+    })
+
+  /**
+   * 管理员查看今日命令统计
+   * 用法: /mai管理员统计
+   */
+  ctx.command('mai管理员统计', '查看今日各指令执行次数统计（需要auth等级3以上）')
+    .userFields(['authority'])
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+      if ((session.user?.authority ?? 0) < 3) {
+        return '❌ 权限不足，需要auth等级3以上才能执行此操作'
+      }
+
+      try {
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        const todayStart = today.getTime()
+
+        // 获取今日所有操作记录
+        const allLogs = await ctx.database.get('maibot_operation_logs', {})
+        const todayLogs = allLogs.filter(log => new Date(log.createdAt).getTime() >= todayStart)
+
+        // 统计各命令执行次数
+        const commandStats: Record<string, { total: number; success: number; failure: number; error: number }> = {}
+        
+        for (const log of todayLogs) {
+          if (!commandStats[log.command]) {
+            commandStats[log.command] = { total: 0, success: 0, failure: 0, error: 0 }
+          }
+          commandStats[log.command].total++
+          if (log.status === 'success') {
+            commandStats[log.command].success++
+          } else if (log.status === 'failure') {
+            commandStats[log.command].failure++
+          } else if (log.status === 'error') {
+            commandStats[log.command].error++
+          }
+        }
+
+        // 按执行次数排序
+        const sortedCommands = Object.entries(commandStats).sort((a, b) => b[1].total - a[1].total)
+
+        let result = `📊 今日命令执行统计\n\n`
+        result += `统计时间: ${new Date().toLocaleString('zh-CN')}\n`
+        result += `总操作数: ${todayLogs.length}\n\n`
+
+        if (sortedCommands.length === 0) {
+          result += `ℹ️ 今日暂无操作记录`
+        } else {
+          result += `各命令执行情况:\n`
+          for (const [command, stats] of sortedCommands) {
+            result += `\n${command}:\n`
+            result += `  总次数: ${stats.total}\n`
+            result += `  成功: ${stats.success}\n`
+            result += `  失败: ${stats.failure}\n`
+            result += `  错误: ${stats.error}\n`
+          }
+        }
+
+        return result
+      } catch (error: any) {
+        logger.error('查询统计失败:', error)
+        return `❌ 查询失败: ${error?.message || '未知错误'}`
       }
     })
 

@@ -28,10 +28,26 @@ export interface MaiBotSetting {
   updatedAt: Date
 }
 
+export interface OperationLog {
+  id: number
+  refId: string  // 操作引用ID（唯一标识）
+  command: string  // 命令名称（如 'mai绑定', 'mai上传B50'）
+  userId: string  // 操作人用户ID
+  targetUserId?: string  // 目标用户ID（如果是代操作）
+  guildId?: string  // 群组ID
+  channelId?: string  // 频道ID
+  status: 'success' | 'failure' | 'error'  // 操作状态
+  result?: string  // 操作结果消息
+  errorMessage?: string  // 错误信息
+  apiResponse?: string  // API响应（JSON字符串）
+  createdAt: Date  // 操作时间
+}
+
 declare module 'koishi' {
   interface Tables {
     maibot_bindings: UserBinding
     maibot_settings: MaiBotSetting
+    maibot_operation_logs: OperationLog
   }
 }
 
@@ -70,6 +86,27 @@ export function extendDatabase(ctx: Context) {
     updatedAt: 'timestamp',
   }, {
     primary: 'key',
+  })
+
+  // 操作记录表
+  ctx.model.extend('maibot_operation_logs', {
+    id: 'unsigned',
+    refId: 'string',
+    command: 'string',
+    userId: 'string',
+    targetUserId: 'string',
+    guildId: 'string',
+    channelId: 'string',
+    status: 'string',  // 'success' | 'failure' | 'error'
+    result: 'text',
+    errorMessage: 'text',
+    apiResponse: 'text',
+    createdAt: 'timestamp',
+  }, {
+    primary: 'id',
+    autoInc: true,
+    // targetUserId, guildId, channelId, result, errorMessage, apiResponse 可以为空
+    unique: ['refId'], // refId 必须唯一
   })
 }
 
