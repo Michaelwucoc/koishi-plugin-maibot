@@ -34,6 +34,7 @@ export interface Config {
   lockRefreshConcurrency?: number  // 锁定账号刷新时的并发数
   confirmTimeout?: number  // 确认提示超时时间（毫秒）
   rebindTimeout?: number  // 重新绑定超时时间（毫秒），默认60秒
+  sgidCacheMinutes?: number  // SGID缓存有效期（分钟），默认10分钟
   protectionCheckInterval?: number  // 保护模式检查间隔（毫秒）
   authLevelForProxy?: number  // 代操作功能需要的auth等级（默认3）
   protectionLockMessage?: string  // 保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）
@@ -92,6 +93,7 @@ export const Config: Schema<Config> = Schema.object({
   lockRefreshConcurrency: Schema.number().default(3).description('锁定账号刷新时的并发数，默认3个账号同时刷新'),
   confirmTimeout: Schema.number().default(10000).description('确认提示超时时间（毫秒），默认10秒（10000毫秒）'),
   rebindTimeout: Schema.number().default(60000).description('重新绑定超时时间（毫秒），默认60秒（60000毫秒）'),
+  sgidCacheMinutes: Schema.number().default(10).description('SGID缓存有效期（分钟），默认10分钟（0表示禁用缓存）'),
   protectionCheckInterval: Schema.number().default(60000).description('保护模式检查间隔（毫秒），默认60秒（60000毫秒）'),
   authLevelForProxy: Schema.number().default(3).description('代操作功能需要的auth等级，默认3'),
   protectionLockMessage: Schema.string().default('🛡️ 保护模式：{playerid}{at} 你的账号已自动锁定成功').description('保护模式锁定成功消息（支持占位符：{playerid} 玩家名，{at} @用户）'),
@@ -866,7 +868,7 @@ async function waitForUserReply(
 
 /**
  * 交互式获取二维码文本（qr_text）
- * 支持10分钟内使用上次输入的SGID缓存
+ * 支持配置的时间内使用上次输入的SGID缓存
  * 如果缓存存在且有效，直接使用；否则提示用户输入
  */
 async function getQrText(
@@ -881,17 +883,18 @@ async function getQrText(
 ): Promise<{ qrText: string; error?: string; needRebind?: boolean; fromCache?: boolean }> {
   const logger = ctx.logger('maibot')
   
-  // 如果启用缓存且binding存在，检查是否有10分钟内的SGID缓存
-  if (useCache && binding && binding.lastQrCode && binding.lastQrCodeTime) {
+  // 如果启用缓存且binding存在，检查是否有缓存
+  const cacheMinutes = config.sgidCacheMinutes ?? 10
+  if (useCache && cacheMinutes > 0 && binding && binding.lastQrCode && binding.lastQrCodeTime) {
     const cacheAge = Date.now() - new Date(binding.lastQrCodeTime).getTime()
-    const cacheValidDuration = 10 * 60 * 1000  // 10分钟
+    const cacheValidDuration = cacheMinutes * 60 * 1000
     
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
       logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
       // 直接返回缓存的SGID，不验证（让调用方验证，如果失败再提示输入）
       return { qrText: binding.lastQrCode, fromCache: true }
     } else {
-      logger.debug(`缓存已过期（${Math.floor(cacheAge / 1000)}秒前输入，超过10分钟）`)
+      logger.debug(`缓存已过期（${Math.floor(cacheAge / 1000)}秒前输入，超过${cacheMinutes}分钟）`)
     }
   }
   
