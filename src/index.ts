@@ -4677,18 +4677,11 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 查询选项文件（OPT）
    * 用法: /mai查询opt <title_ver>
-   * 权限: auth3
    */
   ctx.command('mai查询opt <titleVer:text>', '查询Mai2选项文件下载地址')
-    .userFields(['authority'])
     .action(async ({ session }, titleVer) => {
       if (!session) {
         return '❌ 无法获取会话信息'
-      }
-
-      // 检查权限（auth3）
-      if (session.user?.authority !== 3) {
-        return '❌ 权限不足，此功能需要auth等级3'
       }
 
       if (!titleVer) {
