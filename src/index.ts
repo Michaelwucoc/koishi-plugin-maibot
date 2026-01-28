@@ -58,6 +58,7 @@ export interface Config {
   }
   errorHelpUrl?: string  // 任务出错时引导用户提问的URL
   b50PollInterval?: number  // B50任务轮询间隔（毫秒），默认2000毫秒
+  b50PollTimeout?: number  // B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -130,6 +131,7 @@ export const Config: Schema<Config> = Schema.object({
   }),
   errorHelpUrl: Schema.string().default('https://awmc.cc/forums/8/').description('任务出错时引导用户提问的URL（留空则不显示引导信息）'),
   b50PollInterval: Schema.number().default(2000).description('B50任务轮询间隔（毫秒），默认2000毫秒'),
+  b50PollTimeout: Schema.number().default(600000).description('B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）'),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -1707,7 +1709,8 @@ export function apply(ctx: Context, config: Config) {
     const mention = buildMention(session)
     const guildId = session.guildId
     const pollInterval = config.b50PollInterval || 2000
-    const maxAttempts = Math.ceil(600000 / pollInterval)  // 10分钟超时
+    const pollTimeout = config.b50PollTimeout || 600000  // 默认10分钟超时
+    const maxAttempts = Math.ceil(pollTimeout / pollInterval)
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
@@ -1760,7 +1763,7 @@ export function apply(ctx: Context, config: Config) {
           command: 'mai上传B50-任务超时',
           session,
           status: 'failure',
-          errorMessage: '任务轮询超时（10分钟）',
+          errorMessage: `任务轮询超时（${Math.round(pollTimeout / 60000)}分钟）`,
         })
         
         let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
@@ -1816,7 +1819,8 @@ export function apply(ctx: Context, config: Config) {
     const mention = buildMention(session)
     const guildId = session.guildId
     const pollInterval = config.b50PollInterval || 2000
-    const maxAttempts = Math.ceil(600000 / pollInterval)  // 10分钟超时
+    const pollTimeout = config.b50PollTimeout || 600000  // 默认10分钟超时
+    const maxAttempts = Math.ceil(pollTimeout / pollInterval)
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
@@ -1869,7 +1873,7 @@ export function apply(ctx: Context, config: Config) {
           command: 'mai上传落雪b50-任务超时',
           session,
           status: 'failure',
-          errorMessage: '任务轮询超时（10分钟）',
+          errorMessage: `任务轮询超时（${Math.round(pollTimeout / 60000)}分钟）`,
         })
         
         let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
@@ -5902,13 +5906,15 @@ export function apply(ctx: Context, config: Config) {
 
         // 获取B50平均处理时长统计
         const pollInterval = config.b50PollInterval || 2000
+        const pollTimeout = config.b50PollTimeout || 600000
         const fishStats = await getUploadStats('mai上传B50')
         const lxStats = await getUploadStats('mai上传落雪b50')
 
         let result = `📊 今日命令执行统计\n\n`
         result += `统计时间: ${new Date().toLocaleString('zh-CN')}\n`
         result += `总操作数: ${todayLogs.length}\n`
-        result += `轮询间隔: ${pollInterval} ms\n\n`
+        result += `轮询间隔: ${pollInterval} ms\n`
+        result += `轮询超时: ${Math.round(pollTimeout / 60000)} 分钟\n\n`
 
         // B50处理时长统计
         result += `📈 B50处理统计:\n`
