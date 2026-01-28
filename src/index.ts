@@ -57,6 +57,7 @@ export interface Config {
     refIdLabel: string  // Ref_ID 显示标签（可自定义），默认 'Ref_ID'
   }
   errorHelpUrl?: string  // 任务出错时引导用户提问的URL
+  b50PollInterval?: number  // B50任务轮询间隔（毫秒），默认2000毫秒
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -128,6 +129,7 @@ export const Config: Schema<Config> = Schema.object({
     refIdLabel: 'Ref_ID',
   }),
   errorHelpUrl: Schema.string().default('https://awmc.cc/forums/8/').description('任务出错时引导用户提问的URL（留空则不显示引导信息）'),
+  b50PollInterval: Schema.number().default(2000).description('B50任务轮询间隔（毫秒），默认2000毫秒'),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -1357,7 +1359,7 @@ export function apply(ctx: Context, config: Config) {
       // 构建统计信息字符串
       let statsStr = ''
       if (avgDuration > 0) {
-        statsStr += `平均处理用时 ${avgDuration.toFixed(2)} s`
+        statsStr += `平均处理用时 ${avgDuration.toFixed(1)} s`
       }
       if (totalCompleted > 0) {
         if (statsStr) statsStr += '，'
@@ -1704,9 +1706,10 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const maxAttempts = 300  // 10分钟超时：300次 * 2秒 = 600秒 = 10分钟
-    const interval = 2_000  // 每2秒轮询一次
-    const initialDelay = 2_000  // 首次延迟2秒后开始检查
+    const pollInterval = config.b50PollInterval || 2000
+    const maxAttempts = Math.ceil(600000 / pollInterval)  // 10分钟超时
+    const interval = pollInterval
+    const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
 
     const poll = async () => {
@@ -1812,9 +1815,10 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const maxAttempts = 300  // 10分钟超时：300次 * 2秒 = 600秒 = 10分钟
-    const interval = 2_000  // 每2秒轮询一次
-    const initialDelay = 2_000  // 首次延迟2秒后开始检查
+    const pollInterval = config.b50PollInterval || 2000
+    const maxAttempts = Math.ceil(600000 / pollInterval)  // 10分钟超时
+    const interval = pollInterval
+    const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
 
     const poll = async () => {
@@ -5896,14 +5900,33 @@ export function apply(ctx: Context, config: Config) {
         // 按执行次数排序
         const sortedCommands = Object.entries(commandStats).sort((a, b) => b[1].total - a[1].total)
 
+        // 获取B50平均处理时长统计
+        const pollInterval = config.b50PollInterval || 2000
+        const fishStats = await getUploadStats('mai上传B50')
+        const lxStats = await getUploadStats('mai上传落雪b50')
+
         let result = `📊 今日命令执行统计\n\n`
         result += `统计时间: ${new Date().toLocaleString('zh-CN')}\n`
-        result += `总操作数: ${todayLogs.length}\n\n`
+        result += `总操作数: ${todayLogs.length}\n`
+        result += `轮询间隔: ${pollInterval} ms\n\n`
+
+        // B50处理时长统计
+        result += `📈 B50处理统计:\n`
+        if (fishStats) {
+          result += `  🐟 水鱼: ${fishStats}\n`
+        } else {
+          result += `  🐟 水鱼: 暂无今日数据\n`
+        }
+        if (lxStats) {
+          result += `  ❄️ 落雪: ${lxStats}\n`
+        } else {
+          result += `  ❄️ 落雪: 暂无今日数据\n`
+        }
 
         if (sortedCommands.length === 0) {
-          result += `ℹ️ 今日暂无操作记录`
+          result += `\nℹ️ 今日暂无操作记录`
         } else {
-          result += `各命令执行情况:\n`
+          result += `\n各命令执行情况:\n`
           for (const [command, stats] of sortedCommands) {
             result += `\n${command}:\n`
             result += `  总次数: ${stats.total}\n`
