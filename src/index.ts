@@ -56,6 +56,7 @@ export interface Config {
     enabled: boolean  // 操作记录开关
     refIdLabel: string  // Ref_ID 显示标签（可自定义），默认 'Ref_ID'
   }
+  errorHelpUrl?: string  // 任务出错时引导用户提问的URL
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -126,6 +127,7 @@ export const Config: Schema<Config> = Schema.object({
     enabled: true,
     refIdLabel: 'Ref_ID',
   }),
+  errorHelpUrl: Schema.string().default('https://awmc.cc/forums/8/').description('任务出错时引导用户提问的URL（留空则不显示引导信息）'),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -721,17 +723,34 @@ function processSGID(input: string): { qrText: string } | null {
   const trimmed = input.trim()
   
   // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-  const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+  const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+  // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
+  const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
   const isSGID = trimmed.startsWith('SGWCMAID')
   
   let qrText = trimmed
   
   // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-  if (isLink) {
+  if (isReqLink) {
     try {
       // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
       // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
       const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
+      if (match && match[1]) {
+        const maid = match[1]
+        // 在前面加上 SGWC 变成 SGWCMAID...
+        qrText = 'SGWC' + maid
+      } else {
+        return null
+      }
+    } catch (error) {
+      return null
+    }
+  } else if (isImgLink) {
+    try {
+      // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
+      // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
+      const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
       if (match && match[1]) {
         const maid = match[1]
         // 在前面加上 SGWC 变成 SGWCMAID...
@@ -923,11 +942,14 @@ async function getQrText(
     let qrText = trimmed
     
     // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-    const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
+    const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
+    const isLink = isReqLink || isImgLink
     const isSGID = trimmed.startsWith('SGWCMAID')
     
     // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-    if (isLink) {
+    if (isReqLink) {
       try {
         // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
         // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
@@ -938,17 +960,36 @@ async function getQrText(
           qrText = 'SGWC' + maid
           logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrText.substring(0, 24)}...`)
         } else {
-          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
           return { qrText: '', error: '无法从网页地址中提取MAID' }
         }
       } catch (error) {
         logger.warn('解析网页地址失败:', error)
-        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
         return { qrText: '', error: '网页地址格式错误' }
       }
+    } else if (isImgLink) {
+      try {
+        // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
+        // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
+        const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
+        if (match && match[1]) {
+          const maid = match[1]
+          // 在前面加上 SGWC 变成 SGWCMAID...
+          qrText = 'SGWC' + maid
+          logger.info(`从图片地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrText.substring(0, 24)}...`)
+        } else {
+          await session.send('⚠️ 无法从图片地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+          return { qrText: '', error: '无法从图片地址中提取MAID' }
+        }
+      } catch (error) {
+        logger.warn('解析图片地址失败:', error)
+        await session.send('⚠️ 图片地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+        return { qrText: '', error: '图片地址格式错误' }
+      }
     } else if (!isSGID) {
-      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
-      return { qrText: '', error: '无效的二维码格式，必须是SGID文本或网页地址' }
+      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+      return { qrText: '', error: '无效的二维码格式，必须是SGID文本或网页/图片地址' }
     }
     
     // 验证SGID格式和长度
@@ -962,7 +1003,7 @@ async function getQrText(
       return { qrText: '', error: '二维码长度错误，应在48-128字符之间' }
     }
     
-    logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrText.substring(0, 50)}...`)
+    logger.info(`✅ 接收到${isLink ? '链接地址（已转换）' : 'SGID'}: ${qrText.substring(0, 50)}...`)
     
     // 尝试撤回用户发送的消息（如果启用了自动撤回）
     await tryRecallMessage(session, ctx, config)
@@ -1087,11 +1128,14 @@ async function promptForRebind(
     let qrCode = trimmed
     
     // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-    const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+    // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
+    const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
+    const isLink = isReqLink || isImgLink
     const isSGID = trimmed.startsWith('SGWCMAID')
     
     // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-    if (isLink) {
+    if (isReqLink) {
       try {
         // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
         // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
@@ -1102,17 +1146,36 @@ async function promptForRebind(
           qrCode = 'SGWC' + maid
           logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
         } else {
-          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
           return { success: false, error: '无法从网页地址中提取MAID', messageId: promptMessageId }
         }
       } catch (error) {
         logger.warn('解析网页地址失败:', error)
-        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
         return { success: false, error: '网页地址格式错误', messageId: promptMessageId }
       }
+    } else if (isImgLink) {
+      try {
+        // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
+        // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
+        const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
+        if (match && match[1]) {
+          const maid = match[1]
+          // 在前面加上 SGWC 变成 SGWCMAID...
+          qrCode = 'SGWC' + maid
+          logger.info(`从图片地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
+        } else {
+          await session.send('⚠️ 无法从图片地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+          return { success: false, error: '无法从图片地址中提取MAID', messageId: promptMessageId }
+        }
+      } catch (error) {
+        logger.warn('解析图片地址失败:', error)
+        await session.send('⚠️ 图片地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+        return { success: false, error: '图片地址格式错误', messageId: promptMessageId }
+      }
     } else if (!isSGID) {
-      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
-      return { success: false, error: '无效的二维码格式，必须是SGID文本或网页地址', messageId: promptMessageId }
+      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+      return { success: false, error: '无效的二维码格式，必须是SGID文本或网页/图片地址', messageId: promptMessageId }
     }
     
     // 验证SGID格式和长度
@@ -1126,7 +1189,7 @@ async function promptForRebind(
       return { success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId }
     }
     
-    logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
+    logger.info(`✅ 接收到${isLink ? '链接地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
     
     // 发送识别中反馈
     await session.send('⏳ 正在处理，请稍候...')
@@ -1211,6 +1274,112 @@ export function apply(ctx: Context, config: Config) {
 
   // 操作记录配置
   const operationLogConfig = config.operationLog || { enabled: true, refIdLabel: 'Ref_ID' }
+
+  // 错误帮助URL配置
+  const errorHelpUrl = config.errorHelpUrl || ''
+
+  /**
+   * 获取上传任务的统计信息（平均处理时长和今日成功率）
+   * @param commandPrefix 命令前缀，用于筛选日志（如 'mai上传B50' 或 'mai上传落雪b50'）
+   * @returns 统计信息字符串
+   */
+  async function getUploadStats(commandPrefix: string): Promise<string> {
+    try {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const todayStart = today.getTime()
+
+      // 获取今日所有相关操作记录
+      const allLogs = await ctx.database.get('maibot_operation_logs', {})
+      const todayLogs = allLogs.filter(log => {
+        const logTime = new Date(log.createdAt).getTime()
+        return logTime >= todayStart && log.command.startsWith(commandPrefix)
+      })
+
+      if (todayLogs.length === 0) {
+        return ''
+      }
+
+      // 统计成功率
+      const taskCompleteLogs = todayLogs.filter(log => log.command.includes('-任务完成'))
+      const successCount = taskCompleteLogs.filter(log => log.status === 'success').length
+      const failureCount = taskCompleteLogs.filter(log => log.status === 'failure').length
+      const totalCompleted = successCount + failureCount
+      
+      // 计算平均处理时长（从任务提交到任务完成）
+      let avgDuration = 0
+      let durationCount = 0
+      
+      // 获取所有任务提交记录和对应的完成记录
+      const submitLogs = todayLogs.filter(log => log.command === commandPrefix && log.status === 'success')
+      
+      for (const submitLog of submitLogs) {
+        // 尝试从 apiResponse 中获取 task_id
+        if (!submitLog.apiResponse) continue
+        try {
+          const response = JSON.parse(submitLog.apiResponse)
+          const taskId = response.task_id
+          if (!taskId) continue
+          
+          // 查找对应的完成记录
+          const completeLog = taskCompleteLogs.find(log => {
+            if (!log.apiResponse) return false
+            try {
+              const completeResponse = JSON.parse(log.apiResponse)
+              return completeResponse.alive_task_id === taskId || String(completeResponse.alive_task_id) === String(taskId)
+            } catch {
+              return false
+            }
+          })
+          
+          if (completeLog) {
+            const submitTime = new Date(submitLog.createdAt).getTime()
+            const completeTime = new Date(completeLog.createdAt).getTime()
+            const duration = (completeTime - submitTime) / 1000 // 转换为秒
+            if (duration > 0 && duration < 600) { // 排除异常数据（超过10分钟的）
+              avgDuration += duration
+              durationCount++
+            }
+          }
+        } catch {
+          continue
+        }
+      }
+      
+      // 计算平均时长
+      if (durationCount > 0) {
+        avgDuration = avgDuration / durationCount
+      }
+      
+      // 计算成功率
+      const successRate = totalCompleted > 0 ? Math.round((successCount / totalCompleted) * 100) : 0
+      
+      // 构建统计信息字符串
+      let statsStr = ''
+      if (avgDuration > 0) {
+        statsStr += `平均处理用时 ${avgDuration.toFixed(2)} s`
+      }
+      if (totalCompleted > 0) {
+        if (statsStr) statsStr += '，'
+        statsStr += `今日成功率 ${successRate}%`
+      }
+      
+      return statsStr
+    } catch (error) {
+      logger.warn('获取上传统计信息失败:', error)
+      return ''
+    }
+  }
+
+  /**
+   * 获取错误帮助信息（如果配置了帮助URL）
+   */
+  function getErrorHelpInfo(): string {
+    if (!errorHelpUrl) {
+      return ''
+    }
+    return `\n\n如有问题，请前往 ${errorHelpUrl} 提问`
+  }
 
   /**
    * 生成唯一的 ref_id
@@ -1552,7 +1721,7 @@ export function apply(ctx: Context, config: Config) {
         if (isDone || hasError) {
           // 任务完成或出错，发送通知并停止
           const statusText = hasError
-            ? `❌ 任务失败：${detail.error}`
+            ? `❌ 任务失败：${detail.error}${getErrorHelpInfo()}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
@@ -1591,7 +1760,7 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: '任务轮询超时（10分钟）',
         })
         
-        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
@@ -1616,7 +1785,7 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: error instanceof Error ? error.message : '未知错误',
         })
         
-        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        let msg = `${mention} 水鱼B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
@@ -1660,7 +1829,7 @@ export function apply(ctx: Context, config: Config) {
         if (isDone || hasError) {
           // 任务完成或出错，发送通知并停止
           const statusText = hasError
-            ? `❌ 任务失败：${detail.error}`
+            ? `❌ 任务失败：${detail.error}${getErrorHelpInfo()}`
             : '✅ 任务已完成'
           const finishTime = detail.alive_task_end_time
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
@@ -1699,7 +1868,7 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: '任务轮询超时（10分钟）',
         })
         
-        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
@@ -1724,7 +1893,7 @@ export function apply(ctx: Context, config: Config) {
           errorMessage: error instanceof Error ? error.message : '未知错误',
         })
         
-        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。`
+        let msg = `${mention} 落雪B50任务 ${taskId} 上传失败，请稍后再试一次。${getErrorHelpInfo()}`
         const maintenanceMsg = getMaintenanceMessage(maintenanceNotice)
         if (maintenanceMsg) {
           msg += `\n${maintenanceMsg}`
@@ -2056,11 +2225,14 @@ export function apply(ctx: Context, config: Config) {
             qrCode = trimmed
             
             // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-            const isLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+            const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
+            // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
+            const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
+            const isLink = isReqLink || isImgLink
             const isSGID = trimmed.startsWith('SGWCMAID')
             
             // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-            if (isLink) {
+            if (isReqLink) {
               try {
                 // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
                 // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
@@ -2071,22 +2243,41 @@ export function apply(ctx: Context, config: Config) {
                   qrCode = 'SGWC' + maid
                   logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
                 } else {
-                  await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+                  await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
                   throw new Error('无法从网页地址中提取MAID')
                 }
               } catch (error) {
                 logger.warn('解析网页地址失败:', error)
-                await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+                await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
                 throw new Error('网页地址格式错误')
               }
+            } else if (isImgLink) {
+              try {
+                // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
+                // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
+                const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
+                if (match && match[1]) {
+                  const maid = match[1]
+                  // 在前面加上 SGWC 变成 SGWCMAID...
+                  qrCode = 'SGWC' + maid
+                  logger.info(`从图片地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
+                } else {
+                  await session.send('⚠️ 无法从图片地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+                  throw new Error('无法从图片地址中提取MAID')
+                }
+              } catch (error) {
+                logger.warn('解析图片地址失败:', error)
+                await session.send('⚠️ 图片地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+                throw new Error('图片地址格式错误')
+              }
             } else if (!isSGID) {
-              await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址（https://wq.wahlap.net/qrcode/req/...）')
-              throw new Error('无效的二维码格式，必须是SGID文本或网页地址')
+              await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
+              throw new Error('无效的二维码格式，必须是SGID文本或网页/图片地址')
             }
             
             // 验证SGID格式和长度
             if (!qrCode.startsWith('SGWCMAID')) {
-              await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）或公众号提供的网页地址')
+              await session.send('⚠️ 未识别到有效的SGID格式，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
               throw new Error('无效的二维码格式，必须以 SGWCMAID 开头')
             }
             
@@ -2095,7 +2286,7 @@ export function apply(ctx: Context, config: Config) {
               throw new Error('二维码长度错误，应在48-128字符之间')
             }
             
-            logger.info(`✅ 接收到${isLink ? '网页地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
+            logger.info(`✅ 接收到${isLink ? '链接地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
             
             // 发送识别中反馈
             await session.send('⏳ 正在处理，请稍候...')
@@ -3341,9 +3532,11 @@ export function apply(ctx: Context, config: Config) {
                 return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后再试，无需重复上传。'
               }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
             }
-            const successMessage = `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const statsInfo = await getUploadStats('mai上传B50')
+            const statsStr = statsInfo ? `\n${statsInfo}` : ''
+            const successMessage = `✅ B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
             const refId = await logOperation({
               command: 'mai上传B50',
               session,
@@ -3449,14 +3642,16 @@ export function apply(ctx: Context, config: Config) {
                 return `✅ 重新绑定成功！请重新执行上传操作。`
               }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
           }
         }
 
-        const successMessage = `✅ B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const statsInfo = await getUploadStats('mai上传B50')
+        const statsStr = statsInfo ? `\n${statsInfo}` : ''
+        const successMessage = `✅ B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
         const refId = await logOperation({
           command: 'mai上传B50',
           session,
@@ -3481,7 +3676,7 @@ export function apply(ctx: Context, config: Config) {
           if (maintenanceMsg) {
             msg += `\n${maintenanceMsg}`
           }
-          msg += `\n\n${maintenanceMessage}`
+          msg += `\n\n${maintenanceMessage}${getErrorHelpInfo()}`
           return msg
         }
         if (error?.response) {
@@ -4516,9 +4711,11 @@ export function apply(ctx: Context, config: Config) {
                 return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后再试，无需重复上传。'
               }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
             }
-            const successMessage = `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+            const statsInfo = await getUploadStats('mai上传落雪b50')
+            const statsStr = statsInfo ? `\n${statsInfo}` : ''
+            const successMessage = `✅ 落雪B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
             const refId = await logOperation({
               command: 'mai上传落雪b50',
               session,
@@ -4530,7 +4727,7 @@ export function apply(ctx: Context, config: Config) {
             scheduleLxB50Notification(session, result.task_id, refId)
             return appendRefId(successMessage, refId)
           }
-          return `❌ 获取二维码失败：${qrTextResult.error}`
+          return `❌ 获取二维码失败：${qrTextResult.error}${getErrorHelpInfo()}`
         }
 
         // 在调用API前加入队列
@@ -4624,14 +4821,16 @@ export function apply(ctx: Context, config: Config) {
                 return `✅ 重新绑定成功！请重新执行上传操作。`
               }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}`
+            return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
           }
         }
 
-        const successMessage = `✅ 落雪B50上传任务已提交！\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
+        const statsInfo = await getUploadStats('mai上传落雪b50')
+        const statsStr = statsInfo ? `\n${statsInfo}` : ''
+        const successMessage = `✅ 落雪B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
         const refId = await logOperation({
           command: 'mai上传落雪b50',
           session,
@@ -4655,12 +4854,12 @@ export function apply(ctx: Context, config: Config) {
                 if (maintenanceMsg) {
                   msg += `\n${maintenanceMsg}`
                 }
-                msg += `\n\n${maintenanceMessage}`
+                msg += `\n\n${maintenanceMessage}${getErrorHelpInfo()}`
                 return msg
               })()
             : (error?.response 
-              ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-              : `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}`))
+              ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}${getErrorHelpInfo()}`
+              : `❌ 上传失败: ${error?.message || '未知错误'}\n\n${maintenanceMessage}${getErrorHelpInfo()}`))
         
         const refId = await logOperation({
           command: 'mai上传落雪b50',
