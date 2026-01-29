@@ -1365,7 +1365,7 @@ export function apply(ctx: Context, config: Config) {
       }
       if (totalCompleted > 0) {
         if (statsStr) statsStr += '，'
-        statsStr += `今日成功率 ${successRate}%`
+        statsStr += `成功率 ${successRate}% (${successCount}/${totalCompleted})`
       }
       
       return statsStr
@@ -1708,15 +1708,18 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const pollInterval = config.b50PollInterval || 2000
-    const pollTimeout = config.b50PollTimeout || 600000  // 默认10分钟超时
+    const pollInterval = config.b50PollInterval ?? 2000
+    const pollTimeout = config.b50PollTimeout ?? 600000  // 默认10分钟超时
     const maxAttempts = Math.ceil(pollTimeout / pollInterval)
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
+    
+    logger.debug(`水鱼B50轮询配置: interval=${pollInterval}ms, timeout=${pollTimeout}ms, maxAttempts=${maxAttempts}`)
 
     const poll = async () => {
       attempts += 1
+      logger.debug(`水鱼B50轮询 ${taskId}: 第${attempts}/${maxAttempts}次`)
       try {
         const detail = await api.getB50TaskById(taskId)
         
@@ -1818,15 +1821,18 @@ export function apply(ctx: Context, config: Config) {
 
     const mention = buildMention(session)
     const guildId = session.guildId
-    const pollInterval = config.b50PollInterval || 2000
-    const pollTimeout = config.b50PollTimeout || 600000  // 默认10分钟超时
+    const pollInterval = config.b50PollInterval ?? 2000
+    const pollTimeout = config.b50PollTimeout ?? 600000  // 默认10分钟超时
     const maxAttempts = Math.ceil(pollTimeout / pollInterval)
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
+    
+    logger.debug(`落雪B50轮询配置: interval=${pollInterval}ms, timeout=${pollTimeout}ms, maxAttempts=${maxAttempts}`)
 
     const poll = async () => {
       attempts += 1
+      logger.debug(`落雪B50轮询 ${taskId}: 第${attempts}/${maxAttempts}次`)
       try {
         const detail = await api.getLxB50TaskById(taskId)
         
@@ -5905,8 +5911,8 @@ export function apply(ctx: Context, config: Config) {
         const sortedCommands = Object.entries(commandStats).sort((a, b) => b[1].total - a[1].total)
 
         // 获取B50平均处理时长统计
-        const pollInterval = config.b50PollInterval || 2000
-        const pollTimeout = config.b50PollTimeout || 600000
+        const pollInterval = config.b50PollInterval ?? 2000
+        const pollTimeout = config.b50PollTimeout ?? 600000
         const fishStats = await getUploadStats('mai上传B50')
         const lxStats = await getUploadStats('mai上传落雪b50')
 
@@ -5916,17 +5922,17 @@ export function apply(ctx: Context, config: Config) {
         result += `轮询间隔: ${pollInterval} ms\n`
         result += `轮询超时: ${Math.round(pollTimeout / 60000)} 分钟\n\n`
 
-        // B50处理时长统计
-        result += `📈 B50处理统计:\n`
+        // B50处理时长统计和成功率
+        result += `📈 B50上传统计:\n`
         if (fishStats) {
-          result += `  🐟 水鱼: ${fishStats}\n`
+          result += `  🐟 水鱼B50: ${fishStats}\n`
         } else {
-          result += `  🐟 水鱼: 暂无今日数据\n`
+          result += `  🐟 水鱼B50: 暂无今日数据\n`
         }
         if (lxStats) {
-          result += `  ❄️ 落雪: ${lxStats}\n`
+          result += `  ❄️ 落雪B50: ${lxStats}\n`
         } else {
-          result += `  ❄️ 落雪: 暂无今日数据\n`
+          result += `  ❄️ 落雪B50: 暂无今日数据\n`
         }
 
         if (sortedCommands.length === 0) {
@@ -5934,11 +5940,11 @@ export function apply(ctx: Context, config: Config) {
         } else {
           result += `\n各命令执行情况:\n`
           for (const [command, stats] of sortedCommands) {
+            // 计算成功率（成功数 / 总数 * 100）
+            const successRate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : '0.0'
             result += `\n${command}:\n`
-            result += `  总次数: ${stats.total}\n`
-            result += `  成功: ${stats.success}\n`
-            result += `  失败: ${stats.failure}\n`
-            result += `  错误: ${stats.error}\n`
+            result += `  总次数: ${stats.total} | 成功率: ${successRate}%\n`
+            result += `  成功: ${stats.success} | 失败: ${stats.failure} | 错误: ${stats.error}\n`
           }
         }
 
