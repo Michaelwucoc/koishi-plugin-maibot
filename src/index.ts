@@ -1304,17 +1304,17 @@ export function apply(ctx: Context, config: Config) {
         return ''
       }
 
-      // 统计成功率
-      const taskCompleteLogs = todayLogs.filter(log => log.command.includes('-任务完成'))
-      const successCount = taskCompleteLogs.filter(log => log.status === 'success').length
-      const failureCount = taskCompleteLogs.filter(log => log.status === 'failure').length
-      const totalCompleted = successCount + failureCount
+      // 统计成功率 - 基于所有相关日志（与管理员统计保持一致）
+      const totalCount = todayLogs.length
+      const successCount = todayLogs.filter(log => log.status === 'success').length
+      const failureCount = todayLogs.filter(log => log.status === 'failure').length
       
       // 计算平均处理时长（从任务提交到任务完成）
       let avgDuration = 0
       let durationCount = 0
       
       // 获取所有任务提交记录和对应的完成记录
+      const taskCompleteLogs = todayLogs.filter(log => log.command.includes('-任务完成'))
       const submitLogs = todayLogs.filter(log => log.command === commandPrefix && log.status === 'success')
       
       for (const submitLog of submitLogs) {
@@ -1355,17 +1355,17 @@ export function apply(ctx: Context, config: Config) {
         avgDuration = avgDuration / durationCount
       }
       
-      // 计算成功率
-      const successRate = totalCompleted > 0 ? Math.round((successCount / totalCompleted) * 100) : 0
+      // 计算成功率（成功数 / 总数）
+      const successRate = totalCount > 0 ? ((successCount / totalCount) * 100).toFixed(1) : '0.0'
       
       // 构建统计信息字符串
       let statsStr = ''
       if (avgDuration > 0) {
         statsStr += `平均处理用时 ${avgDuration.toFixed(1)} s`
       }
-      if (totalCompleted > 0) {
+      if (totalCount > 0) {
         if (statsStr) statsStr += '，'
-        statsStr += `成功率 ${successRate}% (${successCount}/${totalCompleted})`
+        statsStr += `成功率 ${successRate}% (${successCount}/${totalCount})`
       }
       
       return statsStr
