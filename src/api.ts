@@ -3,12 +3,18 @@ import axios, { AxiosInstance } from 'axios'
 export interface ApiConfig {
   baseURL: string
   timeout?: number
+  retryCount?: number
+  retryDelay?: number
 }
 
 export class MaiBotAPI {
   private client: AxiosInstance
+  private retryCount: number
+  private retryDelay: number
 
   constructor(config: ApiConfig) {
+    this.retryCount = config.retryCount ?? 5
+    this.retryDelay = config.retryDelay ?? 1000
     this.client = axios.create({
       baseURL: config.baseURL || 'http://localhost:5566',
       timeout: config.timeout || 30000,
@@ -16,6 +22,35 @@ export class MaiBotAPI {
         'Content-Type': 'application/json',
       },
     })
+    this.setupRetry()
+  }
+
+  private setupRetry(): void {
+    this.client.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const originalConfig = error?.config as (typeof error.config & {
+          __retryCount?: number
+        })
+        if (!originalConfig) {
+          return Promise.reject(error)
+        }
+
+        const shouldRetry =
+          error?.code === 'ECONNRESET' || error?.response?.status === 504
+
+        const currentRetry = originalConfig.__retryCount ?? 0
+        if (!shouldRetry || currentRetry >= this.retryCount) {
+          return Promise.reject(error)
+        }
+
+        originalConfig.__retryCount = currentRetry + 1
+        if (this.retryDelay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.retryDelay))
+        }
+        return this.client.request(originalConfig)
+      }
+    )
   }
 
   /**

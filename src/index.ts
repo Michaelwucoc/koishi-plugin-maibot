@@ -16,6 +16,8 @@ export interface MachineInfo {
 export interface Config {
   apiBaseURL: string
   apiTimeout?: number
+  apiRetryCount?: number
+  apiRetryDelay?: number
   machineInfo: MachineInfo
   turnstileToken: string
   maintenanceNotice?: {
@@ -64,6 +66,8 @@ export interface Config {
 export const Config: Schema<Config> = Schema.object({
   apiBaseURL: Schema.string().default('http://localhost:5566').description('API服务地址'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
+  apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
+  apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
   machineInfo: Schema.object({
     clientId: Schema.string().required().description('客户端ID'),
     regionId: Schema.number().required().description('区域ID'),
@@ -1269,6 +1273,8 @@ export function apply(ctx: Context, config: Config) {
   const api = new MaiBotAPI({
     baseURL: config.apiBaseURL,
     timeout: config.apiTimeout,
+    retryCount: config.apiRetryCount,
+    retryDelay: config.apiRetryDelay,
   })
   const logger = ctx.logger('maibot')
 
@@ -1285,39 +1291,62 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 获取上传任务的统计信息（平均处理时长和今日成功率）
    * @param commandPrefix 命令前缀，用于筛选日志（如 'mai上传B50' 或 'mai上传落雪b50'）
+   * @param showDetails 是否显示详细数量（用于管理员统计）
    * @returns 统计信息字符串
    */
-  async function getUploadStats(commandPrefix: string): Promise<string> {
+  async function getUploadStats(commandPrefix: string, showDetails: boolean = false): Promise<string> {
     try {
       const today = new Date()
       today.setHours(0, 0, 0, 0)
       const todayStart = today.getTime()
 
-      // 获取今日所有相关操作记录
+      // 命令名称映射（与管理员统计保持一致）
+      const commandMapping: Record<string, string> = {
+        'mai上传B50-任务完成': 'mai上传B50',
+        'mai上传B50-任务超时': 'mai上传B50',
+        'mai上传B50-轮询异常': 'mai上传B50',
+        'mai上传落雪b50-任务完成': 'mai上传落雪b50',
+        'mai上传落雪b50-任务超时': 'mai上传落雪b50',
+        'mai上传落雪b50-轮询异常': 'mai上传落雪b50',
+      }
+
+      // 获取今日所有相关操作记录（使用映射后的命令名称）
       const allLogs = await ctx.database.get('maibot_operation_logs', {})
       const todayLogs = allLogs.filter(log => {
         const logTime = new Date(log.createdAt).getTime()
-        return logTime >= todayStart && log.command.startsWith(commandPrefix)
+        if (logTime < todayStart) return false
+        // 使用映射后的命令名称进行匹配
+        const mappedCommand = commandMapping[log.command] || log.command
+        return mappedCommand === commandPrefix
       })
 
       if (todayLogs.length === 0) {
         return ''
       }
 
-      // 统计成功率 - 基于所有相关日志（与管理员统计保持一致）
-      const totalCount = todayLogs.length
-      const successCount = todayLogs.filter(log => log.status === 'success').length
-      const failureCount = todayLogs.filter(log => log.status === 'failure').length
+      // 获取所有任务提交记录（包括成功和失败的提交）
+      const allSubmitLogs = todayLogs.filter(log => log.command === commandPrefix)
       
-      // 计算平均处理时长（从任务提交到任务完成）
+      // 获取所有任务完成记录（成功完成、超时、轮询异常）
+      const allCompleteLogs = todayLogs.filter(log => 
+        log.command.includes('-任务完成') || 
+        log.command.includes('-任务超时') || 
+        log.command.includes('-轮询异常')
+      )
+      
+      // 获取所有成功的任务完成记录
+      const successCompleteLogs = todayLogs.filter(log => 
+        log.command.includes('-任务完成') && log.status === 'success'
+      )
+      
+      // 计算平均处理时长（只统计成功完成的任务，排除错误请求）
       let avgDuration = 0
       let durationCount = 0
       
-      // 获取所有任务提交记录和对应的完成记录
-      const taskCompleteLogs = todayLogs.filter(log => log.command.includes('-任务完成'))
-      const submitLogs = todayLogs.filter(log => log.command === commandPrefix && log.status === 'success')
+      // 获取所有成功的任务提交记录（用于计算处理时长）
+      const successSubmitLogs = allSubmitLogs.filter(log => log.status === 'success')
       
-      for (const submitLog of submitLogs) {
+      for (const submitLog of successSubmitLogs) {
         // 尝试从 apiResponse 中获取 task_id
         if (!submitLog.apiResponse) continue
         try {
@@ -1325,8 +1354,8 @@ export function apply(ctx: Context, config: Config) {
           const taskId = response.task_id
           if (!taskId) continue
           
-          // 查找对应的完成记录
-          const completeLog = taskCompleteLogs.find(log => {
+          // 查找对应的成功完成记录
+          const completeLog = successCompleteLogs.find(log => {
             if (!log.apiResponse) return false
             try {
               const completeResponse = JSON.parse(log.apiResponse)
@@ -1340,7 +1369,9 @@ export function apply(ctx: Context, config: Config) {
             const submitTime = new Date(submitLog.createdAt).getTime()
             const completeTime = new Date(completeLog.createdAt).getTime()
             const duration = (completeTime - submitTime) / 1000 // 转换为秒
-            if (duration > 0 && duration < 600) { // 排除异常数据（超过10分钟的）
+            const pollTimeout = config.b50PollTimeout ?? 600000
+            const maxDuration = pollTimeout / 1000  // 使用配置的超时时间作为最大值
+            if (duration > 0 && duration < maxDuration) {
               avgDuration += duration
               durationCount++
             }
@@ -1355,17 +1386,30 @@ export function apply(ctx: Context, config: Config) {
         avgDuration = avgDuration / durationCount
       }
       
-      // 计算成功率（成功数 / 总数）
+      // 统计成功率 - 基于已完成的任务（有完成记录的任务）
+      // 总数 = 有完成记录的任务数（成功完成 + 超时 + 轮询异常）
+      // 成功数 = 成功完成的任务数
+      const totalCount = allCompleteLogs.length
+      const successCount = successCompleteLogs.length
+      
+      // 计算成功率（成功完成数 / 已完成总数）
       const successRate = totalCount > 0 ? ((successCount / totalCount) * 100).toFixed(1) : '0.0'
       
       // 构建统计信息字符串
       let statsStr = ''
-      if (avgDuration > 0) {
+      // 只有当有成功完成的任务配对时才显示平均处理用时
+      if (durationCount > 0 && avgDuration > 0) {
         statsStr += `平均处理用时 ${avgDuration.toFixed(1)} s`
       }
       if (totalCount > 0) {
         if (statsStr) statsStr += '，'
-        statsStr += `成功率 ${successRate}% (${successCount}/${totalCount})`
+        // 统一使用 "成功率 xx.x%" 格式（与管理员统计一致）
+        // showDetails 控制是否显示详细数量 (xx/xx)
+        if (showDetails) {
+          statsStr += `成功率 ${successRate}% (${successCount}/${totalCount})`
+        } else {
+          statsStr += `成功率 ${successRate}%`
+        }
       }
       
       return statsStr
@@ -1736,14 +1780,14 @@ export function apply(ctx: Context, config: Config) {
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
           
-          // 记录任务完成/失败的操作日志
+          // 记录任务完成/失败的操作日志（添加 alive_task_id 用于统计匹配）
           const taskRefId = await logOperation({
             command: 'mai上传B50-任务完成',
             session,
             status: hasError ? 'failure' : 'success',
             result: `${statusText}${finishTime}`,
             errorMessage: hasError ? detail.error || '未知错误' : undefined,
-            apiResponse: detail,
+            apiResponse: { ...detail, alive_task_id: taskId },
           })
           
           const finalMessage = `${mention} 水鱼B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
@@ -1849,14 +1893,14 @@ export function apply(ctx: Context, config: Config) {
             ? `\n完成时间: ${new Date((typeof detail.alive_task_end_time === 'number' ? detail.alive_task_end_time : parseInt(String(detail.alive_task_end_time))) * 1000).toLocaleString('zh-CN')}`
             : ''
           
-          // 记录任务完成/失败的操作日志
+          // 记录任务完成/失败的操作日志（添加 alive_task_id 用于统计匹配）
           const taskRefId = await logOperation({
             command: 'mai上传落雪b50-任务完成',
             session,
             status: hasError ? 'failure' : 'success',
             result: `${statusText}${finishTime}`,
             errorMessage: hasError ? detail.error || '未知错误' : undefined,
-            apiResponse: detail,
+            apiResponse: { ...detail, alive_task_id: taskId },
           })
           
           const finalMessage = `${mention} 落雪B50任务 ${taskId} 状态更新\n${statusText}${finishTime}`
@@ -5910,11 +5954,11 @@ export function apply(ctx: Context, config: Config) {
         // 按执行次数排序
         const sortedCommands = Object.entries(commandStats).sort((a, b) => b[1].total - a[1].total)
 
-        // 获取B50平均处理时长统计
+        // 获取B50平均处理时长统计（管理员统计显示详细数量）
         const pollInterval = config.b50PollInterval ?? 2000
         const pollTimeout = config.b50PollTimeout ?? 600000
-        const fishStats = await getUploadStats('mai上传B50')
-        const lxStats = await getUploadStats('mai上传落雪b50')
+        const fishStats = await getUploadStats('mai上传B50', true)
+        const lxStats = await getUploadStats('mai上传落雪b50', true)
 
         let result = `📊 今日命令执行统计\n\n`
         result += `统计时间: ${new Date().toLocaleString('zh-CN')}\n`
