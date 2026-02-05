@@ -1,5 +1,7 @@
 # koishi-plugin-maibot
 
+# Due to personal issue, the project will temporarily stop maintaining. We may unarchive it further.
+
 舞萌DX游戏高级操作插件 for Koishi
 
 ## 功能特性
