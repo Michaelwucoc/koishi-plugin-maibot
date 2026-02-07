@@ -144,8 +144,10 @@ export class MaiBotAPI {
    * 根据任务 ID 查询水鱼 B50 任务
    * GET /api/public/get_b50_task_byid
    * 需要: task_id
+   * @param taskId 任务ID
+   * @param timeout 可选的请求超时时间（毫秒）
    */
-  async getB50TaskById(taskId: string): Promise<{
+  async getB50TaskById(taskId: string, timeout?: number): Promise<{
     code: number
     alive_task_id: string | number
     alive_task_time: number
@@ -156,6 +158,7 @@ export class MaiBotAPI {
   }> {
     const response = await this.client.get('/api/public/get_b50_task_byid', {
       params: { task_id: taskId },
+      ...(timeout ? { timeout } : {}),
     })
     return response.data
   }
@@ -213,8 +216,10 @@ export class MaiBotAPI {
    * 根据任务 ID 查询落雪 B50 任务
    * GET /api/public/get_lx_b50_task_byid
    * 需要: task_id
+   * @param taskId 任务ID
+   * @param timeout 可选的请求超时时间（毫秒）
    */
-  async getLxB50TaskById(taskId: string): Promise<{
+  async getLxB50TaskById(taskId: string, timeout?: number): Promise<{
     code: number
     alive_task_id: string | number
     alive_task_time: number
@@ -225,6 +230,7 @@ export class MaiBotAPI {
   }> {
     const response = await this.client.get('/api/public/get_lx_b50_task_byid', {
       params: { task_id: taskId },
+      ...(timeout ? { timeout } : {}),
     })
     return response.data
   }
@@ -410,6 +416,41 @@ export class MaiBotAPI {
     return response.data
   }
 
+  /**
+   * 修改账号游戏版本号
+   * POST /api/private/edit_ver
+   * 需要: region_id, region_name, client_id, place_id, place_name, rom_ver, data_ver, qr_text
+   */
+  async editVer(
+    regionId: number,
+    regionName: string,
+    clientId: string,
+    placeId: number,
+    placeName: string,
+    romVer: string,
+    dataVer: string,
+    qrText: string
+  ): Promise<{
+    QrStatus: boolean
+    LoginStatus: boolean
+    LogoutStatus: boolean
+    UserAllStatus: boolean
+  }> {
+    const response = await this.client.post('/api/private/edit_ver', null, {
+      params: {
+        region_id: regionId,
+        region_name: regionName,
+        client_id: clientId,
+        place_id: placeId,
+        place_name: placeName,
+        rom_ver: romVer,
+        data_ver: dataVer,
+        qr_text: qrText,
+      },
+    })
+    return response.data
+  }
+
   // ========== 以下为旧API，已不再支持，保留用于兼容性 ==========
 
   /**
@@ -455,9 +496,6 @@ export class MaiBotAPI {
 
   // 获取1.5倍票 - 新API未提供
   async get15Ticket(...) { ... }
-
-  // 发收藏品 - 新API未提供
-  async getItem(...) { ... }
 
   // 清收藏品 - 新API未提供
   async clearItem(...) { ... }
