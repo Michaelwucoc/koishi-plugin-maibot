@@ -62,6 +62,7 @@ export interface Config {
   b50PollInterval?: number  // B50任务轮询间隔（毫秒），默认2000毫秒
   b50PollTimeout?: number  // B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）
   b50PollRequestTimeout?: number  // B50轮询单次请求超时时间（毫秒），默认10000毫秒（10秒）
+  autoRecallProcessingMessages?: boolean  // B50任务完成后自动撤回"正在处理"和"已提交"消息
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -138,6 +139,7 @@ export const Config: Schema<Config> = Schema.object({
   b50PollInterval: Schema.number().default(2000).description('B50任务轮询间隔（毫秒），默认2000毫秒'),
   b50PollTimeout: Schema.number().default(600000).description('B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）'),
   b50PollRequestTimeout: Schema.number().default(10000).description('B50轮询单次请求超时时间（毫秒），默认10000毫秒（10秒），超时后会重试'),
+  autoRecallProcessingMessages: Schema.boolean().default(true).description('B50任务完成后自动撤回"正在处理"和"已提交"消息'),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -970,7 +972,7 @@ async function getQrText(
   
   // 缓存过期或没有缓存，直接问
   const actualTimeout = timeout
-  const message = promptMessage || `请发送 SGID 或二维码链接（${actualTimeout / 1000}秒内）`
+  const message = promptMessage || `请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
   
   try {
     await session.send(message)
@@ -1462,6 +1464,26 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
+   * 发送消息并返回消息ID（用于后续撤回）
+   * @param session 会话
+   * @param content 消息内容
+   * @returns 消息ID数组
+   */
+  async function sendAndGetMessageIds(session: Session, content: string): Promise<string[]> {
+    try {
+      const result = await session.send(content)
+      // session.send 返回消息ID数组
+      if (Array.isArray(result)) {
+        return result.filter(id => id && typeof id === 'string')
+      }
+      return []
+    } catch (err) {
+      logger.debug(`发送消息失败: ${err}`)
+      return []
+    }
+  }
+
+  /**
    * 获取错误帮助信息（如果配置了帮助URL）
    */
   function getErrorHelpInfo(): string {
@@ -1531,17 +1553,20 @@ export function apply(ctx: Context, config: Config) {
   /**
    * 在API调用前加入队列并等待
    * 这个函数应该在获取到SGID后、调用API前使用
+   * @returns 返回发送的消息ID数组（用于后续撤回）
    */
-  async function waitForQueue(session: Session): Promise<void> {
+  async function waitForQueue(session: Session): Promise<string[]> {
+    const sentMessageIds: string[] = []
+    
     if (!requestQueue) {
-      // 队列未启用，直接返回
-      return
+      // 队列未启用，直接返回空数组
+      return sentMessageIds
     }
 
     // 检查必要的 session 属性
     if (!session.userId || !session.channelId) {
       logger.warn('无法加入队列：缺少 userId 或 channelId')
-      return
+      return sentMessageIds
     }
 
     // 先获取当前队列位置（不等待）
@@ -1563,14 +1588,16 @@ export function apply(ctx: Context, config: Config) {
         .replace(/{queueEST}/g, String(estimatedWait))
       // 立即发送队列提示消息（等待发送完成，确保消息及时送达）
       try {
-        await session.send(queueMessage)
+        const msgIds = await sendAndGetMessageIds(session, queueMessage)
+        sentMessageIds.push(...msgIds)
       } catch (err) {
         logger.warn('发送队列提示消息失败:', err)
       }
     } else {
       // 不需要排队：发送"正在处理"的消息
       try {
-        await session.send('⏳ 正在处理您的请求，请稍候...')
+        const msgIds = await sendAndGetMessageIds(session, '⏳ 正在处理您的请求，请稍候...')
+        sentMessageIds.push(...msgIds)
       } catch (err) {
         logger.warn('发送处理中消息失败:', err)
       }
@@ -1583,6 +1610,8 @@ export function apply(ctx: Context, config: Config) {
     } catch (error: any) {
       logger.warn(`加入队列失败: ${error?.message || '未知错误'}`)
     }
+    
+    return sentMessageIds
   }
 
   // 自动撤回仅在交互式输入或命令参数触发
@@ -1784,7 +1813,7 @@ export function apply(ctx: Context, config: Config) {
     return { binding: bindings[0], isProxy: true, error: null }
   }
 
-  const scheduleB50Notification = (session: Session, taskId: string, initialRefId?: string) => {
+  const scheduleB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -1800,8 +1829,22 @@ export function apply(ctx: Context, config: Config) {
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
+    const autoRecallProcessing = config.autoRecallProcessingMessages ?? true
     
     logger.debug(`水鱼B50轮询配置: interval=${pollInterval}ms, timeout=${pollTimeout}ms, maxAttempts=${maxAttempts}`)
+
+    // 撤回处理中消息的辅助函数
+    const recallProcessingMessages = async () => {
+      if (!autoRecallProcessing || !messagesToRecall || messagesToRecall.length === 0) return
+      for (const msgId of messagesToRecall) {
+        try {
+          await bot.deleteMessage(channelId, msgId)
+          logger.debug(`已撤回处理中消息: ${msgId}`)
+        } catch (err) {
+          logger.debug(`撤回消息失败 ${msgId}: ${err}`)
+        }
+      }
+    }
 
     const poll = async () => {
       attempts += 1
@@ -1814,7 +1857,10 @@ export function apply(ctx: Context, config: Config) {
         const isDone = detail.done === true
         
         if (isDone || hasError) {
-          // 任务完成或出错，发送通知并停止
+          // 任务完成或出错，撤回处理中消息
+          await recallProcessingMessages()
+          
+          // 发送通知并停止
           const statusText = hasError
             ? `❌ 任务失败：${detail.error}${getErrorHelpInfo()}`
             : '✅ 任务已完成'
@@ -1847,7 +1893,9 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
-        // 超时情况
+        // 超时情况，撤回处理中消息
+        await recallProcessingMessages()
+        
         const timeoutRefId = await logOperation({
           command: 'mai上传B50-任务超时',
           session,
@@ -1872,7 +1920,9 @@ export function apply(ctx: Context, config: Config) {
           return
         }
         
-        // 轮询异常情况
+        // 轮询异常情况，撤回处理中消息
+        await recallProcessingMessages()
+        
         const errorRefId = await logOperation({
           command: 'mai上传B50-轮询异常',
           session,
@@ -1893,11 +1943,11 @@ export function apply(ctx: Context, config: Config) {
       }
     }
 
-    // 首次延迟3秒后开始检查，之后每5秒轮询一次
+    // 首次延迟后开始检查
     ctx.setTimeout(poll, initialDelay)
   }
 
-  const scheduleLxB50Notification = (session: Session, taskId: string, initialRefId?: string) => {
+  const scheduleLxB50Notification = (session: Session, taskId: string, initialRefId?: string, messagesToRecall?: string[]) => {
     const bot = session.bot
     const channelId = session.channelId
     if (!bot || !channelId) {
@@ -1913,8 +1963,22 @@ export function apply(ctx: Context, config: Config) {
     const interval = pollInterval
     const initialDelay = pollInterval  // 首次延迟与轮询间隔相同
     let attempts = 0
+    const autoRecallProcessing = config.autoRecallProcessingMessages ?? true
     
     logger.debug(`落雪B50轮询配置: interval=${pollInterval}ms, timeout=${pollTimeout}ms, maxAttempts=${maxAttempts}`)
+
+    // 撤回处理中消息的辅助函数
+    const recallProcessingMessages = async () => {
+      if (!autoRecallProcessing || !messagesToRecall || messagesToRecall.length === 0) return
+      for (const msgId of messagesToRecall) {
+        try {
+          await bot.deleteMessage(channelId, msgId)
+          logger.debug(`已撤回处理中消息: ${msgId}`)
+        } catch (err) {
+          logger.debug(`撤回消息失败 ${msgId}: ${err}`)
+        }
+      }
+    }
 
     const poll = async () => {
       attempts += 1
@@ -1927,7 +1991,10 @@ export function apply(ctx: Context, config: Config) {
         const isDone = detail.done === true
         
         if (isDone || hasError) {
-          // 任务完成或出错，发送通知并停止
+          // 任务完成或出错，撤回处理中消息
+          await recallProcessingMessages()
+          
+          // 发送通知并停止
           const statusText = hasError
             ? `❌ 任务失败：${detail.error}${getErrorHelpInfo()}`
             : '✅ 任务已完成'
@@ -1960,7 +2027,9 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
-        // 超时情况
+        // 超时情况，撤回处理中消息
+        await recallProcessingMessages()
+        
         const timeoutRefId = await logOperation({
           command: 'mai上传落雪b50-任务超时',
           session,
@@ -1985,7 +2054,9 @@ export function apply(ctx: Context, config: Config) {
           return
         }
         
-        // 轮询异常情况
+        // 轮询异常情况，撤回处理中消息
+        await recallProcessingMessages()
+        
         const errorRefId = await logOperation({
           command: 'mai上传落雪b50-轮询异常',
           session,
@@ -2006,7 +2077,7 @@ export function apply(ctx: Context, config: Config) {
       }
     }
 
-    // 首次延迟2秒后开始检查，之后每1秒轮询一次
+    // 首次延迟后开始检查
     ctx.setTimeout(poll, initialDelay)
   }
 
@@ -3620,7 +3691,7 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const queueMsgIds = await waitForQueue(session)
             // 使用新的qrText继续
             const result = await api.uploadB50(
               machineInfo.regionId,
@@ -3647,14 +3718,17 @@ export function apply(ctx: Context, config: Config) {
               result: successMessage,
               apiResponse: result,
             })
-            scheduleB50Notification(session, result.task_id, refId)
-            return appendRefId(successMessage, refId)
+            const msgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
+            scheduleB50Notification(session, result.task_id, refId, [...queueMsgIds, ...msgIds])
+            return ''
           }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
-        // 在调用API前加入队列
-        await waitForQueue(session)
+        // 在调用API前加入队列，并收集发送的消息ID（用于后续撤回）
+        const processingMsgIds: string[] = []
+        const queueMsgIds = await waitForQueue(session)
+        processingMsgIds.push(...queueMsgIds)
 
         // 上传B50（使用新API，需要qr_text）
         let result
@@ -3676,7 +3750,8 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const retryQueueMsgIds = await waitForQueue(session)
+            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -3694,7 +3769,8 @@ export function apply(ctx: Context, config: Config) {
                 return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
               }
               // 在调用API前加入队列
-              await waitForQueue(session)
+              const retryQueueMsgIds = await waitForQueue(session)
+              processingMsgIds.push(...retryQueueMsgIds)
               result = await api.uploadB50(
                 machineInfo.regionId,
                 machineInfo.clientId,
@@ -3718,7 +3794,8 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const retryQueueMsgIds = await waitForQueue(session)
+            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -3763,9 +3840,13 @@ export function apply(ctx: Context, config: Config) {
           apiResponse: result,
         })
         
-        scheduleB50Notification(session, result.task_id, refId)
+        // 发送成功消息并获取消息ID（用于后续撤回）
+        const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
+        // 合并处理中消息ID和成功消息ID
+        const allMessageIds = [...processingMsgIds, ...successMsgIds]
+        scheduleB50Notification(session, result.task_id, refId, allMessageIds)
 
-        return appendRefId(successMessage, refId)
+        return ''  // 消息已发送，返回空字符串避免重复发送
       } catch (error: any) {
         ctx.logger('maibot').error('上传B50失败:', error)
         if (maintenanceMode) {
@@ -5031,7 +5112,7 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const queueMsgIds = await waitForQueue(session)
             // 使用新的qrText继续
             const result = await api.uploadLxB50(
               machineInfo.regionId,
@@ -5058,14 +5139,17 @@ export function apply(ctx: Context, config: Config) {
               result: successMessage,
               apiResponse: result,
             })
-            scheduleLxB50Notification(session, result.task_id, refId)
-            return appendRefId(successMessage, refId)
+            const msgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
+            scheduleLxB50Notification(session, result.task_id, refId, [...queueMsgIds, ...msgIds])
+            return ''
           }
           return `❌ 获取二维码失败：${qrTextResult.error}${getErrorHelpInfo()}`
         }
 
-        // 在调用API前加入队列
-        await waitForQueue(session)
+        // 在调用API前加入队列，并收集发送的消息ID（用于后续撤回）
+        const processingMsgIds: string[] = []
+        const queueMsgIds = await waitForQueue(session)
+        processingMsgIds.push(...queueMsgIds)
 
         // 上传落雪B50（使用新API，需要qr_text）
         let result
@@ -5087,7 +5171,8 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const retryQueueMsgIds = await waitForQueue(session)
+            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -5105,7 +5190,8 @@ export function apply(ctx: Context, config: Config) {
                 return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
               }
               // 在调用API前加入队列
-              await waitForQueue(session)
+              const retryQueueMsgIds = await waitForQueue(session)
+              processingMsgIds.push(...retryQueueMsgIds)
               result = await api.uploadLxB50(
                 machineInfo.regionId,
                 machineInfo.clientId,
@@ -5129,7 +5215,8 @@ export function apply(ctx: Context, config: Config) {
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
             // 在调用API前加入队列
-            await waitForQueue(session)
+            const retryQueueMsgIds = await waitForQueue(session)
+            processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
               machineInfo.regionId,
               machineInfo.clientId,
@@ -5174,9 +5261,13 @@ export function apply(ctx: Context, config: Config) {
           apiResponse: result,
         })
         
-        scheduleLxB50Notification(session, result.task_id, refId)
+        // 发送成功消息并获取消息ID（用于后续撤回）
+        const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
+        // 合并处理中消息ID和成功消息ID
+        const allMessageIds = [...processingMsgIds, ...successMsgIds]
+        scheduleLxB50Notification(session, result.task_id, refId, allMessageIds)
 
-        return appendRefId(successMessage, refId)
+        return ''  // 消息已发送，返回空字符串避免重复发送
       } catch (error: any) {
         ctx.logger('maibot').error('上传落雪B50失败:', error)
         const errorMessage = maintenanceMode 
