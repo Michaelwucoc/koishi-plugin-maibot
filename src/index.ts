@@ -854,14 +854,39 @@ function checkWhitelist(session: Session | null, config: Config): { allowed: boo
     return { allowed: true }
   }
 
-  // 检查群ID是否在白名单中
-  const guildId = String(session.guildId)
-  const platformGuild = `${session.platform}:${guildId}`
+  // 检查群ID/频道ID是否在白名单中（兼容不同平台字段）
+  const platform = String(session.platform || '').trim().toLowerCase()
+  const guildId = String(session.guildId || '').trim()
+  const channelId = String(session.channelId || '').trim()
   const whitelistTargets = [
     ...(whitelistConfig.guildIds || []),
     ...(whitelistConfig.targets || []),
   ]
-  if (whitelistTargets.includes(guildId) || whitelistTargets.includes(platformGuild)) {
+    .map(item => String(item || '').trim())
+    .filter(Boolean)
+
+  const whitelistSet = new Set(whitelistTargets)
+  const candidates = new Set<string>()
+  if (guildId) {
+    candidates.add(guildId)
+    if (platform) candidates.add(`${platform}:${guildId}`)
+  }
+  if (channelId) {
+    candidates.add(channelId)
+    if (platform) candidates.add(`${platform}:${channelId}`)
+  }
+
+  for (const candidate of candidates) {
+    if (whitelistSet.has(candidate)) {
+      return { allowed: true }
+    }
+  }
+
+  // 历史兼容：支持无前缀但与 guild/channel 任一匹配
+  if (guildId && whitelistSet.has(guildId)) {
+    return { allowed: true }
+  }
+  if (channelId && whitelistSet.has(channelId)) {
     return { allowed: true }
   }
 
