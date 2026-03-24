@@ -872,7 +872,51 @@ function checkWhitelist(session: Session | null, config: Config): { allowed: boo
   }
 }
 
-async function getSessionBindingKeys(session: Session): Promise<string[]> {
+async function getBindRelatedLegacyUserIds(ctx: Context, session: Session): Promise<string[]> {
+  const relatedUserIds: string[] = []
+  const platform = session.platform ? String(session.platform) : ''
+  const rawUserId = session.userId ? String(session.userId) : ''
+  if (!platform || !rawUserId) return relatedUserIds
+
+  const db = ctx.database as any
+  if (!db || typeof db.get !== 'function') return relatedUserIds
+
+  try {
+    // 尝试从 bind 插件的 binding 表中反查同一账号下的其他平台ID
+    const pidCandidates = [`${platform}:${rawUserId}`, rawUserId]
+    let currentBindings: any[] = []
+    for (const pid of pidCandidates) {
+      const rows = await db.get('binding', { pid })
+      if (rows?.length) {
+        currentBindings = rows
+        break
+      }
+    }
+    if (!currentBindings.length) return relatedUserIds
+
+    const aid = currentBindings[0]?.aid
+    if (aid === undefined || aid === null) return relatedUserIds
+
+    const allBindings = await db.get('binding', { aid })
+    for (const item of allBindings || []) {
+      const pid = item?.pid
+      if (typeof pid === 'string' && pid.length > 0) {
+        // 常见格式: "platform:userId"
+        const idx = pid.indexOf(':')
+        const extracted = idx >= 0 ? pid.slice(idx + 1) : pid
+        if (extracted && !relatedUserIds.includes(extracted)) {
+          relatedUserIds.push(extracted)
+        }
+      }
+    }
+  } catch {
+    // binding 表不存在或结构不一致时忽略，保持插件可用
+  }
+
+  return relatedUserIds
+}
+
+async function getSessionBindingKeys(ctx: Context, session: Session): Promise<string[]> {
   const keys: string[] = []
   const rawUserId = session.userId ? String(session.userId) : ''
   if (rawUserId) {
@@ -893,11 +937,19 @@ async function getSessionBindingKeys(session: Session): Promise<string[]> {
     // 忽略异常，保持向后兼容（仅用平台原始 userId）
   }
 
+  // 兼容历史数据：若是 QQ 老绑定（仅存 raw userId），在新平台通过 bind 关系反查
+  const legacyIds = await getBindRelatedLegacyUserIds(ctx, session)
+  for (const id of legacyIds) {
+    if (!keys.includes(id)) {
+      keys.push(id)
+    }
+  }
+
   return keys
 }
 
 async function getBindingBySession(ctx: Context, session: Session): Promise<UserBinding | null> {
-  const keys = await getSessionBindingKeys(session)
+  const keys = await getSessionBindingKeys(ctx, session)
   for (const key of keys) {
     const bindings = await ctx.database.get('maibot_bindings', { userId: key })
     if (bindings.length > 0) return bindings[0]
@@ -906,7 +958,7 @@ async function getBindingBySession(ctx: Context, session: Session): Promise<User
 }
 
 async function updateBindingBySession(ctx: Context, session: Session, data: Partial<UserBinding>): Promise<boolean> {
-  const keys = await getSessionBindingKeys(session)
+  const keys = await getSessionBindingKeys(ctx, session)
   for (const key of keys) {
     const bindings = await ctx.database.get('maibot_bindings', { userId: key })
     if (bindings.length > 0) {
@@ -918,7 +970,7 @@ async function updateBindingBySession(ctx: Context, session: Session, data: Part
 }
 
 async function removeBindingBySession(ctx: Context, session: Session): Promise<boolean> {
-  const keys = await getSessionBindingKeys(session)
+  const keys = await getSessionBindingKeys(ctx, session)
   for (const key of keys) {
     const bindings = await ctx.database.get('maibot_bindings', { userId: key })
     if (bindings.length > 0) {
@@ -2417,7 +2469,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 使用队列系统
-      const userBindingKeys = await getSessionBindingKeys(session)
+      const userBindingKeys = await getSessionBindingKeys(ctx, session)
       const userId = userBindingKeys[0] || String(session.userId)
 
       try {
