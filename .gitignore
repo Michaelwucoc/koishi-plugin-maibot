@@ -41,3 +41,5 @@ logs/
 
 # Sensitive file
 src/constants.ts
+
+.DS_Store
