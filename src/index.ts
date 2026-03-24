@@ -1031,13 +1031,35 @@ async function tryRecallMessage(
       return
     }
 
-    // 尝试使用bot的deleteMessage方法
-    if (session.bot && typeof session.bot.deleteMessage === 'function') {
-      await session.bot.deleteMessage(session.channelId, targetMessageId)
-      logger.info(`已撤回用户 ${session.userId} 的消息: ${targetMessageId}`)
-    } else {
+    // KOOK 对“刚发送就撤回”更敏感，增加短暂延迟和重试
+    const platform = String(session.platform || '').toLowerCase()
+    const retryCount = platform === 'kook' ? 3 : 1
+    const delayMs = platform === 'kook' ? 500 : 0
+
+    if (!(session.bot && typeof session.bot.deleteMessage === 'function')) {
       logger.debug('当前适配器不支持撤回消息功能')
+      return
     }
+
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
+
+    let lastError: any
+    for (let i = 0; i < retryCount; i++) {
+      try {
+        await session.bot.deleteMessage(session.channelId, targetMessageId)
+        logger.info(`已撤回用户 ${session.userId} 的消息: ${targetMessageId}`)
+        return
+      } catch (error) {
+        lastError = error
+        // KOOK 可能出现瞬时删除失败，短暂等待后重试
+        if (i < retryCount - 1) {
+          await new Promise(resolve => setTimeout(resolve, 350))
+        }
+      }
+    }
+    throw lastError
   } catch (error: any) {
     // 撤回失败时不抛出错误，只记录日志
     logger.debug(`尝试撤回消息失败（可能不支持该功能）: ${error?.message || '未知错误'}`)
@@ -1050,10 +1072,21 @@ async function tryRecallMessage(
 async function waitForUserReply(
   session: Session,
   ctx: Context,
-  timeout: number
+  timeout: number,
+  expectedQuoteMessageIds?: string[]
 ): Promise<Session | null> {
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout | undefined
+    const quoteIdSet = new Set((expectedQuoteMessageIds || []).filter(Boolean))
+    const platform = String(session.platform || '').toLowerCase()
+
+    const getQuotedMessageId = (replySession: any): string | null => {
+      const quote = replySession?.quote
+      if (!quote) return null
+      if (typeof quote === 'string') return quote
+      return quote.id || quote.messageId || null
+    }
+
     const stop = ctx.on('message', (replySession) => {
       if (!replySession.userId || !replySession.channelId) {
         return
@@ -1065,9 +1098,22 @@ async function waitForUserReply(
         if (replySession.guildId !== session.guildId) {
           return
         }
+        // KOOK 等多频道平台：同一 guild 下也必须同一 channel，避免串台
+        if (replySession.channelId !== session.channelId) {
+          return
+        }
       } else if (replySession.channelId !== session.channelId) {
         return
       }
+
+      // KOOK 优先支持“引用机器人提示消息”作为输入，减少误触发
+      if (platform === 'kook' && quoteIdSet.size > 0) {
+        const quotedId = getQuotedMessageId(replySession)
+        if (quotedId && !quoteIdSet.has(quotedId)) {
+          return
+        }
+      }
+
       if (timer) {
         clearTimeout(timer)
       }
@@ -1305,7 +1351,12 @@ async function promptForRebind(
   try {
     logger.info(`开始等待用户 ${session.userId} 重新绑定SGID，超时时间: ${actualTimeout}ms`)
     
-    const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+    const promptSession = await waitForUserReply(
+      session,
+      ctx,
+      actualTimeout,
+      promptMessageId ? [promptMessageId] : undefined,
+    )
     const promptText = promptSession?.content?.trim() || ''
     if (!promptText) {
       await session.send(`❌ 重新绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定二维码`)
@@ -2525,7 +2576,12 @@ export function apply(ctx: Context, config: Config) {
             logger.info(`开始等待用户 ${session.userId} 输入SGID，超时时间: ${actualTimeout}ms`)
             
             // 等待用户输入SGID文本（获取完整 Session 便于撤回）
-            const promptSession = await waitForUserReply(session, ctx, actualTimeout)
+            const promptSession = await waitForUserReply(
+              session,
+              ctx,
+              actualTimeout,
+              promptMessageId ? [promptMessageId] : undefined,
+            )
             const promptText = promptSession?.content?.trim() || ''
             if (!promptText) {
               throw new Error('超时未收到响应')
