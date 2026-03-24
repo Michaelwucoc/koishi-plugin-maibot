@@ -2,7 +2,7 @@ import { Context } from 'koishi'
 
 export interface UserBinding {
   id: number
-  userId: string  // QQ用户ID
+  userId: string  // 用户唯一键（优先 koishi:<id>，兼容旧平台原始ID）
   maiUid: string  // 加密后的用户ID
   qrCode: string  // 原始二维码（SGWCMAID...）
   bindTime: Date  // 绑定时间

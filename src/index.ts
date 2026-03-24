@@ -45,7 +45,8 @@ export interface Config {
   hideLockAndProtection?: boolean  // 隐藏锁定模式和保护模式功能
   whitelist?: {
     enabled: boolean  // 白名单开关
-    guildIds: string[]  // 允许使用的群ID列表
+    guildIds: string[]  // 允许使用的群ID列表（兼容旧配置）
+    targets?: string[]  // 允许使用的群列表，支持 "platform:guildId" 或仅 "guildId"
     message: string  // 非白名单群的提示消息
   }
   autoRecall?: boolean  // 仅在交互输入或命令参数时自动撤回敏感消息
@@ -111,11 +112,13 @@ export const Config: Schema<Config> = Schema.object({
   hideLockAndProtection: Schema.boolean().default(false).description('隐藏锁定模式和保护模式功能，开启后相关指令将不可用，状态信息也不会显示'),
   whitelist: Schema.object({
     enabled: Schema.boolean().default(false).description('白名单开关，开启后只有白名单内的群可以使用Bot功能'),
-    guildIds: Schema.array(Schema.string()).default(['1072033605']).description('允许使用Bot功能的群ID列表'),
+    guildIds: Schema.array(Schema.string()).default(['1072033605']).description('允许使用Bot功能的群ID列表（兼容旧配置）'),
+    targets: Schema.array(Schema.string()).role('table').default(['qq:1072033605']).description('允许使用Bot功能的群列表，支持 "platform:guildId"（如 qq:1072033605, discord:123456）或仅 "guildId"'),
     message: Schema.string().default('本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。').description('非白名单群的提示消息'),
   }).description('群白名单配置').default({
     enabled: false,
     guildIds: ['1072033605'],
+    targets: ['qq:1072033605'],
     message: '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。',
   }),
   autoRecall: Schema.boolean().default(true).description('仅在交互输入或命令参数时自动撤回敏感消息（尝试撤回，如不支持则忽略）'),
@@ -839,7 +842,7 @@ function checkWhitelist(session: Session | null, config: Config): { allowed: boo
     return { allowed: true }  // 私聊允许
   }
 
-  const whitelistConfig = config.whitelist || { enabled: false, guildIds: [], message: '' }
+  const whitelistConfig = config.whitelist || { enabled: false, guildIds: [], targets: [], message: '' }
   
   // 如果白名单未启用，允许所有群
   if (!whitelistConfig.enabled) {
@@ -853,7 +856,12 @@ function checkWhitelist(session: Session | null, config: Config): { allowed: boo
 
   // 检查群ID是否在白名单中
   const guildId = String(session.guildId)
-  if (whitelistConfig.guildIds.includes(guildId)) {
+  const platformGuild = `${session.platform}:${guildId}`
+  const whitelistTargets = [
+    ...(whitelistConfig.guildIds || []),
+    ...(whitelistConfig.targets || []),
+  ]
+  if (whitelistTargets.includes(guildId) || whitelistTargets.includes(platformGuild)) {
     return { allowed: true }
   }
 
@@ -862,6 +870,63 @@ function checkWhitelist(session: Session | null, config: Config): { allowed: boo
     allowed: false, 
     message: whitelistConfig.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。' 
   }
+}
+
+async function getSessionBindingKeys(session: Session): Promise<string[]> {
+  const keys: string[] = []
+  const rawUserId = session.userId ? String(session.userId) : ''
+  if (rawUserId) {
+    keys.push(rawUserId)
+  }
+
+  // bind 插件启用后，session.observeUser(['id']) 会返回统一用户ID（跨平台）
+  try {
+    const user = await session.observeUser(['id'])
+    const unifiedId = user?.id
+    if (unifiedId !== undefined && unifiedId !== null) {
+      const unifiedKey = `koishi:${String(unifiedId)}`
+      if (!keys.includes(unifiedKey)) {
+        keys.unshift(unifiedKey)
+      }
+    }
+  } catch {
+    // 忽略异常，保持向后兼容（仅用平台原始 userId）
+  }
+
+  return keys
+}
+
+async function getBindingBySession(ctx: Context, session: Session): Promise<UserBinding | null> {
+  const keys = await getSessionBindingKeys(session)
+  for (const key of keys) {
+    const bindings = await ctx.database.get('maibot_bindings', { userId: key })
+    if (bindings.length > 0) return bindings[0]
+  }
+  return null
+}
+
+async function updateBindingBySession(ctx: Context, session: Session, data: Partial<UserBinding>): Promise<boolean> {
+  const keys = await getSessionBindingKeys(session)
+  for (const key of keys) {
+    const bindings = await ctx.database.get('maibot_bindings', { userId: key })
+    if (bindings.length > 0) {
+      await ctx.database.set('maibot_bindings', { userId: key }, data)
+      return true
+    }
+  }
+  return false
+}
+
+async function removeBindingBySession(ctx: Context, session: Session): Promise<boolean> {
+  const keys = await getSessionBindingKeys(session)
+  for (const key of keys) {
+    const bindings = await ctx.database.get('maibot_bindings', { userId: key })
+    if (bindings.length > 0) {
+      await ctx.database.remove('maibot_bindings', { userId: key })
+      return true
+    }
+  }
+  return false
 }
 
 /**
@@ -1785,12 +1850,12 @@ export function apply(ctx: Context, config: Config) {
     // 如果没有提供目标用户，使用当前用户
     if (!targetUserIdRaw) {
       logger.debug(`getTargetBinding: 未提供目标用户，使用当前用户 ${currentUserId}`)
-      const bindings = await ctx.database.get('maibot_bindings', { userId: currentUserId })
-      logger.debug(`getTargetBinding: 当前用户绑定数量 = ${bindings.length}`)
-      if (bindings.length === 0) {
+      const binding = await getBindingBySession(ctx, session)
+      logger.debug(`getTargetBinding: 当前用户绑定状态 = ${binding ? 'found' : 'not found'}`)
+      if (!binding) {
         return { binding: null, isProxy: false, error: '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定' }
       }
-      return { binding: bindings[0], isProxy: false, error: null }
+      return { binding, isProxy: false, error: null }
     }
     
     // 如果提供了目标用户，需要检查权限
@@ -2352,13 +2417,14 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // 使用队列系统
-      const userId = session.userId
+      const userBindingKeys = await getSessionBindingKeys(session)
+      const userId = userBindingKeys[0] || String(session.userId)
 
       try {
         // 检查是否已绑定
-        const existing = await ctx.database.get('maibot_bindings', { userId })
-        if (existing.length > 0) {
-          return `❌ 您已经绑定了账号\n绑定时间: ${new Date(existing[0].bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
+        const existing = await getBindingBySession(ctx, session)
+        if (existing) {
+          return `❌ 您已经绑定了账号\n绑定时间: ${new Date(existing.bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
         }
 
         // 如果没有提供SGID，提示用户输入
@@ -2597,18 +2663,14 @@ export function apply(ctx: Context, config: Config) {
         return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
       }
 
-      const userId = session.userId
-
       try {
-        // 查找绑定记录
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
+        const binding = await getBindingBySession(ctx, session)
+        if (!binding) {
           return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
         }
 
-        // 删除绑定记录
-        await ctx.database.remove('maibot_bindings', { userId })
+        // 删除绑定记录（优先删除 bind 统一ID键，兼容旧键）
+        await removeBindingBySession(ctx, session)
 
         return `✅ 解绑成功！`
       } catch (error: any) {
@@ -5832,17 +5894,14 @@ export function apply(ctx: Context, config: Config) {
         return '❌ 无法获取会话信息'
       }
 
-      const userId = session.userId
+      const userId = String(session.userId)
 
       try {
         // 检查是否已绑定账号
-        const bindings = await ctx.database.get('maibot_bindings', { userId })
-        
-        if (bindings.length === 0) {
+        const binding = await getBindingBySession(ctx, session)
+        if (!binding) {
           return '❌ 请先绑定舞萌DX账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
         }
-
-        const binding = bindings[0]
         const currentState = binding.alertEnabled ?? false
 
         // 如果没有提供参数，显示当前状态
@@ -5874,7 +5933,7 @@ export function apply(ctx: Context, config: Config) {
           updateData.channelId = channelId
         }
         
-        await ctx.database.set('maibot_bindings', { userId }, updateData)
+        await updateBindingBySession(ctx, session, updateData)
 
         // 如果是首次开启，初始化登录状态
         // 废弃旧的uid策略，无法使用缓存的qrCode或maiUid初始化状态

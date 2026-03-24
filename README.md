@@ -49,6 +49,15 @@ plugins:
 
 **注意**：`machineInfo` 和 `turnstileToken` 为必填配置，需要在配置文件中填写。
 
+### 跨平台绑定（推荐）
+
+如需在多个平台（QQ/Discord/Telegram 等）共享同一份绑定数据，建议同时启用 Koishi 官方 `bind` 插件。  
+本插件会优先使用 bind 统一后的用户 ID 保存绑定信息，并兼容历史的平台原始 ID 数据。
+
+### 群白名单跨平台配置
+
+`whitelist.targets` 支持 `platform:guildId` 格式（例如 `qq:1072033605`、`discord:1234567890`），也支持仅填写 `guildId`（兼容旧配置）。
+
 ## 使用
 
 ### 绑定账号
