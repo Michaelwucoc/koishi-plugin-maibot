@@ -20,6 +20,10 @@ export interface UserBinding {
   protectionMode?: boolean  // 是否开启保护模式
   lastQrCode?: string  // 最近输入的SGID（用于10分钟内缓存）
   lastQrCodeTime?: Date  // 最近输入SGID的时间戳
+  /** 绑定时快照的玩家名，用于与每次 preview 校验 */
+  boundPlayerName?: string
+  /** 解绑卡兑换累计次数，冷却期内解绑时消耗 */
+  unbindCredits?: number
 }
 
 export interface MaiBotSetting {
@@ -43,11 +47,71 @@ export interface OperationLog {
   createdAt: Date  // 操作时间
 }
 
+export interface MaiBotUserCooldown {
+  userId: string
+  slot: string
+  lastAt: Date
+}
+
+/** personal / group / unbind（解绑卡，兑换后为当前绑定账号增加解绑额度） */
+export type MaiBotCardKind = 'personal' | 'group' | 'unbind'
+
+export interface MaiBotCardKey {
+  id: number
+  code: string
+  /** 默认 personal（旧数据无此字段时按 personal 处理） */
+  cardKind?: MaiBotCardKind
+  permanent: boolean
+  durationMs: number
+  createdAt: Date
+  issuerUserId: string
+  redeemedAt?: Date
+  redeemerUserId?: string
+  active: boolean
+}
+
+export interface MaiBotPriorityUser {
+  userId: string
+  expiresAt?: Date
+  updatedAt: Date
+  /** 为 true 表示由「authority 高于阈值」自动写入的永久优先；权限回落时可安全删除，不影响卡密兑换记录 */
+  authorityAuto?: boolean
+}
+
+/** 群组优先授权：绑定在 platform:guildId（无 platform 时仅 guildId） */
+export interface MaiBotGroupPriority {
+  guildKey: string
+  expiresAt?: Date
+  updatedAt: Date
+  /** 可取消/换绑本群群组优先的用户键（制表符分隔，与兑换时写入的账号键一致） */
+  managerUserIds?: string
+}
+
+/** 群组优先换绑：先在原群发起，再在目标群完成 */
+export interface MaiBotGroupRebindPending {
+  anchorUserId: string
+  matchKeys: string
+  fromGuildKey: string
+  expiresAt: Date
+}
+
+/** 解绑后仍记录上次绑定/解绑时间，用于换绑冷却 */
+export interface MaiBotUserRebindState {
+  userId: string
+  lastBindChangeAt: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     maibot_bindings: UserBinding
     maibot_settings: MaiBotSetting
     maibot_operation_logs: OperationLog
+    maibot_user_cooldowns: MaiBotUserCooldown
+    maibot_card_keys: MaiBotCardKey
+    maibot_priority_users: MaiBotPriorityUser
+    maibot_group_priority: MaiBotGroupPriority
+    maibot_group_rebind_pending: MaiBotGroupRebindPending
+    maibot_user_rebind_state: MaiBotUserRebindState
   }
 }
 
@@ -72,6 +136,8 @@ export function extendDatabase(ctx: Context) {
     protectionMode: 'boolean',  // 是否开启保护模式
     lastQrCode: 'string',  // 最近输入的SGID（用于10分钟内缓存）
     lastQrCodeTime: 'timestamp',  // 最近输入SGID的时间戳
+    boundPlayerName: 'string',
+    unbindCredits: 'unsigned',
   }, {
     primary: 'id',
     autoInc: true,
@@ -107,6 +173,65 @@ export function extendDatabase(ctx: Context) {
     autoInc: true,
     // targetUserId, guildId, channelId, result, errorMessage, apiResponse 可以为空
     unique: ['refId'], // refId 必须唯一
+  })
+
+  ctx.model.extend('maibot_user_cooldowns', {
+    userId: 'string',
+    slot: 'string',
+    lastAt: 'timestamp',
+  }, {
+    primary: ['userId', 'slot'],
+  })
+
+  ctx.model.extend('maibot_card_keys', {
+    id: 'unsigned',
+    code: 'string',
+    cardKind: 'string',
+    permanent: 'boolean',
+    durationMs: 'unsigned',
+    createdAt: 'timestamp',
+    issuerUserId: 'string',
+    redeemedAt: 'timestamp',
+    redeemerUserId: 'string',
+    active: 'boolean',
+  }, {
+    primary: 'id',
+    autoInc: true,
+    unique: ['code'],
+  })
+
+  ctx.model.extend('maibot_priority_users', {
+    userId: 'string',
+    expiresAt: 'timestamp',
+    updatedAt: 'timestamp',
+    authorityAuto: 'boolean',
+  }, {
+    primary: 'userId',
+  })
+
+  ctx.model.extend('maibot_group_priority', {
+    guildKey: 'string',
+    expiresAt: 'timestamp',
+    updatedAt: 'timestamp',
+    managerUserIds: 'text',
+  }, {
+    primary: 'guildKey',
+  })
+
+  ctx.model.extend('maibot_group_rebind_pending', {
+    anchorUserId: 'string',
+    matchKeys: 'text',
+    fromGuildKey: 'string',
+    expiresAt: 'timestamp',
+  }, {
+    primary: 'anchorUserId',
+  })
+
+  ctx.model.extend('maibot_user_rebind_state', {
+    userId: 'string',
+    lastBindChangeAt: 'timestamp',
+  }, {
+    primary: 'userId',
   })
 }
 

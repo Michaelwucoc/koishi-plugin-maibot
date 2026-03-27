@@ -1,6 +1,34 @@
 import { Context, Schema, Session } from 'koishi'
 import { MaiBotAPI } from './api'
+import {
+  formatBindChangeWaitHuman,
+  msUntilBindChangeAllowed,
+  resolveBindingNameMatchOptions,
+  verifyPreviewMatchesBinding,
+} from './binding-verify'
 import { extendDatabase, UserBinding } from './database'
+import {
+  adminRemoveGroupPriorityRow,
+  adminRemovePersonalPriorityRows,
+  adminSetGroupPriorityForGuild,
+  adminSetPersonalPriorityForUserIds,
+  canonicalGuildPriorityKey,
+  checkCommandCooldown,
+  clearUserCooldownsForKeys,
+  commandToCooldownSlot,
+  completeGroupPriorityRebind,
+  createCardKeys,
+  getGroupPriorityDisplay,
+  getPriorityUserDisplayForAnyKey,
+  parseCardDurationSpec,
+  parsePriorityAdminSpec,
+  recordCommandCooldown,
+  redeemCardKey,
+  startGroupPriorityRebind,
+  syncAuthorityAutoPriority,
+  userCancelGroupPriority,
+  type PriorityCooldownConfig,
+} from './priority-cooldown'
 
 export const name = 'maibot'
 export const inject = ['database']
@@ -64,6 +92,20 @@ export interface Config {
   b50PollTimeout?: number  // B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）
   b50PollRequestTimeout?: number  // B50轮询单次请求超时时间（毫秒），默认10000毫秒（10秒）
   autoRecallProcessingMessages?: boolean  // B50任务完成后自动撤回"正在处理"和"已提交"消息
+  /** 卡密生成/删除/导出等管理指令需要的 Koishi authority，默认 4 */
+  authLevelForCardAdmin?: number
+  /** 普通用户指令冷却（优先用户可走更短冷却）；authority > adminBypassAuthority 时绕过冷却并自动同步永久个人优先 */
+  priorityCooldown?: PriorityCooldownConfig
+  /** 换绑冷却与解绑卡说明（shopUrl 留空则用 priorityCooldown.shopUrl） */
+  rebindPolicy?: {
+    minDaysBetweenBindChange: number
+    shopUrl?: string
+  }
+  /** SGID / preview 校验时：绑定快照玩家名与当前玩家名的匹配（含 /mai状态、mymai 等） */
+  bindingPlayerNameMatch?: {
+    /** 0–100：NFKC 规范化后，编辑距离相似度下限；100 为须完全一致。全角如 Ｍｉｌｋ 与半角 Milk 在 100 下通常视为一致 */
+    minSimilarityPercent: number
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -143,6 +185,58 @@ export const Config: Schema<Config> = Schema.object({
   b50PollTimeout: Schema.number().default(600000).description('B50任务轮询超时时间（毫秒），默认600000毫秒（10分钟）'),
   b50PollRequestTimeout: Schema.number().default(10000).description('B50轮询单次请求超时时间（毫秒），默认10000毫秒（10秒），超时后会重试'),
   autoRecallProcessingMessages: Schema.boolean().default(true).description('B50任务完成后自动撤回"正在处理"和"已提交"消息'),
+  authLevelForCardAdmin: Schema.number().default(4).description('卡密管理指令（生成/删除/导出）需要的 Koishi authority，默认 4'),
+  priorityCooldown: Schema.object({
+    enabled: Schema.boolean().default(false).description(
+      '开启后，对参与冷却槽的 mai 指令在指令执行前统一检查间隔（见插件内 commandToCooldownSlot：含发票/B50/状态等分槽，其余多数为 default 槽；帮助、绑定类、maialert、管理员指令等不参与）',
+    ),
+    adminBypassAuthority: Schema.number()
+      .default(4)
+      .description(
+        '仅当用户 Koishi authority 大于该数值时视为管理员：绕过冷却，并自动写入永久个人优先（带标记，权限回落时自动删除）；卡密兑换的优先记录不会被删除。',
+      ),
+    shopUrl: Schema.string().default('https://ifdian.net/a/AWMC_TEAM?tab=shop').description('冷却提示中的购买链接'),
+    messageTemplate: Schema.string().role('textarea', { rows: 3 }).default('普通用户使用此功能有限制。您的冷却时间剩余：{remainingSec}秒。前往{shopUrl}购买优先授权！').description('冷却中提示（占位符 {remainingSec} {shopUrl}）'),
+    normalTicketMs: Schema.number().default(1200000).description('普通用户「发票」类冷却（毫秒），默认 20 分钟'),
+    priorityTicketMs: Schema.number().default(0).description('优先用户「发票」类冷却（毫秒），默认 0'),
+    normalB50Ms: Schema.number().default(30000).description('普通用户 B50 相关（mai上传B50 / maiua / 落雪b50）冷却（毫秒）'),
+    priorityB50Ms: Schema.number().default(0).description('优先用户 B50 相关冷却（毫秒）'),
+    normalStatusMs: Schema.number().default(30000).description('普通用户 /mai状态 冷却（毫秒）'),
+    priorityStatusMs: Schema.number().default(0).description('优先用户 /mai状态 冷却（毫秒）'),
+    normalDefaultMs: Schema.number().default(30000).description('普通用户其它功能指令默认冷却（毫秒）'),
+    priorityDefaultMs: Schema.number().default(0).description('优先用户其它功能指令默认冷却（毫秒）'),
+  }).description('用户指令冷却与优先授权提示').default({
+    enabled: false,
+    adminBypassAuthority: 4,
+    shopUrl: 'https://ifdian.net/a/AWMC_TEAM?tab=shop',
+    messageTemplate: '普通用户使用此功能有限制。您的冷却时间剩余：{remainingSec}秒。前往{shopUrl}购买优先授权！',
+    normalTicketMs: 1200000,
+    priorityTicketMs: 0,
+    normalB50Ms: 30000,
+    priorityB50Ms: 0,
+    normalStatusMs: 30000,
+    priorityStatusMs: 0,
+    normalDefaultMs: 30000,
+    priorityDefaultMs: 0,
+  }),
+  rebindPolicy: Schema.object({
+    minDaysBetweenBindChange: Schema.number().default(30).description('同一账号两次绑定/换绑之间的最小间隔天数'),
+    shopUrl: Schema.string().default('').description('解绑卡购买链接（留空则用 priorityCooldown.shopUrl）'),
+  }).description('换绑冷却与解绑卡').default({
+    minDaysBetweenBindChange: 30,
+    shopUrl: '',
+  }),
+  bindingPlayerNameMatch: Schema.object({
+    minSimilarityPercent: Schema.number()
+      .default(100)
+      .min(0)
+      .max(100)
+      .description(
+        '玩家名最低相似度（0–100）。先进行 Unicode NFKC 规范化（全角/半角英数字统一）再按编辑距离计算；100 表示须完全一致。略低于 100 可容忍少量字符差异（改名、显示差异等）。',
+      ),
+  })
+    .description('绑定记录中的玩家名与 preview 的校验（maiUid 一致时的第二道校验）')
+    .default({ minSimilarityPercent: 100 }),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -193,7 +287,7 @@ function maskUserId(uid: string): string {
  * 清理错误消息中的敏感信息（IP地址、URL等）
  */
 function sanitizeErrorMessage(message: string): string {
-  if (!message) return '未知错误'
+  if (!message) return '未提供错误详情'
   return message
     .replace(/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?/g, '[服务器]')
     .replace(/https?:\/\/[^\s]+/g, '[链接]')
@@ -205,7 +299,7 @@ function sanitizeErrorMessage(message: string): string {
  * 用于日志输出，防止泄漏服务器地址
  */
 function sanitizeError(error: any): string {
-  if (!error) return '未知错误'
+  if (!error) return '未提供错误详情'
   
   // 获取错误消息
   const message = error?.message || String(error)
@@ -219,13 +313,149 @@ function sanitizeError(error: any): string {
   return `${code} ${sanitizedMessage}`.trim()
 }
 
+/** Session 上暂存当前正在执行的指令用法（由 command/before-execute 写入） */
+const MAI_SESSION_CMD_USAGE_KEY = '__maiCmdUsageHint'
+
+function getSessionCommandUsageHint(session?: Session): string {
+  if (!session) return ''
+  const raw = (session as unknown as Record<string, unknown>)[MAI_SESSION_CMD_USAGE_KEY]
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
+function isMaiPluginCommandName(name: string): boolean {
+  return name.trim().startsWith('mai')
+}
+
+async function computeMaiCommandUsageHint(command: any, session: Session): Promise<string> {
+  if (!command || !isMaiPluginCommandName(String(command.name || ''))) return ''
+  const chunks: string[] = []
+  try {
+    const descPath = `commands.${command.name}.description`
+    const d = session.text(descPath)
+    if (d && String(d).trim() && d !== descPath && !String(d).startsWith('commands.')) {
+      chunks.push(String(d).trim())
+    }
+  } catch {
+    /* ignore */
+  }
+  const display = String(command.displayName ?? command.name ?? '').trim()
+  const decl = String(command.declaration ?? '').trim()
+  const syntax = [display, decl].filter(Boolean).join(' ')
+  if (syntax) chunks.push(`用法：/${syntax}`)
+  const usageField = command._usage
+  if (typeof usageField === 'string' && usageField.trim()) {
+    chunks.push(usageField.trim())
+  } else if (typeof usageField === 'function') {
+    try {
+      const u = await usageField(session)
+      if (u && String(u).trim()) chunks.push(String(u).trim())
+    } catch {
+      /* ignore */
+    }
+  }
+  return chunks.join('\n')
+}
+
+function shouldAppendUsageFooter(text: string, session?: Session): boolean {
+  if (!getSessionCommandUsageHint(session)) return false
+  const t = (text || '').trim()
+  if (!t) return true
+  if (t.includes('查看各指令用法') || t.includes('/mai帮助')) return false
+  if (t === '执行失败（未返回详细原因）') return true
+  if (t === '未知错误' || t === '未提供错误详情') return true
+  if (/^(发生未知错误|未知错误|An unknown error)/i.test(t)) return true
+  return false
+}
+
+function formatCommandUsageAppend(session?: Session): string {
+  let hint = getSessionCommandUsageHint(session)
+  if (!hint) return ''
+  const max = 800
+  if (hint.length > max) hint = `${hint.slice(0, max)}…`
+  return `\n\n📌 ${hint}`
+}
+
 /**
  * 获取用户友好的错误消息（隐藏敏感信息）
+ * @param session 若传入且在指令执行上下文中，对模糊错误会附加当前指令的用法说明
  */
-function getSafeErrorMessage(error: any): string {
-  if (!error) return '未知错误'
+function getSafeErrorMessage(error: any, session?: Session): string {
+  if (!error) {
+    const base = '执行失败（未返回详细原因）'
+    return shouldAppendUsageFooter(base, session) ? `${base}${formatCommandUsageAppend(session)}` : base
+  }
   const message = error?.message || String(error)
-  return sanitizeErrorMessage(message)
+  const sanitized = sanitizeErrorMessage(message)
+  const base =
+    !String(message).trim() || sanitized === '未知错误'
+      ? '执行失败（未返回详细原因）'
+      : sanitized
+  return shouldAppendUsageFooter(base, session) ? `${base}${formatCommandUsageAppend(session)}` : base
+}
+
+type InteractiveCardKindChoice = 'personal' | 'group' | 'unbind' | 'cancel'
+
+function parseInteractiveCardKindInput(text: string): InteractiveCardKindChoice | null {
+  const t = text.trim().toLowerCase()
+  if (!t) return null
+  if (t === '0' || t === '取消' || t === 'cancel' || t === 'q') return 'cancel'
+  if (t === '1' || t === '个人' || t === 'personal' || t === 'p') return 'personal'
+  if (t === '2' || t === '群组' || t === 'group' || t === 'g') return 'group'
+  if (t === '3' || t === '解绑' || t === 'unbind' || t === 'u') return 'unbind'
+  return null
+}
+
+/** 批量作废卡密：一行一条；可粘贴导出 TSV（取每行首列）；从行内匹配 MAI-… */
+function parseBatchVoidCardCodes(raw: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const line of raw.split(/\r?\n/)) {
+    let s = line.trim()
+    if (!s) continue
+    if (s.includes('\t')) {
+      s = s.split('\t')[0].trim()
+    }
+    const upper = s.toUpperCase()
+    const m = upper.match(/MAI-[A-Z0-9-]+/)
+    const code = m ? m[0] : upper
+    if (!code.startsWith('MAI-')) continue
+    if (seen.has(code)) continue
+    seen.add(code)
+    out.push(code)
+  }
+  return out
+}
+
+type ExportScopeChoice = 'all' | 'unused' | 'redeemed' | 'cancel'
+
+function parseExportScopeInput(text: string): ExportScopeChoice | null {
+  const t = text.trim().toLowerCase()
+  if (!t) return null
+  if (t === '0' || t === '取消' || t === 'cancel' || t === 'q') return 'cancel'
+  if (t === '1' || t === 'all' || t === '全部') return 'all'
+  if (t === '2' || t === 'unused' || t === '未使用') return 'unused'
+  if (t === '3' || t === 'redeemed' || t === '已兑换') return 'redeemed'
+  return null
+}
+
+type ExportKindFilterChoice = 'all' | 'personal' | 'group' | 'unbind' | 'cancel'
+
+function parseExportKindFilterInput(text: string): ExportKindFilterChoice | null {
+  const t = text.trim().toLowerCase()
+  if (!t) return null
+  if (t === '0' || t === '取消' || t === 'cancel' || t === 'q') return 'cancel'
+  if (t === '1' || t === 'all' || t === '全部') return 'all'
+  if (t === '2' || t === 'personal' || t === '个人') return 'personal'
+  if (t === '3' || t === 'group' || t === '群组') return 'group'
+  if (t === '4' || t === 'unbind' || t === '解绑') return 'unbind'
+  return null
+}
+
+function rowCardKindOf(row: { cardKind?: string }): 'personal' | 'group' | 'unbind' {
+  const k = row.cardKind
+  if (k === 'group') return 'group'
+  if (k === 'unbind') return 'unbind'
+  return 'personal'
 }
 
 function buildMention(session: Session): string {
@@ -941,6 +1171,50 @@ async function getBindRelatedLegacyUserIds(ctx: Context, session: Session): Prom
   return relatedUserIds
 }
 
+async function getBindRelatedLegacyUserIdsForTarget(
+  ctx: Context,
+  platform: string,
+  rawUserId: string,
+): Promise<string[]> {
+  const relatedUserIds: string[] = []
+  if (!platform || !rawUserId) return relatedUserIds
+
+  const db = ctx.database as any
+  if (!db || typeof db.get !== 'function') return relatedUserIds
+
+  try {
+    const pidCandidates = [`${platform}:${rawUserId}`, rawUserId]
+    let currentBindings: any[] = []
+    for (const pid of pidCandidates) {
+      const rows = await db.get('binding', { pid })
+      if (rows?.length) {
+        currentBindings = rows
+        break
+      }
+    }
+    if (!currentBindings.length) return relatedUserIds
+
+    const aid = currentBindings[0]?.aid
+    if (aid === undefined || aid === null) return relatedUserIds
+
+    const allBindings = await db.get('binding', { aid })
+    for (const item of allBindings || []) {
+      const pid = item?.pid
+      if (typeof pid === 'string' && pid.length > 0) {
+        const idx = pid.indexOf(':')
+        const extracted = idx >= 0 ? pid.slice(idx + 1) : pid
+        if (extracted && !relatedUserIds.includes(extracted)) {
+          relatedUserIds.push(extracted)
+        }
+      }
+    }
+  } catch {
+    // binding 表不存在或结构不一致时忽略
+  }
+
+  return relatedUserIds
+}
+
 async function getSessionBindingKeys(ctx: Context, session: Session): Promise<string[]> {
   const keys: string[] = []
   const rawUserId = session.userId ? String(session.userId) : ''
@@ -1140,19 +1414,36 @@ async function getQrText(
   timeout: number = 60000,
   promptMessage?: string,
   useCache: boolean = true  // 是否使用缓存（默认启用）
-): Promise<{ qrText: string; error?: string; needRebind?: boolean; fromCache?: boolean }> {
+): Promise<{ qrText: string; error?: string; fromCache?: boolean }> {
   const logger = ctx.logger('maibot')
   
-  // 如果启用缓存且binding存在，检查是否有缓存
+  // 如果启用缓存且binding存在，检查是否有缓存（仍会用 preview 校验身份）
   const cacheMinutes = config.sgidCacheMinutes ?? 10
   if (useCache && cacheMinutes > 0 && binding && binding.lastQrCode && binding.lastQrCodeTime) {
     const cacheAge = Date.now() - new Date(binding.lastQrCodeTime).getTime()
     const cacheValidDuration = cacheMinutes * 60 * 1000
     
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
-      logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
-      // 直接返回缓存的SGID，不验证（让调用方验证，如果失败再提示输入）
-      return { qrText: binding.lastQrCode, fromCache: true }
+      try {
+        const previewCached = await api.getPreview(config.machineInfo.clientId, binding.lastQrCode)
+        const vErr = verifyPreviewMatchesBinding(
+          binding,
+          previewCached,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+        if (!vErr) {
+          if (previewCached.UserName != null && !binding.boundPlayerName?.trim()) {
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+              boundPlayerName: String(previewCached.UserName).trim(),
+            })
+          }
+          logger.info(`使用缓存的SGID（${Math.floor(cacheAge / 1000)}秒前输入）`)
+          return { qrText: binding.lastQrCode, fromCache: true }
+        }
+        logger.info('缓存 SGID 与绑定身份校验失败，需重新输入')
+      } catch (e) {
+        logger.warn('缓存 SGID 预检失败:', e)
+      }
     } else {
       logger.debug(`缓存已过期（${Math.floor(cacheAge / 1000)}秒前输入，超过${cacheMinutes}分钟）`)
     }
@@ -1255,24 +1546,35 @@ async function getQrText(
       const preview = await api.getPreview(config.machineInfo.clientId, qrText)
       if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
         await session.send('❌ 无效或过期的二维码，请重新发送')
-        return { qrText: '', error: '无效或过期的二维码', needRebind: true }
+        return { qrText: '', error: '无效或过期的二维码' }
       }
-      
-      // 如果binding存在，更新数据库中的qrCode和缓存
       if (binding) {
-        await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
+        const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+        if (vErr) {
+          await session.send(vErr)
+          return { qrText: '', error: vErr }
+        }
+        const patch: Record<string, unknown> = {
           qrCode: qrText,
-          lastQrCode: qrText,  // 更新缓存
-          lastQrCodeTime: new Date(),  // 更新时间戳
-        })
+          lastQrCode: qrText,
+          lastQrCodeTime: new Date(),
+        }
+        if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+          patch.boundPlayerName = String(preview.UserName).trim()
+        }
+        await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
         logger.info(`已更新用户 ${binding.userId} 的qrCode和缓存`)
       }
       
       return { qrText: qrText }
     } catch (error: any) {
       logger.error(`验证qrCode失败: ${sanitizeError(error)}`)
-      await session.send(`❌ 验证二维码失败：${getSafeErrorMessage(error)}`)
-      return { qrText: '', error: `验证二维码失败：${getSafeErrorMessage(error)}`, needRebind: true }
+      await session.send(`❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`)
+      return { qrText: '', error: `验证二维码失败：${getSafeErrorMessage(error, session)}` }
     }
   } catch (error: any) {
     logger.error(`等待用户输入二维码失败: ${error?.message}`, error)
@@ -1280,231 +1582,54 @@ async function getQrText(
       await session.send(`❌ 输入超时（${actualTimeout / 1000}秒）`)
       return { qrText: '', error: '超时未收到响应' }
     }
-    return { qrText: '', error: getSafeErrorMessage(error) }
+    return { qrText: '', error: getSafeErrorMessage(error, session) }
   }
 }
 
-/**
- * 处理API调用失败，如果需要重新绑定则进入重新绑定流程
- */
-async function handleApiFailure(
-  session: Session,
-  ctx: Context,
-  api: MaiBotAPI,
-  binding: UserBinding | null,
-  config: Config,
-  error: any,
-  rebindTimeout: number
-): Promise<{ success: boolean; error?: string; rebindResult?: { success: boolean; newBinding?: UserBinding; error?: string } }> {
-  const logger = ctx.logger('maibot')
-  
-  // 检查错误是否表示需要重新绑定（例如UserID为-1，或qr_text相关错误）
-  const needRebind = 
-    error?.response?.data?.UserID === -1 ||
-    error?.response?.data?.UserID === '-1' ||
-    error?.message?.includes('二维码') ||
-    error?.message?.includes('qr_text') ||
-    error?.message?.includes('无效') ||
-    error?.message?.includes('过期')
-  
-  if (needRebind && binding) {
-    logger.info(`检测到需要重新绑定，用户: ${binding.userId}`)
-    const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-    return { success: false, rebindResult }
-  }
-  
-  return { success: false, error: getSafeErrorMessage(error) }
-}
-
-/**
- * 提示用户重新绑定二维码
- * 只支持用户输入SGID文本
- */
-async function promptForRebind(
-  session: Session,
-  ctx: Context,
-  api: MaiBotAPI,
-  binding: UserBinding,
-  config: Config,
-  timeout: number = 60000
-): Promise<{ success: boolean; newBinding?: UserBinding; error?: string; messageId?: string }> {
-  const actualTimeout = timeout
-  const logger = ctx.logger('maibot')
-  
-  // 发送提示消息
-  let promptMessageId: string | undefined
-  try {
-    const sentMessage = await session.send(
-      `❌ 二维码对应ID无法登陆，您需要重新绑定新的二维码，请在${actualTimeout / 1000}秒内发送SGID（长按玩家二维码识别后发送）或公众号提供的网页地址`
-    )
-    // 尝试从返回的消息中提取消息ID
-    if (typeof sentMessage === 'string') {
-      promptMessageId = sentMessage
-    } else if (sentMessage && (sentMessage as any).messageId) {
-      promptMessageId = (sentMessage as any).messageId
-    }
-  } catch (error) {
-    logger.warn('发送提示消息失败:', error)
-  }
-
-  // 使用session.prompt等待用户输入SGID文本
-  try {
-    logger.info(`开始等待用户 ${session.userId} 重新绑定SGID，超时时间: ${actualTimeout}ms`)
-    
-    const promptSession = await waitForUserReply(
-      session,
-      ctx,
-      actualTimeout,
-      promptMessageId ? [promptMessageId] : undefined,
-    )
-    const promptText = promptSession?.content?.trim() || ''
-    if (!promptText) {
-      await session.send(`❌ 重新绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定二维码`)
-      return { success: false, error: '超时未收到响应', messageId: promptMessageId }
-    }
-
-    const trimmed = promptText.trim()
-    // 交互式输入的敏感信息，撤回用户输入消息
-    if (promptSession) {
-      await tryRecallMessage(promptSession, ctx, config, promptSession.messageId)
-    }
-    logger.debug(`收到用户输入: ${trimmed.substring(0, 50)}`)
-    
-    let qrCode = trimmed
-    
-    // 检查是否为公众号网页地址格式（https://wq.wahlap.net/qrcode/req/）
-    const isReqLink = trimmed.includes('https://wq.wahlap.net/qrcode/req/')
-    // 检查是否为二维码图片链接格式（https://wq.wahlap.net/qrcode/img/）
-    const isImgLink = trimmed.includes('https://wq.wahlap.net/qrcode/img/')
-    const isLink = isReqLink || isImgLink
-    const isSGID = trimmed.startsWith('SGWCMAID')
-    
-    // 如果是网页地址，提取MAID并转换为SGWCMAID格式
-    if (isReqLink) {
-      try {
-        // 从URL中提取MAID部分：https://wq.wahlap.net/qrcode/req/MAID2601...55.html?...
-        // 匹配 /qrcode/req/ 后面的 MAID 开头的内容（到 .html 或 ? 之前）
-        const match = trimmed.match(/qrcode\/req\/(MAID[^?\.]+)/i)
-        if (match && match[1]) {
-          const maid = match[1]
-          // 在前面加上 SGWC 变成 SGWCMAID...
-          qrCode = 'SGWC' + maid
-          logger.info(`从网页地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
-        } else {
-          await session.send('⚠️ 无法从网页地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
-          return { success: false, error: '无法从网页地址中提取MAID', messageId: promptMessageId }
-        }
-      } catch (error) {
-        logger.warn('解析网页地址失败:', error)
-        await session.send('⚠️ 网页地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
-        return { success: false, error: '网页地址格式错误', messageId: promptMessageId }
-      }
-    } else if (isImgLink) {
-      try {
-        // 从图片URL中提取MAID部分：https://wq.wahlap.net/qrcode/img/MAID260128205107...png?v
-        // 匹配 /qrcode/img/ 后面的 MAID 开头的内容（到 .png 或 ? 之前）
-        const match = trimmed.match(/qrcode\/img\/(MAID[^?\.]+)/i)
-        if (match && match[1]) {
-          const maid = match[1]
-          // 在前面加上 SGWC 变成 SGWCMAID...
-          qrCode = 'SGWC' + maid
-          logger.info(`从图片地址提取MAID并转换: ${maid.substring(0, 20)}... -> ${qrCode.substring(0, 24)}...`)
-        } else {
-          await session.send('⚠️ 无法从图片地址中提取MAID，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
-          return { success: false, error: '无法从图片地址中提取MAID', messageId: promptMessageId }
-        }
-      } catch (error) {
-        logger.warn('解析图片地址失败:', error)
-        await session.send('⚠️ 图片地址格式错误，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
-        return { success: false, error: '图片地址格式错误', messageId: promptMessageId }
-      }
-    } else if (!isSGID) {
-      await session.send('⚠️ 未识别到有效的SGID格式或网页地址，请发送SGID文本（SGWCMAID开头）或公众号提供的网页/图片地址')
-      return { success: false, error: '无效的二维码格式，必须是SGID文本或网页/图片地址', messageId: promptMessageId }
-    }
-    
-    // 验证SGID格式和长度
-    if (!qrCode.startsWith('SGWCMAID')) {
-      await session.send('❌ 识别失败：格式错误，必须以 SGWCMAID 开头')
-      return { success: false, error: 'SGID格式错误，必须以 SGWCMAID 开头', messageId: promptMessageId }
-    }
-    
-    if (qrCode.length < 48 || qrCode.length > 128) {
-      await session.send('❌ 识别失败：SGID长度错误，应在48-128字符之间')
-      return { success: false, error: '二维码长度错误，应在48-128字符之间', messageId: promptMessageId }
-    }
-    
-    logger.info(`✅ 接收到${isLink ? '链接地址（已转换）' : 'SGID'}: ${qrCode.substring(0, 50)}...`)
-    
-    // 发送识别中反馈
-    await session.send('⏳ 正在处理，请稍候...')
-
-    // 使用新API获取用户信息
-    const machineInfo = config.machineInfo
-    let previewResult
-    try {
-      previewResult = await api.getPreview(machineInfo.clientId, qrCode)
-    } catch (error: any) {
-      logger.error(`获取用户预览信息失败: ${sanitizeError(error)}`)
-      await session.send(`❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${getSafeErrorMessage(error)}`)
-      return { 
-        success: false, 
-        error: `绑定失败：无法从二维码获取用户信息\n错误信息: ${getSafeErrorMessage(error)}`,
-        messageId: promptMessageId
-      }
-    }
-
-    // 检查是否获取成功
-    if (previewResult.UserID === -1 || (typeof previewResult.UserID === 'string' && previewResult.UserID === '-1')) {
-      await session.send(`❌ 绑定失败：无效或过期的二维码`)
-      return { 
-        success: false, 
-        error: '绑定失败：无效或过期的二维码',
-        messageId: promptMessageId
-      }
-    }
-
-    // UserID在新API中是加密的字符串
-    const maiUid = String(previewResult.UserID)
-    const userName = previewResult.UserName
-    const rating = previewResult.Rating ? String(previewResult.Rating) : undefined
-
-    // 更新数据库中的绑定
-    await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-      maiUid,
-      qrCode,
-      bindTime: new Date(),
-      userName,
-      rating,
-      lastQrCode: qrCode,  // 保存为缓存
-      lastQrCodeTime: new Date(),  // 保存时间戳
-    })
-
-    // 发送成功反馈
-    await session.send(`✅ 重新绑定成功！${userName ? `\n用户名: ${userName}` : ''}${rating ? `\nRating: ${rating}` : ''}\n\n⚠️ 为了确保账户安全，请手动撤回群内包含SGID的消息`)
-
-    // 获取更新后的绑定
-    const updated = await ctx.database.get('maibot_bindings', { userId: binding.userId })
-    if (updated.length > 0) {
-      return { success: true, newBinding: updated[0], messageId: promptMessageId }
-    } else {
-      await session.send('⚠️ 绑定已更新，但获取绑定信息失败')
-      return { success: false, error: '更新绑定失败', messageId: promptMessageId }
-    }
-  } catch (error: any) {
-    logger.error(`重新绑定失败: ${sanitizeError(error)}`)
-    if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
-      await session.send(`❌ 重新绑定超时（${actualTimeout / 1000}秒），请稍后使用 /mai绑定 重新绑定二维码`)
-      return { success: false, error: '超时未收到响应', messageId: promptMessageId }
-    }
-    await session.send(`❌ 重新绑定过程中发生错误：${getSafeErrorMessage(error)}`)
-    return { success: false, error: getSafeErrorMessage(error), messageId: promptMessageId }
-  }
+function qrOrLoginFailureHint(): string {
+  return '请使用已绑定账号本人微信中的最新玩家二维码（SGID）重试；若需更换绑定账号，请在冷却结束后使用 /mai解绑，或在冷却期内使用 /mai解绑卡。'
 }
 
 export function apply(ctx: Context, config: Config) {
   // 扩展数据库
   extendDatabase(ctx)
+
+  ctx.on('command/before-execute', async (argv) => {
+    const sess = argv.session
+    const cmd = argv.command
+    if (sess && cmd) {
+      const bag = sess as unknown as Record<string, unknown>
+      try {
+        bag[MAI_SESSION_CMD_USAGE_KEY] = await computeMaiCommandUsageHint(cmd, sess)
+      } catch {
+        bag[MAI_SESSION_CMD_USAGE_KEY] = ''
+      }
+    }
+    if (
+      sess &&
+      cmd &&
+      priorityCooldownCfg?.enabled &&
+      isMaiPluginCommandName(String(cmd.name || ''))
+    ) {
+      try {
+        await syncAuthorityAutoPriority(ctx, priorityCooldownCfg, sess, async (s) => getSessionBindingKeys(ctx, s))
+      } catch (e) {
+        logger.warn('管理员优先授权同步失败', e)
+      }
+    }
+  })
+
+  // Koishi 等框架在指令未捕获异常时可能只回复「发生未知错误」，此处附上当前指令用法
+  ctx.on('before-send', (session: Session) => {
+    const c = session.content
+    if (typeof c !== 'string') return
+    const t = c.trim()
+    if (t.length > 200) return
+    if (/^(发生未知错误\.?|未知错误\.?|An unknown error\.?)$/i.test(t)) {
+      const extra = formatCommandUsageAppend(session)
+      if (extra) session.content = `${c}${extra}`
+    }
+  })
 
   // 初始化API客户端
   const api = new MaiBotAPI({
@@ -1515,6 +1640,54 @@ export function apply(ctx: Context, config: Config) {
   })
   const logger = ctx.logger('maibot')
 
+  function rebindShopUrl(): string {
+    const fromPolicy = config.rebindPolicy?.shopUrl?.trim()
+    if (fromPolicy) return fromPolicy
+    return (
+      config.priorityCooldown?.shopUrl ||
+      'https://ifdian.net/a/AWMC_TEAM?tab=shop'
+    )
+  }
+
+  async function touchRebindClock(userId: string): Promise<void> {
+    const prev = await ctx.database.get('maibot_user_rebind_state', { userId })
+    if (prev.length) {
+      await ctx.database.set('maibot_user_rebind_state', { userId }, { lastBindChangeAt: new Date() })
+    } else {
+      await ctx.database.create('maibot_user_rebind_state', { userId, lastBindChangeAt: new Date() })
+    }
+  }
+
+  async function getRebindWaitMsForBinding(binding: UserBinding): Promise<number> {
+    const minDays = config.rebindPolicy?.minDaysBetweenBindChange ?? 30
+    const stateRows = await ctx.database.get('maibot_user_rebind_state', { userId: binding.userId })
+    const stateMs = stateRows[0]?.lastBindChangeAt ? new Date(stateRows[0].lastBindChangeAt).getTime() : 0
+    const bindMs = new Date(binding.bindTime).getTime()
+    return msUntilBindChangeAllowed(stateMs, bindMs, minDays)
+  }
+
+  async function formatAlreadyBoundMessage(existing: UserBinding): Promise<string> {
+    const waitMs = await getRebindWaitMsForBinding(existing)
+    const bindStr = new Date(existing.bindTime).toLocaleString('zh-CN')
+    const shop = rebindShopUrl()
+    const credits = existing.unbindCredits ?? 0
+    if (waitMs > 0) {
+      return (
+        `❌ 您已经绑定了账号\n` +
+        `绑定时间: ${bindStr}\n` +
+        (credits > 0 ? `解绑卡额度: ${credits} 次\n` : '') +
+        `\n如需重新绑定，请等待约 ${formatBindChangeWaitHuman(waitMs)}。或前往 ${shop} 购买解绑卡。\n` +
+        `冷却期内请使用 /maiunbindkey 或 /mai解绑卡（按提示发送 SGID 并二次确认）。`
+      )
+    }
+    return (
+      `❌ 您已经绑定了账号\n` +
+      `绑定时间: ${bindStr}\n` +
+      (credits > 0 ? `解绑卡额度: ${credits} 次\n` : '') +
+      `\n您已超过换绑冷却期，可直接使用 /mai解绑 后重新绑定。`
+    )
+  }
+
   // 初始化队列系统
   const queueConfig = config.queue || { enabled: false, interval: 10000, message: '你正在排队，前面还有 {queuePosition} 人。预计等待 {queueEST} 秒。' }
   const requestQueue = queueConfig.enabled ? new RequestQueue(queueConfig.interval) : null
@@ -1524,6 +1697,38 @@ export function apply(ctx: Context, config: Config) {
 
   // 错误帮助URL配置
   const errorHelpUrl = config.errorHelpUrl || ''
+
+  const priorityCooldownCfg = config.priorityCooldown
+  const authLevelForCardAdmin = config.authLevelForCardAdmin ?? 4
+
+  async function getCooldownPrimaryUserId(session: Session): Promise<string> {
+    const keys = await getSessionBindingKeys(ctx, session)
+    return keys[0] || String(session.userId || '')
+  }
+
+  ctx.on('command/before-execute', async (argv) => {
+    const sess = argv.session
+    const cmd = argv.command
+    if (!sess || !cmd) return
+    const cmdName = String(cmd.name || '')
+    if (!priorityCooldownCfg?.enabled) return
+    if (!isMaiPluginCommandName(cmdName)) return
+    if (commandToCooldownSlot(cmdName) === null) return
+    const wl = checkWhitelist(sess, config)
+    if (!wl.allowed) return
+    const hit = await checkCommandCooldown(
+      ctx,
+      sess,
+      priorityCooldownCfg,
+      cmdName,
+      getCooldownPrimaryUserId,
+      async (s) => getSessionBindingKeys(ctx, s),
+    )
+    if (hit) return hit
+    const uid = await getCooldownPrimaryUserId(sess)
+    if (!uid) return
+    await recordCommandCooldown(ctx, uid, cmdName, priorityCooldownCfg)
+  })
 
   /**
    * 获取上传任务的统计信息（平均处理时长和今日成功率）
@@ -1960,6 +2165,20 @@ export function apply(ctx: Context, config: Config) {
     return null
   }
 
+  async function resolveCooldownKeyCandidatesForBypass(session: Session, targetText: string): Promise<string[]> {
+    const extracted = extractUserId(targetText) || targetText?.trim()
+    if (!extracted) return []
+    const keys = new Set<string>([extracted])
+    const platform = session.platform ? String(session.platform) : ''
+    const legacy = await getBindRelatedLegacyUserIdsForTarget(ctx, platform, extracted)
+    for (const id of legacy) keys.add(id)
+    for (const id of [...keys]) {
+      const rows = await ctx.database.get('maibot_bindings', { userId: id })
+      for (const b of rows) keys.add(b.userId)
+    }
+    return [...keys]
+  }
+
   /**
    * 检查权限并获取目标用户绑定
    * 如果提供了targetUserId，检查权限并使用目标用户
@@ -2303,6 +2522,7 @@ export function apply(ctx: Context, config: Config) {
   /mai绑定 - 绑定舞萌DX账号（支持SGID文本或公众号提供的网页地址）
   /mai解绑 - 解绑舞萌DX账号
   /mai状态 - 查询绑定状态
+  /mymai - 与 /mai状态 相同（别名）
   /maiping - 测试机台连接`
 
       // 有权限的代操作命令
@@ -2384,6 +2604,14 @@ export function apply(ctx: Context, config: Config) {
 
       helpText += `
 
+💎 优先授权（缓解指令冷却，需在配置中开启 priorityCooldown）：
+  /mai兑换卡密 [卡密] — 无需 SGID 验证；可直接带卡密或发送指令后粘贴。个人卡全局有效；群组卡须在对应群内兑换；解绑卡须已 /mai绑定
+  /mymai 或 /mai状态 — 可查看个人授权与「群组优先」状态及到期时间
+  /mai取消群组优先 — 在群内，群组卡兑换人可取消本群群组优先
+  /mai群组优先换绑 — 在原群发起，再在目标群发 /mai群组优先换入（兑换人迁移授权）`
+
+      helpText += `
+
 🔔 提醒功能：
   /maialert [on|off] - 开关账号状态播报功能`
 
@@ -2425,6 +2653,20 @@ export function apply(ctx: Context, config: Config) {
   /mai管理员关闭所有锁定和保护 - 一键关闭所有人的锁定模式和保护模式（需要auth等级${authLevelForProxy}以上）
   /mai管理员关闭登录播报 - 关闭/开启登录播报功能（需要auth等级${authLevelForProxy}以上）
   /mai管理员关闭所有播报 - 强制关闭所有人的maialert状态（需要auth等级${authLevelForProxy}以上）`
+      }
+
+      if (userAuthority >= authLevelForCardAdmin) {
+        helpText += `
+
+🎟️ 卡密与冷却管理（需要 auth 等级 ${authLevelForCardAdmin} 以上）：
+  /mai管理员生成卡密 — 无参数时交互选择类型、时长、数量；也可 /mai管理员生成卡密 <时长> [数量] [-g|-u]
+  /mai管理员删除卡密 — 支持多行批量（每行一条，或粘贴导出 TSV 整段）；无参走交互粘贴
+  /mai管理员导出卡密 — 无参数时交互选择范围与类型；也可 /mai管理员导出卡密 [all|unused|redeemed]
+  /mai管理员取消群组优先 [群标识] — 取消群组优先；省略时在群内则针对当前群
+  /mai管理员取消个人优先 <@或ID> — 清除个人优先记录
+  /mai管理员设置个人优先 <@或ID> <spec> — spec：永久、7d、clear 等
+  /mai管理员设置群组优先 <spec> [-g 群标识] — 直接改群组优先；spec：永久、7d、clear；-g 省略且群内则当前群
+  /maibypass <@用户|用户ID> — 清除该用户当前全部指令冷却（别名 /mai管理员清除冷却）`
       }
 
       helpText += `
@@ -2483,7 +2725,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return `${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
         }
-        return `❌ Ping失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
+        return `❌ Ping失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}\n\n📊 查看所有服务状态: https://status.awmc.cc`
       }
     })
 
@@ -2552,7 +2794,7 @@ export function apply(ctx: Context, config: Config) {
         // 检查是否已绑定
         const existing = await getBindingBySession(ctx, session)
         if (existing) {
-          return `❌ 您已经绑定了账号\n绑定时间: ${new Date(existing.bindTime).toLocaleString('zh-CN')}\n\n如需重新绑定，请先使用 /mai解绑`
+          return await formatAlreadyBoundMessage(existing)
         }
 
         // 如果没有提供SGID，提示用户输入
@@ -2669,10 +2911,10 @@ export function apply(ctx: Context, config: Config) {
               return '❌ 超时未收到响应，绑定已取消'
             }
             if (error.message?.includes('无效的二维码')) {
-              return `❌ 绑定失败：${getSafeErrorMessage(error)}`
+              return `❌ 绑定失败：${getSafeErrorMessage(error, session)}`
             }
-            await session.send(`❌ 绑定过程中发生错误：${getSafeErrorMessage(error)}`)
-            return `❌ 绑定失败：${getSafeErrorMessage(error)}`
+            await session.send(`❌ 绑定过程中发生错误：${getSafeErrorMessage(error, session)}`)
+            return `❌ 绑定失败：${getSafeErrorMessage(error, session)}`
           }
         }
 
@@ -2705,12 +2947,12 @@ export function apply(ctx: Context, config: Config) {
           previewResult = await api.getPreview(machineInfo.clientId, qrCode)
         } catch (error: any) {
           ctx.logger('maibot').error('获取用户预览信息失败:', error)
-          const errorMessage = `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${getSafeErrorMessage(error)}`
+          const errorMessage = `❌ 绑定失败：无法从二维码获取用户信息\n错误信息: ${getSafeErrorMessage(error, session)}`
           const refId = await logOperation({
             command: 'mai绑定',
             session,
             status: 'error',
-            errorMessage: getSafeErrorMessage(error),
+            errorMessage: getSafeErrorMessage(error, session),
             apiResponse: error?.response?.data,
           })
           return appendRefId(errorMessage, refId)
@@ -2741,10 +2983,12 @@ export function apply(ctx: Context, config: Config) {
           qrCode,
           bindTime: new Date(),
           userName,
+          boundPlayerName: userName != null ? String(userName).trim() : undefined,
           rating,
           lastQrCode: qrCode,  // 保存为缓存
           lastQrCodeTime: new Date(),  // 保存时间戳
         })
+        await touchRebindClock(userId)
 
         const successMessage = `✅ 绑定成功！\n` +
                (userName ? `用户名: ${userName}\n` : '') +
@@ -2766,13 +3010,13 @@ export function apply(ctx: Context, config: Config) {
           ? maintenanceMessage
           : (error?.response 
             ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-            : `❌ 绑定失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`)
+            : `❌ 绑定失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`)
         
         const refId = await logOperation({
           command: 'mai绑定',
           session,
           status: 'error',
-          errorMessage: getSafeErrorMessage(error),
+          errorMessage: getSafeErrorMessage(error, session),
           apiResponse: error?.response?.data,
         })
         
@@ -2802,7 +3046,16 @@ export function apply(ctx: Context, config: Config) {
           return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
         }
 
-        // 删除绑定记录（优先删除 bind 统一ID键，兼容旧键）
+        const waitMs = await getRebindWaitMsForBinding(binding)
+        if (waitMs > 0) {
+          return (
+            `❌ 当前处于换绑冷却期内，还需等待约 ${formatBindChangeWaitHuman(waitMs)}。\n` +
+            `请使用 /mai解绑卡 或 /maiunbindkey（需解绑卡额度并验证 SGID），或前往 ${rebindShopUrl()} 购买解绑卡。\n` +
+            `已绑定状态下可使用 /mai兑换卡密 兑换解绑卡。`
+          )
+        }
+
+        await touchRebindClock(binding.userId)
         await removeBindingBySession(ctx, session)
 
         return `✅ 解绑成功！`
@@ -2811,7 +3064,65 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 解绑失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 解绑失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
+      }
+    })
+
+  ctx.command('mai解绑卡', '冷却期内凭解绑卡额度解绑（需 SGID 验证与二次确认）')
+    .alias('maiunbindkey')
+    .action(async ({ session }) => {
+      if (!session) {
+        return '❌ 无法获取会话信息'
+      }
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+      try {
+        const binding = await getBindingBySession(ctx, session)
+        if (!binding) {
+          return '❌ 您还没有绑定账号\n使用 /mai绑定 <SGWCMAID...> 进行绑定'
+        }
+        const waitMs = await getRebindWaitMsForBinding(binding)
+        const credits = binding.unbindCredits ?? 0
+        if (waitMs > 0 && credits <= 0) {
+          return (
+            `❌ 换绑冷却期内且没有解绑卡额度。\n` +
+            `还需等待约 ${formatBindChangeWaitHuman(waitMs)}，或前往 ${rebindShopUrl()} 购买解绑卡后用 /mai兑换卡密 兑换。`
+          )
+        }
+        const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)
+        if (qrTextResult.error) {
+          return `❌ ${qrTextResult.error}`
+        }
+        if (!await promptYesLocal(session, '⚠️ 即将解绑当前舞萌账号，相关功能将无法使用直到再次绑定\n确认继续？')) {
+          return '操作已取消'
+        }
+        if (!await promptYesLocal(session, '二次确认：确定要解绑吗？')) {
+          return '操作已取消'
+        }
+        const fresh = await getBindingBySession(ctx, session)
+        if (!fresh) {
+          return '❌ 绑定记录已变更，请重新执行'
+        }
+        const w2 = await getRebindWaitMsForBinding(fresh)
+        const c2 = fresh.unbindCredits ?? 0
+        if (w2 > 0 && c2 <= 0) {
+          return '❌ 解绑卡额度不足或状态已变更，请重新检查。'
+        }
+        if (w2 > 0) {
+          await ctx.database.set('maibot_bindings', { userId: fresh.userId }, { unbindCredits: c2 - 1 })
+        }
+        await touchRebindClock(fresh.userId)
+        await removeBindingBySession(ctx, session)
+        const left = w2 > 0 ? c2 - 1 : c2
+        return (
+          `✅ 已解绑舞萌账号` +
+          (w2 > 0 ? `\n（已消耗 1 次解绑卡额度，剩余 ${left} 次）` : '')
+        )
+      } catch (error: any) {
+        ctx.logger('maibot').error('解绑卡流程失败:', error)
+        return `❌ 解绑失败: ${getSafeErrorMessage(error, session)}`
       }
     })
 
@@ -2820,6 +3131,7 @@ export function apply(ctx: Context, config: Config) {
    * 用法: /mai状态 [--expired] [@用户id]
    */
   ctx.command('mai状态 [targetUserId:text]', '查询绑定状态')
+    .alias('mymai')
     .userFields(['authority'])
     .option('expired', '--expired  显示过期票券')
     .action(async ({ session, options }, targetUserId) => {
@@ -2841,8 +3153,24 @@ export function apply(ctx: Context, config: Config) {
         }
 
         const userId = binding.userId
+        const primaryAccountId = await getCooldownPrimaryUserId(session)
+        const sessionKeysForPri = await getSessionBindingKeys(ctx, session)
+        const priView = await getPriorityUserDisplayForAnyKey(
+          ctx,
+          sessionKeysForPri.length ? sessionKeysForPri : [primaryAccountId],
+        )
+        const grpView = await getGroupPriorityDisplay(ctx, session)
         let statusInfo = `✅ 已绑定账号\n\n` +
                         `绑定时间: ${new Date(binding.bindTime).toLocaleString('zh-CN')}\n` +
+                        `账户ID（通用）: ${primaryAccountId}\n` +
+                        `授权状态: ${priView.isPriority ? '优先用户' : '普通用户'}\n` +
+                        (priView.isPriority
+                          ? (priView.permanent ? `到期时间: 永久\n` : `到期时间: ${priView.expiresAt!.toLocaleString('zh-CN')}\n`)
+                          : '') +
+                        (grpView.active
+                          ? (`状态：群组优先\n` +
+                            (grpView.permanent ? `本群授权到期：永久\n` : `本群授权到期：${grpView.expiresAt!.toLocaleString('zh-CN')}\n`))
+                          : '') +
                         `🚨 /maialert查看账号提醒状态\n`
 
         // 尝试获取最新状态并更新数据库（需要新二维码）
@@ -3047,7 +3375,7 @@ export function apply(ctx: Context, config: Config) {
           }
         } catch (error: any) {
           logger.warn(`获取票券信息失败: ${sanitizeError(error)}`)
-          statusInfo += `\n\n🎫 票券情况: 获取失败（${getSafeErrorMessage(error)}）`
+          statusInfo += `\n\n🎫 票券情况: 获取失败（${getSafeErrorMessage(error, session)}）`
         }
 
         const refId = await logOperation({
@@ -3057,23 +3385,19 @@ export function apply(ctx: Context, config: Config) {
           status: 'success',
           result: statusInfo,
         })
-        
+
         return appendRefId(statusInfo, refId)
       } catch (error: any) {
         ctx.logger('maibot').error('查询状态失败:', error)
-        const errorMessage = `❌ 查询状态失败: ${getSafeErrorMessage(error)}`
+        const errorMessage = `❌ 查询状态失败: ${getSafeErrorMessage(error, session)}`
         const refId = await logOperation({
           command: 'mai状态',
           session,
           targetUserId,
           status: 'error',
-          errorMessage: getSafeErrorMessage(error),
+          errorMessage: getSafeErrorMessage(error, session),
         })
         return appendRefId(errorMessage, refId)
-        if (maintenanceMode) {
-          return maintenanceMessage
-        }
-        return `❌ 查询失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -3175,7 +3499,7 @@ export function apply(ctx: Context, config: Config) {
           }
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 锁定失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 锁定失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -3262,7 +3586,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 解锁失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 解锁失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -3315,7 +3639,7 @@ export function apply(ctx: Context, config: Config) {
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
-            return `❌ 绑定失败：${getSafeErrorMessage(error)}`
+            return `❌ 绑定失败：${getSafeErrorMessage(error, session)}`
           }
         }
 
@@ -3338,7 +3662,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 绑定失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 绑定失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -3378,7 +3702,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 解绑失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 解绑失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -3430,7 +3754,7 @@ export function apply(ctx: Context, config: Config) {
             if (error.message?.includes('超时') || error.message?.includes('timeout') || error.message?.includes('未收到响应')) {
               return `❌ 输入超时（${actualTimeout / 1000}秒），绑定已取消`
             }
-            return `❌ 绑定失败：${getSafeErrorMessage(error)}`
+            return `❌ 绑定失败：${getSafeErrorMessage(error, session)}`
           }
         }
 
@@ -3453,7 +3777,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 绑定失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 绑定失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -3493,7 +3817,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 解绑失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 解绑失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -3557,33 +3881,6 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（交互式或从绑定中获取）
         const qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         if (qrTextResult.error) {
-          if (qrTextResult.needRebind) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (!rebindResult.success) {
-              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-            }
-            // 重新绑定成功后，使用新的binding
-            const updatedBinding = rebindResult.newBinding || binding
-            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
-            if (retryQrText.error) {
-              return `❌ 获取二维码失败：${retryQrText.error}`
-            }
-            // 在调用API前加入队列
-            await waitForQueue(session)
-            // 使用新的qrText继续
-            await session.send('请求成功提交，请等待服务器响应。（通常需要2-3分钟）')
-            const ticketResult = await api.getTicket(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              multiple,
-              retryQrText.qrText
-            )
-            if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
-              return '❌ 发放功能票失败：服务器返回未成功，请稍后再试'
-            }
-            return `✅ 已发放 ${multiple} 倍票\n请稍等几分钟在游戏内确认`
-          }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
@@ -3621,26 +3918,7 @@ export function apply(ctx: Context, config: Config) {
               retryQrText.qrText
             )
           } else {
-            // 如果API返回失败，可能需要重新绑定
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              // 重新绑定成功，重试获取功能票
-              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              // 在调用API前加入队列
-              await waitForQueue(session)
-              ticketResult = await api.getTicket(
-                machineInfo.regionId,
-                machineInfo.clientId,
-                machineInfo.placeId,
-                multiple,
-                retryQrText.qrText
-              )
-            } else {
-              throw error
-            }
+            throw error
           }
         }
 
@@ -3663,22 +3941,13 @@ export function apply(ctx: Context, config: Config) {
             )
             if (!ticketResult.TicketStatus || !ticketResult.LoginStatus || !ticketResult.LogoutStatus) {
               if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
-                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-                if (rebindResult.success && rebindResult.newBinding) {
-                  return `✅ 重新绑定成功！请重新执行发票操作。`
-                }
-                return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+                return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
               }
               return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
             }
           } else {
-            // 如果返回失败，可能需要重新绑定
             if (!ticketResult.QrStatus || ticketResult.LoginStatus === false) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return `✅ 重新绑定成功！请重新执行发票操作。`
-              }
-              return `❌ 发放功能票失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+              return `❌ 发放功能票失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
             }
             return '❌ 发票失败：服务器返回未成功，请确认是否已在短时间内多次执行发票指令或稍后再试或点击获取二维码刷新账号后再试。'
           }
@@ -3699,13 +3968,13 @@ export function apply(ctx: Context, config: Config) {
           ? maintenanceMessage
           : (error?.response 
             ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
-            : `❌ 发票失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`)
+            : `❌ 发票失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`)
         const refId = await logOperation({
           command: 'mai发票',
           session,
           targetUserId,
           status: 'error',
-          errorMessage: getSafeErrorMessage(error),
+          errorMessage: getSafeErrorMessage(error, session),
           apiResponse: error?.response?.data,
         })
         return appendRefId(errorMessage, refId)
@@ -3796,7 +4065,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 发放舞里程失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 发放舞里程失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -3859,64 +4128,35 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
         let qrTextResult
         if (qrCode) {
-          // 验证qrCode是否有效
           try {
             const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
+            const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+            if (vErr) {
+              return vErr
+            }
+            const patch: Record<string, unknown> = {
+              lastQrCode: qrCode,
+              lastQrCodeTime: new Date(),
+            }
+            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+              patch.boundPlayerName = String(preview.UserName).trim()
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error)}`
+            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
           }
         } else {
-          // 交互式获取
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
         if (qrTextResult.error) {
-          if (qrTextResult.needRebind) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (!rebindResult.success) {
-              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-            }
-            // 重新绑定成功后，使用新的binding
-            const updatedBinding = rebindResult.newBinding || binding
-            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
-            if (retryQrText.error) {
-              return `❌ 获取二维码失败：${retryQrText.error}`
-            }
-            // 在调用API前加入队列
-            const queueMsgIds = await waitForQueue(session)
-            // 使用新的qrText继续
-            const result = await api.uploadB50(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              retryQrText.qrText,
-              binding.fishToken
-            )
-            if (!result.UploadStatus) {
-              if (result.msg === '该账号下存在未完成的任务') {
-                return '⚠️ 当前账号已有未完成的水鱼B50任务，请稍后再试，无需重复上传。'
-              }
-              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
-            }
-            const statsInfo = await getUploadStats('mai上传B50')
-            const statsStr = statsInfo ? `\n${statsInfo}` : ''
-            const successMessage = `✅ B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
-            const refId = await logOperation({
-              command: 'mai上传B50',
-              session,
-              targetUserId,
-              status: 'success',
-              result: successMessage,
-              apiResponse: result,
-            })
-            const msgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
-            scheduleB50Notification(session, result.task_id, refId, [...queueMsgIds, ...msgIds])
-            return ''
-          }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
@@ -3955,27 +4195,7 @@ export function apply(ctx: Context, config: Config) {
               binding.fishToken
             )
           } else {
-            // 如果API返回失败，可能需要重新绑定
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              // 重新绑定成功，重试上传
-              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              // 在调用API前加入队列
-              const retryQueueMsgIds = await waitForQueue(session)
-              processingMsgIds.push(...retryQueueMsgIds)
-              result = await api.uploadB50(
-                machineInfo.regionId,
-                machineInfo.clientId,
-                machineInfo.placeId,
-                retryQrText.qrText,
-                binding.fishToken
-              )
-            } else {
-              throw error
-            }
+            throw error
           }
         }
 
@@ -4009,14 +4229,9 @@ export function apply(ctx: Context, config: Config) {
             if (result.msg === '该账号下存在未完成的任务') {
               return '⚠️ 当前账号已有未完成的水鱼B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
             }
-            // 如果返回失败，可能需要重新绑定
             if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return `✅ 重新绑定成功！请重新执行上传操作。`
-              }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}\n${qrOrLoginFailureHint()}${getErrorHelpInfo()}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
             return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
@@ -4034,7 +4249,7 @@ export function apply(ctx: Context, config: Config) {
           result: successMessage,
           apiResponse: result,
         })
-        
+
         // 发送成功消息并获取消息ID（用于后续撤回）
         const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
         // 合并处理中消息ID和成功消息ID
@@ -4060,7 +4275,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 上传失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 上传失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -4133,22 +4348,31 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
+            const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+            if (vErr) {
+              return vErr
+            }
+            const patch: Record<string, unknown> = {
+              lastQrCode: qrCode,
+              lastQrCodeTime: new Date(),
+            }
+            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+              patch.boundPlayerName = String(preview.UserName).trim()
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error)}`
+            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
           }
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
 
         if (qrTextResult.error) {
-          if (qrTextResult.needRebind) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (!rebindResult.success) {
-              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-            }
-            return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-          }
           return `❌ 获取二维码失败：${qrTextResult.error}`
         }
 
@@ -4188,12 +4412,8 @@ export function apply(ctx: Context, config: Config) {
             if (fishResult.msg === '该账号下存在未完成的任务') {
               results.push('🐟 水鱼: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
             } else if (fishResult.msg?.includes('二维码') || fishResult.msg?.includes('qr_text') || fishResult.msg?.includes('无效')) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-              }
               const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
-              return `❌ 水鱼上传失败：${fishResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              return `❌ 水鱼上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}\n${qrOrLoginFailureHint()}`
             } else {
               const taskIdInfo = fishResult.task_id ? `\n任务ID: ${fishResult.task_id}` : ''
               results.push(`🐟 水鱼: ❌ 上传失败：${fishResult.msg || '未知错误'}${taskIdInfo}`)
@@ -4241,10 +4461,6 @@ export function apply(ctx: Context, config: Config) {
                 results.push(`🐟 水鱼: ✅ B50任务已提交！\n任务ID: ${fishResult.task_id}\n请耐心等待任务完成，预计1-10分钟`)
               }
             } catch (retryError: any) {
-              const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
-              if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-              }
               if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
                 return '🐟 水鱼: ❌ 上传超时，请稍后再试一次。'
               }
@@ -4254,17 +4470,13 @@ export function apply(ctx: Context, config: Config) {
               return `🐟 水鱼: ❌ 上传失败: ${retryError?.message || '未知错误'}`
             }
           } else {
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-            }
             if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
               return '🐟 水鱼: ❌ 上传超时，请稍后再试一次。'
             }
             if (error?.response) {
               return `🐟 水鱼: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`
             }
-            return `🐟 水鱼: ❌ 上传失败: ${getSafeErrorMessage(error)}`
+            return `🐟 水鱼: ❌ 上传失败: ${getSafeErrorMessage(error, session)}`
           }
         }
 
@@ -4304,12 +4516,8 @@ export function apply(ctx: Context, config: Config) {
             if (lxResult.msg === '该账号下存在未完成的任务') {
               results.push('❄️ 落雪: ⚠️ 当前账号已有未完成的B50任务，请稍后再试，无需重复上传。')
             } else if (lxResult.msg?.includes('二维码') || lxResult.msg?.includes('qr_text') || lxResult.msg?.includes('无效')) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-              }
               const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
-              return `❌ 落雪上传失败：${lxResult.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}`
+              return `❌ 落雪上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}\n${qrOrLoginFailureHint()}`
             } else {
               const taskIdInfo = lxResult.task_id ? `\n任务ID: ${lxResult.task_id}` : ''
               results.push(`❄️ 落雪: ❌ 上传失败：${lxResult.msg || '未知错误'}${taskIdInfo}`)
@@ -4366,10 +4574,6 @@ export function apply(ctx: Context, config: Config) {
                   results.push(appendRefId(successMessage, refId))
                 }
               } catch (retryError: any) {
-                const failureResult = await handleApiFailure(session, ctx, api, binding, config, retryError, rebindTimeout)
-                if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-                  return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-                }
                 if (retryError?.code === 'ECONNABORTED' || String(retryError?.message || '').includes('timeout')) {
                   results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
                 } else if (retryError?.response) {
@@ -4380,16 +4584,12 @@ export function apply(ctx: Context, config: Config) {
               }
             }
           } else {
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              return '✅ 重新绑定成功！请重新执行 /maiua 上传操作。'
-            }
             if (error?.code === 'ECONNABORTED' || String(error?.message || '').includes('timeout')) {
               results.push('❄️ 落雪: ❌ 上传超时，请稍后再试一次。')
             } else if (error?.response) {
               results.push(`❄️ 落雪: ❌ API请求失败: ${error.response.status} ${error.response.statusText}`)
             } else {
-              results.push(`❄️ 落雪: ❌ 上传失败: ${getSafeErrorMessage(error)}`)
+              results.push(`❄️ 落雪: ❌ 上传失败: ${getSafeErrorMessage(error, session)}`)
             }
           }
         }
@@ -4407,7 +4607,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 双上传失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 双上传失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -4517,7 +4717,7 @@ export function apply(ctx: Context, config: Config) {
           const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
           return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
         }
-        return `❌ 清票失败\n错误信息： ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 清票失败\n错误信息： ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -4614,39 +4814,37 @@ export function apply(ctx: Context, config: Config) {
         }
 
         // 获取 qr_text：命令带 SGID/链接则校验并使用（并更新缓存）；否则交互式获取或使用缓存（与上传 B50 一致）
-        let qrTextResult: { qrText: string; error?: string; needRebind?: boolean; fromCache?: boolean }
+        let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
             const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            if (binding) {
-              await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-                lastQrCode: qrCode,
-                lastQrCodeTime: new Date(),
-              })
+            const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+            if (vErr) {
+              return vErr
             }
+            const patch: Record<string, unknown> = {
+              lastQrCode: qrCode,
+              lastQrCodeTime: new Date(),
+            }
+            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+              patch.boundPlayerName = String(preview.UserName).trim()
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error)}`
+            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
           }
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
           if (qrTextResult.error) {
-            if (qrTextResult.needRebind) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (!rebindResult.success) {
-                return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-              }
-              const retryQrText = await getQrText(session, ctx, api, rebindResult.newBinding!, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              qrTextResult = retryQrText
-            } else {
-              return `❌ 获取二维码失败：${qrTextResult.error}`
-            }
+            return `❌ 获取二维码失败：${qrTextResult.error}`
           }
         }
 
@@ -4690,27 +4888,7 @@ export function apply(ctx: Context, config: Config) {
               retryQrText.qrText
             )
           } else {
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              await waitForQueue(session)
-              result = await api.getItem(
-                machineInfo.regionId,
-                machineInfo.regionName,
-                machineInfo.clientId,
-                machineInfo.placeId,
-                machineInfo.placeName,
-                parseInt(itemId, 10),
-                itemKind,
-                stockFinal,
-                retryQrText.qrText
-              )
-            } else {
-              throw error
-            }
+            throw error
           }
         }
 
@@ -4735,21 +4913,13 @@ export function apply(ctx: Context, config: Config) {
             )
             if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
               if (!result.QrStatus || result.LoginStatus === false) {
-                const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-                if (rebindResult.success && rebindResult.newBinding) {
-                  return '✅ 重新绑定成功！请重新执行获取收藏品操作。'
-                }
-                return `❌ 获取收藏品失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+                return `❌ 获取收藏品失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
               }
               return '❌ 获取收藏品失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
             }
           } else {
             if (!result.QrStatus || result.LoginStatus === false) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return '✅ 重新绑定成功！请重新执行获取收藏品操作。'
-              }
-              return `❌ 获取收藏品失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+              return `❌ 获取收藏品失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
             }
             return '❌ 获取收藏品失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
           }
@@ -4764,7 +4934,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 获取收藏品失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 获取收藏品失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -4805,39 +4975,37 @@ export function apply(ctx: Context, config: Config) {
 
         const proxyTip = isProxy ? `（代操作用户 ${binding.userId}）` : ''
 
-        let qrTextResult: { qrText: string; error?: string; needRebind?: boolean; fromCache?: boolean }
+        let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
             const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            if (binding) {
-              await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
-                lastQrCode: qrCode,
-                lastQrCodeTime: new Date(),
-              })
+            const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+            if (vErr) {
+              return vErr
             }
+            const patch: Record<string, unknown> = {
+              lastQrCode: qrCode,
+              lastQrCodeTime: new Date(),
+            }
+            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+              patch.boundPlayerName = String(preview.UserName).trim()
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
             qrTextResult = { qrText: qrCode }
           } catch (err: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(err)}`
+            return `❌ 验证二维码失败：${getSafeErrorMessage(err, session)}`
           }
         } else {
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
           if (qrTextResult.error) {
-            if (qrTextResult.needRebind) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (!rebindResult.success) {
-                return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-              }
-              const retryQrText = await getQrText(session, ctx, api, rebindResult.newBinding!, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              qrTextResult = retryQrText
-            } else {
-              return `❌ 获取二维码失败：${qrTextResult.error}`
-            }
+            return `❌ 获取二维码失败：${qrTextResult.error}`
           }
         }
 
@@ -4898,53 +5066,12 @@ export function apply(ctx: Context, config: Config) {
             qrTextResult.qrText
           )
         } catch (error: any) {
-          const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-          if (failureResult.rebindResult?.success && failureResult.rebindResult.newBinding) {
-            const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
-            if (retryQrText.error) {
-              return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-            }
-            await waitForQueue(session)
-            result = await api.editVer(
-              machineInfo.regionId,
-              machineInfo.regionName,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              machineInfo.placeName,
-              romVer,
-              dataVer,
-              retryQrText.qrText
-            )
-          } else {
-            throw error
-          }
+          throw error
         }
 
         if (!result.UserAllStatus || !result.LoginStatus || !result.LogoutStatus) {
           if (!result.QrStatus || result.LoginStatus === false) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (rebindResult.success && rebindResult.newBinding) {
-              const retryQrText = await getQrText(session, ctx, api, rebindResult.newBinding, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              await waitForQueue(session)
-              result = await api.editVer(
-                machineInfo.regionId,
-                machineInfo.regionName,
-                machineInfo.clientId,
-                machineInfo.placeId,
-                machineInfo.placeName,
-                romVer,
-                dataVer,
-                retryQrText.qrText
-              )
-              if (result.UserAllStatus && result.LoginStatus && result.LogoutStatus) {
-                return `✅ 已为 ${maskUserId(binding.maiUid)} 修改版本号${proxyTip}\n机台版本: ${romVer}\n数据版本: ${dataVer}`
-              }
-              return '❌ 修改版本号失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
-            }
-            return `❌ 修改版本号失败：服务器返回未成功\n重新绑定失败：${rebindResult.error || '未知错误'}`
+            return `❌ 修改版本号失败：无法验证登录或二维码状态。\n${qrOrLoginFailureHint()}`
           }
           return '❌ 修改版本号失败：服务器返回未成功，请稍后再试或刷新二维码后再试。'
         }
@@ -4958,7 +5085,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 修改版本号失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 修改版本号失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -5048,7 +5175,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 清空失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 清空失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -5204,7 +5331,7 @@ export function apply(ctx: Context, config: Config) {
           const errorInfo = error.response.data ? JSON.stringify(error.response.data) : `${error.response.status} ${error.response.statusText}`
           return `❌ API请求失败\n错误信息： ${errorInfo}\n\n${maintenanceMessage}`
         }
-        return `❌ 上传失败\n错误信息： ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 上传失败\n错误信息： ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -5280,64 +5407,35 @@ export function apply(ctx: Context, config: Config) {
         // 获取qr_text（如果提供了SGID参数则直接使用，否则交互式获取）
         let qrTextResult
         if (qrCode) {
-          // 验证qrCode是否有效
           try {
             const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
+            const vErr = verifyPreviewMatchesBinding(
+          binding,
+          preview,
+          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
+        )
+            if (vErr) {
+              return vErr
+            }
+            const patch: Record<string, unknown> = {
+              lastQrCode: qrCode,
+              lastQrCodeTime: new Date(),
+            }
+            if (preview.UserName != null && !binding.boundPlayerName?.trim()) {
+              patch.boundPlayerName = String(preview.UserName).trim()
+            }
+            await ctx.database.set('maibot_bindings', { userId: binding.userId }, patch)
             qrTextResult = { qrText: qrCode }
           } catch (error: any) {
-            return `❌ 验证二维码失败：${getSafeErrorMessage(error)}`
+            return `❌ 验证二维码失败：${getSafeErrorMessage(error, session)}`
           }
         } else {
-          // 交互式获取
           qrTextResult = await getQrText(session, ctx, api, binding, config, rebindTimeout)
         }
         if (qrTextResult.error) {
-          if (qrTextResult.needRebind) {
-            const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-            if (!rebindResult.success) {
-              return `❌ 重新绑定失败：${rebindResult.error || '未知错误'}\n请使用 /mai绑定 重新绑定二维码`
-            }
-            // 重新绑定成功后，使用新的binding
-            const updatedBinding = rebindResult.newBinding || binding
-            const retryQrText = await getQrText(session, ctx, api, updatedBinding, config, rebindTimeout)
-            if (retryQrText.error) {
-              return `❌ 获取二维码失败：${retryQrText.error}`
-            }
-            // 在调用API前加入队列
-            const queueMsgIds = await waitForQueue(session)
-            // 使用新的qrText继续
-            const result = await api.uploadLxB50(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
-              retryQrText.qrText,
-              finalLxnsCode
-            )
-            if (!result.UploadStatus) {
-              if (result.msg === '该账号下存在未完成的任务') {
-                return '⚠️ 当前账号已有未完成的落雪B50任务，请稍后再试，无需重复上传。'
-              }
-              const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
-            }
-            const statsInfo = await getUploadStats('mai上传落雪b50')
-            const statsStr = statsInfo ? `\n${statsInfo}` : ''
-            const successMessage = `✅ 落雪B50上传任务已提交！${statsStr}\n任务ID: ${result.task_id}\n\n请耐心等待任务完成，预计1-10分钟`
-            const refId = await logOperation({
-              command: 'mai上传落雪b50',
-              session,
-              targetUserId: actualTargetUserId,
-              status: 'success',
-              result: successMessage,
-              apiResponse: result,
-            })
-            const msgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
-            scheduleLxB50Notification(session, result.task_id, refId, [...queueMsgIds, ...msgIds])
-            return ''
-          }
           return `❌ 获取二维码失败：${qrTextResult.error}${getErrorHelpInfo()}`
         }
 
@@ -5358,14 +5456,12 @@ export function apply(ctx: Context, config: Config) {
             finalLxnsCode
           )
         } catch (error: any) {
-          // 如果使用了缓存且失败，尝试重新获取SGID
           if (usedCache) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
             if (retryQrText.error) {
               return `❌ 获取二维码失败：${retryQrText.error}`
             }
-            // 在调用API前加入队列
             const retryQueueMsgIds = await waitForQueue(session)
             processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
@@ -5376,32 +5472,11 @@ export function apply(ctx: Context, config: Config) {
               finalLxnsCode
             )
           } else {
-            // 如果API返回失败，可能需要重新绑定
-            const failureResult = await handleApiFailure(session, ctx, api, binding, config, error, rebindTimeout)
-            if (failureResult.rebindResult && failureResult.rebindResult.success && failureResult.rebindResult.newBinding) {
-              // 重新绑定成功，重试上传
-              const retryQrText = await getQrText(session, ctx, api, failureResult.rebindResult.newBinding, config, rebindTimeout)
-              if (retryQrText.error) {
-                return `❌ 重新绑定后获取二维码失败：${retryQrText.error}`
-              }
-              // 在调用API前加入队列
-              const retryQueueMsgIds = await waitForQueue(session)
-              processingMsgIds.push(...retryQueueMsgIds)
-              result = await api.uploadLxB50(
-                machineInfo.regionId,
-                machineInfo.clientId,
-                machineInfo.placeId,
-                retryQrText.qrText,
-                finalLxnsCode
-              )
-            } else {
-              throw error
-            }
+            throw error
           }
         }
 
         if (!result.UploadStatus) {
-          // 如果使用了缓存且失败，尝试重新获取SGID
           if (usedCache && (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效'))) {
             logger.info('使用缓存的SGID失败，尝试重新获取SGID')
             const retryQrText = await getQrText(session, ctx, api, binding, config, rebindTimeout, undefined, false)  // 禁用缓存，强制重新输入
@@ -5409,7 +5484,6 @@ export function apply(ctx: Context, config: Config) {
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
               return `❌ 上传失败：${result.msg || '未知错误'}\n获取新二维码失败：${retryQrText.error}${taskIdInfo}`
             }
-            // 在调用API前加入队列
             const retryQueueMsgIds = await waitForQueue(session)
             processingMsgIds.push(...retryQueueMsgIds)
             result = await api.uploadLxB50(
@@ -5430,14 +5504,9 @@ export function apply(ctx: Context, config: Config) {
             if (result.msg === '该账号下存在未完成的任务') {
               return '⚠️ 当前账号已有未完成的落雪B50任务，请耐心等待任务完成，预计1-10分钟，无需重复上传。'
             }
-            // 如果返回失败，可能需要重新绑定
             if (result.msg?.includes('二维码') || result.msg?.includes('qr_text') || result.msg?.includes('无效')) {
-              const rebindResult = await promptForRebind(session, ctx, api, binding, config, rebindTimeout)
-              if (rebindResult.success && rebindResult.newBinding) {
-                return `✅ 重新绑定成功！请重新执行上传操作。`
-              }
               const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
-              return `❌ 上传失败：${result.msg || '未知错误'}\n重新绑定失败：${rebindResult.error || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
+              return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}\n${qrOrLoginFailureHint()}${getErrorHelpInfo()}`
             }
             const taskIdInfo = result.task_id ? `\n任务ID: ${result.task_id}` : ''
             return `❌ 上传失败：${result.msg || '未知错误'}${taskIdInfo}${getErrorHelpInfo()}`
@@ -5455,7 +5524,7 @@ export function apply(ctx: Context, config: Config) {
           result: successMessage,
           apiResponse: result,
         })
-        
+
         // 发送成功消息并获取消息ID（用于后续撤回）
         const successMsgIds = await sendAndGetMessageIds(session, appendRefId(successMessage, refId))
         // 合并处理中消息ID和成功消息ID
@@ -5479,14 +5548,14 @@ export function apply(ctx: Context, config: Config) {
               })()
             : (error?.response 
               ? `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}${getErrorHelpInfo()}`
-              : `❌ 上传失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}${getErrorHelpInfo()}`))
+              : `❌ 上传失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}${getErrorHelpInfo()}`))
         
         const refId = await logOperation({
           command: 'mai上传落雪b50',
           session,
           targetUserId: (typeof actualTargetUserId !== 'undefined' ? actualTargetUserId : targetUserId) || undefined,
           status: 'error',
-          errorMessage: getSafeErrorMessage(error),
+          errorMessage: getSafeErrorMessage(error, session),
           apiResponse: error?.response?.data,
         })
         
@@ -5557,7 +5626,7 @@ export function apply(ctx: Context, config: Config) {
         if (error?.response) {
           return `❌ API请求失败: ${error.response.status} ${error.response.statusText}\n\n${maintenanceMessage}`
         }
-        return `❌ 查询失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 查询失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -6092,7 +6161,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 操作失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -6168,7 +6237,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 操作失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
 
@@ -6280,7 +6349,7 @@ export function apply(ctx: Context, config: Config) {
         if (maintenanceMode) {
           return maintenanceMessage
         }
-        return `❌ 操作失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        return `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
   */
@@ -6377,13 +6446,13 @@ export function apply(ctx: Context, config: Config) {
       logger.error(`管理员一键关闭操作失败: ${sanitizeError(error)}`)
       const errorMessage = maintenanceMode 
         ? maintenanceMessage
-        : `❌ 操作失败: ${getSafeErrorMessage(error)}\n\n${maintenanceMessage}`
+        : `❌ 操作失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       
       const refId = await logOperation({
         command: 'mai管理员一键关闭',
         session,
         status: 'error',
-        errorMessage: getSafeErrorMessage(error),
+        errorMessage: getSafeErrorMessage(error, session),
       })
       
       return appendRefId(errorMessage, refId)
@@ -6450,7 +6519,7 @@ export function apply(ctx: Context, config: Config) {
         return result
       } catch (error: any) {
         logger.error('查询操作记录失败:', error)
-        return `❌ 查询失败: ${getSafeErrorMessage(error)}`
+        return `❌ 查询失败: ${getSafeErrorMessage(error, session)}`
       }
     })
 
@@ -6554,7 +6623,7 @@ export function apply(ctx: Context, config: Config) {
         return result
       } catch (error: any) {
         logger.error('查询统计失败:', error)
-        return `❌ 查询失败: ${getSafeErrorMessage(error)}`
+        return `❌ 查询失败: ${getSafeErrorMessage(error, session)}`
       }
     })
 
@@ -6656,6 +6725,416 @@ export function apply(ctx: Context, config: Config) {
       return updated === 0
         ? 'ℹ️ 没有需要关闭的用户（所有人的 maialert 都已是关闭状态）'
         : `✅ 已强制关闭所有人的 maialert\n关闭的用户数: ${updated}`
+    })
+
+  ctx.command('mai兑换卡密 [code:text]', '兑换卡密（个人/群组/解绑卡；解绑卡需已绑定舞萌）')
+    .userFields(['authority'])
+    .usage(' /mai兑换卡密 <MAI-开头的卡密>  或发送 /mai兑换卡密 后在限时内粘贴卡密。群组卡请在目标群内兑换；解绑卡须先 /mai绑定。')
+    .action(async ({ session }, code) => {
+      if (!session) return '❌ 无法获取会话信息'
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+      const binding = await getBindingBySession(ctx, session)
+      let codeFinal = code?.trim() || ''
+      if (!codeFinal) {
+        await session.send(`请在 ${Math.floor(rebindTimeout / 1000)} 秒内发送要兑换的卡密（可直接粘贴，如 MAI- 开头）`)
+        const ps = await waitForUserReply(session, ctx, rebindTimeout)
+        codeFinal = ps?.content?.trim() || ''
+        if (ps) {
+          await tryRecallMessage(ps, ctx, config, ps.messageId)
+        }
+      }
+      if (!codeFinal) {
+        return '❌ 未收到卡密或已超时\n📖 用法：/mai兑换卡密 <卡密> 或先发 /mai兑换卡密 再粘贴卡密。'
+      }
+      const linkKeys = await getSessionBindingKeys(ctx, session)
+      const uid = linkKeys[0] || String(session.userId || '')
+      if (!uid) return '❌ 无法识别用户身份，请稍后重试'
+      const r = await redeemCardKey(ctx, codeFinal, uid, session, binding?.userId ?? null, linkKeys)
+      if (r.ok) {
+        const keys = await getSessionBindingKeys(ctx, session)
+        await clearUserCooldownsForKeys(ctx, keys)
+      }
+      return r.message
+    })
+
+  ctx.command('mai管理员生成卡密 [durationSpec:text] [count:number]', '生成优先授权卡密（无参为交互式；需要 auth）')
+    .userFields(['authority'])
+    .usage(' 快速：/mai管理员生成卡密 7d 5  或  -g 30d 3  或  -u -1 10\n无参数：发指令后按提示选类型、时长、数量。')
+    .option('group', '-g  群组卡密（须在群内兑换，本群全员群内免冷却）')
+    .option('unbind', '-u  解绑卡（已绑定用户兑换后为当前绑定增加解绑额度；时长参数可填 -1/任意占位）')
+    .action(async ({ session, options }, durationSpec, countInput) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上才能生成卡密`
+      }
+      if (options?.group && options?.unbind) {
+        return '❌ -g 与 -u 不能同时使用'
+      }
+
+      const promptMs = Math.max(90000, rebindTimeout)
+      const durStr = durationSpec != null && String(durationSpec).trim() !== '' ? String(durationSpec).trim() : ''
+      const cntNum = countInput !== undefined && countInput !== null ? Number(countInput) : NaN
+      const hasCountArg = Number.isInteger(cntNum)
+
+      let cardKind: 'personal' | 'group' | 'unbind' = options?.unbind ? 'unbind' : options?.group ? 'group' : 'personal'
+      let parsed: ReturnType<typeof parseCardDurationSpec> | -1
+      let cnt: number
+
+      const needInteractive = !durStr && !hasCountArg
+
+      if (needInteractive) {
+        if (!options?.group && !options?.unbind) {
+          await session.send(
+            '【生成卡密】请选择类型（回复序号或英文）：\n' +
+            '1 = 个人优先\n2 = 群组优先\n3 = 解绑卡\n0 = 取消',
+          )
+          const r1 = await waitForUserReply(session, ctx, promptMs)
+          const ch = parseInteractiveCardKindInput(r1?.content || '')
+          if (ch === null || ch === 'cancel') return '操作已取消或输入无效'
+          cardKind = ch
+        }
+
+        if (cardKind !== 'unbind') {
+          await session.send(
+            '请输入时长，例如：7d、30d、12h、-1 或 永久\n（个人/群组卡密必填）',
+          )
+          const r2 = await waitForUserReply(session, ctx, promptMs)
+          const spec = r2?.content?.trim() || ''
+          const p = parseCardDurationSpec(spec)
+          if (p === null) {
+            return '❌ 时长格式无效。支持：-1/永久、7d、7天、12h、7d12h、1mo/月、1m（天）、1y/年、min/分钟 等'
+          }
+          parsed = p
+        } else {
+          parsed = -1
+        }
+
+        await session.send('请输入生成数量（1–50 的整数，直接发数字）')
+        const r3 = await waitForUserReply(session, ctx, promptMs)
+        const rawC = (r3?.content?.trim() || '').trim()
+        const cn = parseInt(rawC, 10)
+        if (!Number.isInteger(cn) || cn < 1 || cn > 50) {
+          return '❌ 数量须为 1–50 之间的整数'
+        }
+        cnt = cn
+      } else {
+        if (options?.unbind) {
+          parsed = -1
+        } else {
+          const p = parseCardDurationSpec(durStr)
+          if (p === null) {
+            return '❌ 时长格式无效。支持：-1/永久、7d、7天、12h、7d12h、1mo/月、1m（表示 1 天）、1y/年、min/分钟 等组合'
+          }
+          parsed = p
+        }
+        cnt = hasCountArg ? Math.min(50, Math.max(1, cntNum)) : 1
+        if (hasCountArg && cnt !== cntNum) {
+          return '❌ 数量须为 1–50 之间的整数'
+        }
+      }
+
+      const keys = await createCardKeys(ctx, String(session.userId || 'unknown'), parsed, cnt, cardKind)
+      const kindLabel = cardKind === 'group' ? '群组' : cardKind === 'unbind' ? '解绑' : '个人'
+      const durLabel = (k: (typeof keys)[0]) =>
+        cardKind === 'unbind' ? '解绑额度+1' : (k.permanent ? '永久' : `${k.durationMs}ms（约 ${(k.durationMs / 86400000).toFixed(2)} 天）`)
+      const lines = keys.map(k => `${k.code}\t${kindLabel}\t${durLabel(k)}`)
+      const explain =
+        cardKind === 'group'
+          ? '群组卡密仅能在群聊内兑换，兑换后该群全体成员在群内使用指令时免冷却。'
+          : cardKind === 'unbind'
+            ? '解绑卡须用户已绑定舞萌账号后兑换，兑换后为该绑定增加 1 次冷却期内解绑额度（配合 /mai解绑卡）。'
+            : '个人卡密任意环境兑换，兑换后该账号全局享受优先冷却。'
+      return (
+        `✅ 已生成 ${keys.length} 条${kindLabel}卡密（请妥善保管，勿公开）：\n` +
+        `说明：${explain}\n` +
+        lines.join('\n')
+      )
+    })
+
+  ctx.command('mai管理员删除卡密 [code:text]', '作废卡密（无参为交互式；需要 auth）')
+    .userFields(['authority'])
+    .usage(
+      ' 快速：/mai管理员删除卡密 MAI-XXX（可多行粘贴，每行一条；或导出 TSV 整段粘贴）\n无参数：发指令后粘贴，支持批量。',
+    )
+    .action(async ({ session }, code) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      let codeFinal = code?.trim() || ''
+      const promptMs = Math.max(90000, rebindTimeout)
+      if (!codeFinal) {
+        await session.send(
+          `【作废卡密】请在 ${Math.floor(promptMs / 1000)} 秒内发送卡密，一行一条（可多条）；支持粘贴导出 TSV（每行取首列）。\n单独发 0 = 取消`,
+        )
+        const r = await waitForUserReply(session, ctx, promptMs)
+        codeFinal = r?.content?.trim() || ''
+        if (r) {
+          await tryRecallMessage(r, ctx, config, r.messageId)
+        }
+        if (/^0$/u.test(codeFinal)) return '操作已取消'
+      }
+      if (!codeFinal) return '❌ 未收到卡密或已超时'
+
+      const codes = parseBatchVoidCardCodes(codeFinal)
+      if (!codes.length) return '❌ 未解析到有效卡密（需 MAI- 开头，每行一条或 TSV 首列）'
+
+      const voided: string[] = []
+      const notFound: string[] = []
+      const already: string[] = []
+      for (const c of codes) {
+        const rows = await ctx.database.get('maibot_card_keys', { code: c })
+        if (!rows.length) {
+          notFound.push(c)
+          continue
+        }
+        const row = rows[0] as { active?: boolean }
+        if (row.active === false) {
+          already.push(c)
+          continue
+        }
+        await ctx.database.set('maibot_card_keys', { code: c }, { active: false })
+        voided.push(c)
+      }
+
+      const parts: string[] = []
+      if (voided.length) parts.push(`✅ 已作废 ${voided.length} 条：\n${voided.join('\n')}`)
+      if (already.length) parts.push(`ℹ️ 已是作废状态（跳过）${already.length} 条：\n${already.join('\n')}`)
+      if (notFound.length) parts.push(`❌ 未找到 ${notFound.length} 条：\n${notFound.join('\n')}`)
+      return parts.join('\n\n')
+    })
+
+  ctx.command('mai管理员导出卡密 [scope:text]', '导出卡密（无参为交互筛选；制表符文本）')
+    .userFields(['authority'])
+    .usage(' 快速：/mai管理员导出卡密 all|unused|redeemed\n无参数：按提示选「兑换状态」与「卡密类型」。')
+    .action(async ({ session }, scope) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+
+      const promptMs = Math.max(90000, rebindTimeout)
+      let sc: 'all' | 'unused' | 'redeemed' = 'all'
+      let kindFilter: ExportKindFilterChoice = 'all'
+
+      const scopeArg = scope?.trim() || ''
+      if (scopeArg) {
+        const low = scopeArg.toLowerCase()
+        if (low === 'unused' || low === '未使用') sc = 'unused'
+        else if (low === 'redeemed' || low === '已兑换') sc = 'redeemed'
+        else if (low === 'all' || low === '全部') sc = 'all'
+        else {
+          return '❌ 范围参数无效。请使用 all / unused / redeemed，或不带参数进入交互。'
+        }
+      } else {
+        await session.send(
+          '【导出卡密】第一步：请选择兑换状态（回复序号）：\n' +
+          '1 = 全部记录\n2 = 仅未使用（有效且未兑换）\n3 = 仅已兑换\n0 = 取消',
+        )
+        const r1 = await waitForUserReply(session, ctx, promptMs)
+        const ch1 = parseExportScopeInput(r1?.content || '')
+        if (ch1 === null || ch1 === 'cancel') return '操作已取消或输入无效'
+        sc = ch1
+
+        await session.send(
+          '第二步：是否按卡密类型再筛选？（回复序号）\n' +
+          '1 = 不筛选（全部类型）\n2 = 仅个人优先卡\n3 = 仅群组卡\n4 = 仅解绑卡\n0 = 取消',
+        )
+        const r2 = await waitForUserReply(session, ctx, promptMs)
+        const ch2 = parseExportKindFilterInput(r2?.content || '')
+        if (ch2 === null || ch2 === 'cancel') return '操作已取消或输入无效'
+        kindFilter = ch2
+      }
+
+      const all = await ctx.database.get('maibot_card_keys', {})
+      const filtered = all.filter((row) => {
+        const redeemed = !!row.redeemedAt
+        if (sc === 'unused' && (redeemed || !row.active)) return false
+        if (sc === 'redeemed' && !redeemed) return false
+        if (kindFilter !== 'all') {
+          const rk = rowCardKindOf(row as { cardKind?: string })
+          if (kindFilter !== rk) return false
+        }
+        return true
+      })
+      const header = [
+        'code',
+        'cardKind',
+        'permanent',
+        'durationMs',
+        'active',
+        'createdAt',
+        'issuerUserId',
+        'redeemedAt',
+        'redeemerUserId',
+      ].join('\t')
+      const lines = filtered.map((row) =>
+        [
+          row.code,
+          (row as { cardKind?: string }).cardKind === 'group'
+            ? 'group'
+            : (row as { cardKind?: string }).cardKind === 'unbind'
+              ? 'unbind'
+              : 'personal',
+          row.permanent ? '1' : '0',
+          String(row.durationMs),
+          row.active ? '1' : '0',
+          row.createdAt ? new Date(row.createdAt).toISOString() : '',
+          row.issuerUserId || '',
+          row.redeemedAt ? new Date(row.redeemedAt).toISOString() : '',
+          row.redeemerUserId || '',
+        ].join('\t'),
+      )
+      const body = [header, ...lines].join('\n')
+      const maxLen = 3200
+      const scLabel = sc === 'all' ? '全部' : sc === 'unused' ? '未使用' : '已兑换'
+      const kLabel =
+        kindFilter === 'all' ? '全部类型' : kindFilter === 'personal' ? '个人' : kindFilter === 'group' ? '群组' : '解绑'
+      if (body.length <= maxLen) {
+        return `共 ${filtered.length} 条（状态：${scLabel}，类型：${kLabel}）\n` + body
+      }
+      await session.send(`共 ${filtered.length} 条（状态：${scLabel}，类型：${kLabel}），将分多条发送`)
+      for (let i = 0; i < body.length; i += maxLen) {
+        await session.send(body.slice(i, i + maxLen))
+      }
+      return ''
+    })
+
+  ctx.command('mai取消群组优先', '取消本群群组优先（仅群组卡兑换人）')
+    .action(async ({ session }) => {
+      if (!session) return '❌ 无法获取会话信息'
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+      const gkey = canonicalGuildPriorityKey(session)
+      if (!gkey) return '❌ 请在群聊内使用本指令。'
+      const keys = await getSessionBindingKeys(ctx, session)
+      const r = await userCancelGroupPriority(ctx, gkey, keys)
+      return r.message
+    })
+
+  ctx.command('mai群组优先换绑', '发起将本群群组优先迁移到其他群（仅兑换人）')
+    .action(async ({ session }) => {
+      if (!session) return '❌ 无法获取会话信息'
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+      const r = await startGroupPriorityRebind(ctx, session, async (s) => getSessionBindingKeys(ctx, s))
+      return r.message
+    })
+
+  ctx.command('mai群组优先换入', '在目标群完成群组优先换绑')
+    .alias('mai群组优先换绑完成')
+    .action(async ({ session }) => {
+      if (!session) return '❌ 无法获取会话信息'
+      const whitelistCheck = checkWhitelist(session, config)
+      if (!whitelistCheck.allowed) {
+        return whitelistCheck.message || '本群暂时没有被授权使用本Bot的功能，请添加官方群聊1072033605。'
+      }
+      const r = await completeGroupPriorityRebind(ctx, session, async (s) => getSessionBindingKeys(ctx, s))
+      return r.message
+    })
+
+  ctx.command('mai管理员取消群组优先 [guildKey:text]', '取消指定群或当前群的群组优先')
+    .userFields(['authority'])
+    .action(async ({ session }, guildKey) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      const gk = (guildKey?.trim() || canonicalGuildPriorityKey(session) || '').trim()
+      if (!gk) {
+        return '❌ 请填写群标识（如 qq:123456），或在群聊内使用并不带参数。'
+      }
+      const did = await adminRemoveGroupPriorityRow(ctx, gk)
+      return did ? `✅ 已取消群组优先：${gk}` : `ℹ️ 该群无群组优先记录：${gk}`
+    })
+
+  ctx.command('mai管理员取消个人优先 <targetUserId:text>', '清除目标用户的个人优先记录')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      if (!targetUserId?.trim()) {
+        return '❌ 请指定用户，例如：/mai管理员取消个人优先 @用户 或 数字ID'
+      }
+      const candidates = await resolveCooldownKeyCandidatesForBypass(session, targetUserId)
+      if (!candidates.length) {
+        return '❌ 无法解析目标用户，请使用 @用户 或数字 ID'
+      }
+      const n = await adminRemovePersonalPriorityRows(ctx, candidates)
+      return `✅ 已清除 ${n} 条个人优先记录。\n匹配键：${candidates.join('、')}`
+    })
+
+  ctx.command('mai管理员设置个人优先 <targetUserId:text> <spec:text>', '设置个人优先：永久 / 时长 / clear')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId, spec) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      if (!targetUserId?.trim() || !spec?.trim()) {
+        return '❌ 用法：/mai管理员设置个人优先 <@或ID> <永久|7d|clear>'
+      }
+      const sp = parsePriorityAdminSpec(spec)
+      if (sp === null) {
+        return '❌ 无效的 spec，示例：永久、7d、30d、clear'
+      }
+      const candidates = await resolveCooldownKeyCandidatesForBypass(session, targetUserId)
+      if (!candidates.length) {
+        return '❌ 无法解析目标用户'
+      }
+      const r = await adminSetPersonalPriorityForUserIds(ctx, candidates, sp)
+      return r.message
+    })
+
+  ctx.command('mai管理员设置群组优先 <spec:text>', '直接设置群组优先（-g 指定群，默认当前群）')
+    .userFields(['authority'])
+    .option('guild', '-g <guildKey:string> 群标识，如 qq:群号')
+    .action(async ({ session, options }, spec) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      if (!spec?.trim()) {
+        return '❌ 用法：/mai管理员设置群组优先 <永久|7d|clear> [-g 群标识]'
+      }
+      const sp = parsePriorityAdminSpec(spec)
+      if (sp === null) {
+        return '❌ 无效的 spec，示例：永久、7d、clear'
+      }
+      const gk = (String(options?.guild ?? '').trim() || canonicalGuildPriorityKey(session) || '').trim()
+      if (!gk) {
+        return '❌ 请使用 -g 指定群标识（platform:guildId），或在群聊内执行。'
+      }
+      const r = await adminSetGroupPriorityForGuild(ctx, gk, sp)
+      return r.message
+    })
+
+  ctx.command('maibypass <targetUserId:text>', '清除指定用户的全部指令冷却（需要 auth 等级，默认 4）')
+    .alias('mai管理员清除冷却')
+    .userFields(['authority'])
+    .action(async ({ session }, targetUserId) => {
+      if (!session) return '❌ 无法获取会话信息'
+      if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
+        return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
+      }
+      if (!targetUserId?.trim()) {
+        return '❌ 请指定用户，例如：/maibypass @123456 或 /maibypass 123456'
+      }
+      const candidates = await resolveCooldownKeyCandidatesForBypass(session, targetUserId)
+      if (!candidates.length) {
+        return '❌ 无法解析目标用户，请使用 @用户 或数字 ID'
+      }
+      const removed = await clearUserCooldownsForKeys(ctx, candidates)
+      return `✅ 已清除 ${removed} 条冷却记录。\n尝试匹配的用户键：${candidates.join('、')}`
     })
 }
 
