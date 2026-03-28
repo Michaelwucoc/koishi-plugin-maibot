@@ -4,100 +4,55 @@ export function normalizePreviewUserId(userId: string | number): string {
   return String(userId)
 }
 
-/** 与插件配置 bindingPlayerNameMatch 对应 */
-export interface BindingPlayerNameMatchConfig {
-  /** 0–100：规范化后玩家名相似度下限（编辑距离比值×100）。100 须完全一致 */
-  minSimilarityPercent?: number
+/** 老版本密钥存库的 maiUid 常见以 Base64 前缀 MDk（即 ASCII「097…」）开头 */
+export function isLegacyMdkMaiUid(boundUid: string): boolean {
+  return String(boundUid).startsWith('MDk')
 }
 
-export interface BindingNameMatchOptions {
-  minSimilarityPercent: number
-}
-
-const DEFAULT_MIN_SIMILARITY = 100
-
-export function resolveBindingNameMatchOptions(
-  cfg?: BindingPlayerNameMatchConfig,
-): BindingNameMatchOptions {
-  let p = cfg?.minSimilarityPercent
-  if (typeof p !== 'number' || Number.isNaN(p)) p = DEFAULT_MIN_SIMILARITY
-  p = Math.min(100, Math.max(0, p))
-  return { minSimilarityPercent: p }
-}
-
-/** 玩家名规范化：去首尾空白 + Unicode NFKC（全角英数、兼容字符等与半角统一） */
-export function normalizePlayerNameForMatch(name: string): string {
-  return name.normalize('NFKC').trim()
-}
-
-function levenshtein(a: string, b: string): number {
-  const m = a.length
-  const n = b.length
-  if (m === 0) return n
-  if (n === 0) return m
-  const dp = new Uint32Array(n + 1)
-  for (let j = 0; j <= n; j++) dp[j] = j
-  for (let i = 1; i <= m; i++) {
-    let prev = dp[0]
-    dp[0] = i
-    for (let j = 1; j <= n; j++) {
-      const tmp = dp[j]
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1
-      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost)
-      prev = tmp
+export type VerifyPreviewBindingResult =
+  | { ok: true }
+  | { ok: false; message: string }
+  | {
+      ok: true
+      migratedToUid: string
+      notice: string
     }
-  }
-  return dp[n]
-}
-
-/** 0–1，分母为 max(len)；用于短玩家名 */
-export function playerNameSimilarityRatio(a: string, b: string): number {
-  if (a === b) return 1
-  const maxLen = Math.max(a.length, b.length)
-  if (maxLen === 0) return 1
-  return Math.max(0, 1 - levenshtein(a, b) / maxLen)
-}
 
 /**
- * 校验 preview 与绑定是否为同一街机账号（加密 UserID + 可选绑定时的玩家名）
- * @param nameMatch 玩家名：先 NFKC 规范化，再按 minSimilarityPercent 比较编辑距离比值
+ * 校验 preview 与绑定是否为同一街机账号：比较绑定记录的 maiUid 与二维码 preview 的 UserID。
+ * 绑定为老格式（maiUid 以 MDk 开头）且与二维码 UID 不一致时，视为同账号升级格式，返回 ok + 迁移信息（由调用方写库并提示）。
  */
 export function verifyPreviewMatchesBinding(
   binding: UserBinding,
   preview: { UserID: string | number; UserName?: string },
-  nameMatch: BindingNameMatchOptions = resolveBindingNameMatchOptions(),
-): string | null {
+): VerifyPreviewBindingResult {
   const pid = normalizePreviewUserId(preview.UserID)
   if (pid === '-1' || preview.UserID === -1) {
-    return '❌ 无效或过期的二维码，无法完成验证。'
+    return { ok: false, message: '❌ 无效或过期的二维码，无法完成验证。请重新获取玩家二维码后重试。' }
   }
-  if (String(binding.maiUid) !== pid) {
-    return '❌ 当前二维码对应的街机账号与绑定不一致，请使用已绑定账号本人微信获取的二维码。'
+  const boundUid = String(binding.maiUid)
+  if (boundUid === pid) {
+    return { ok: true }
   }
-  const boundName = binding.boundPlayerName?.trim()
-  if (!boundName || preview.UserName === undefined) {
-    return null
+  if (isLegacyMdkMaiUid(boundUid)) {
+    return {
+      ok: true,
+      migratedToUid: pid,
+      notice:
+        `💾 街机账号 UID 不一致：\n` +
+        `• 当前绑定记录的 UID：${boundUid}\n` +
+        `• 当前二维码对应的 UID：${pid}\n` +
+        `已为您自动迁移到新格式。`,
+    }
   }
-  const current = String(preview.UserName).trim()
-  const na = normalizePlayerNameForMatch(boundName)
-  const nb = normalizePlayerNameForMatch(current)
-  if (!na) {
-    return null
+  return {
+    ok: false,
+    message:
+      `❌ 街机账号 UID 不一致：\n` +
+      `• 当前绑定记录的 UID：${boundUid}\n` +
+      `• 当前二维码对应的 UID：${pid}\n` +
+      `若您已更换游戏账号，请使用 /mai解绑 后重新绑定（换绑冷却期内请使用 /mai解绑卡）。`,
   }
-  if (!nb) {
-    return `❌ 玩家名与绑定记录不一致（绑定为「${boundName}」，当前玩家名为空）。如已改名请使用解绑卡流程后重新绑定。`
-  }
-  const min = nameMatch.minSimilarityPercent
-  const ratio = playerNameSimilarityRatio(na, nb)
-  const pct = ratio * 100
-  if (pct + 1e-9 >= min) {
-    return null
-  }
-  const minDisp = Number.isInteger(min) ? String(min) : min.toFixed(1)
-  if (min >= 100) {
-    return `❌ 玩家名与绑定记录不一致（绑定为「${boundName}」，当前为「${current}」）。如已改名请使用解绑卡流程后重新绑定。`
-  }
-  return `❌ 玩家名与绑定记录不一致（绑定为「${boundName}」，当前为「${current}」）。规范化后相似度约 ${pct.toFixed(0)}%（要求≥${minDisp}%）。可在插件配置中调低「玩家名最低相似度」或解绑后重新绑定。`
 }
 
 /** lastStateAt：maibot_user_rebind_state.lastBindChangeAt；bindTime：当前绑定记录的 bindTime（无绑定则 0） */

@@ -3,8 +3,8 @@ import { MaiBotAPI } from './api'
 import {
   formatBindChangeWaitHuman,
   msUntilBindChangeAllowed,
-  resolveBindingNameMatchOptions,
   verifyPreviewMatchesBinding,
+  type VerifyPreviewBindingResult,
 } from './binding-verify'
 import { extendDatabase, UserBinding } from './database'
 import {
@@ -100,11 +100,6 @@ export interface Config {
   rebindPolicy?: {
     minDaysBetweenBindChange: number
     shopUrl?: string
-  }
-  /** SGID / preview 校验时：绑定快照玩家名与当前玩家名的匹配（含 /mai状态、mymai 等） */
-  bindingPlayerNameMatch?: {
-    /** 0–100：NFKC 规范化后，编辑距离相似度下限；100 为须完全一致。全角如 Ｍｉｌｋ 与半角 Milk 在 100 下通常视为一致 */
-    minSimilarityPercent: number
   }
 }
 
@@ -226,17 +221,6 @@ export const Config: Schema<Config> = Schema.object({
     minDaysBetweenBindChange: 30,
     shopUrl: '',
   }),
-  bindingPlayerNameMatch: Schema.object({
-    minSimilarityPercent: Schema.number()
-      .default(100)
-      .min(0)
-      .max(100)
-      .description(
-        '玩家名最低相似度（0–100）。先进行 Unicode NFKC 规范化（全角/半角英数字统一）再按编辑距离计算；100 表示须完全一致。略低于 100 可容忍少量字符差异（改名、显示差异等）。',
-      ),
-  })
-    .description('绑定记录中的玩家名与 preview 的校验（maiUid 一致时的第二道校验）')
-    .default({ minSimilarityPercent: 100 }),
 })
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
@@ -324,6 +308,40 @@ function getSessionCommandUsageHint(session?: Session): string {
 
 function isMaiPluginCommandName(name: string): boolean {
   return name.trim().startsWith('mai')
+}
+
+/**
+ * <spec:text> 会把「clear -g 群号」整段吃成一个参数；从首尾拆出 -g 群标识，并与 .option('-g') 合并（优先已解析的 -g）。
+ */
+function splitGroupPrioritySpecAndGuild(
+  specRaw: string | undefined,
+  optionGuild: string | undefined,
+): { spec: string; guild: string } {
+  let specStr = (specRaw ?? '').trim()
+  let guild = String(optionGuild ?? '').trim()
+
+  const lead = specStr.match(/^\s*-g\s+(\S+)\s+([\s\S]+)$/i)
+  if (lead) {
+    if (!guild) guild = lead[1]
+    specStr = lead[2].trim()
+  }
+
+  const tail = specStr.match(/^([\s\S]+?)\s+-g\s+(\S+)\s*$/i)
+  if (tail) {
+    specStr = tail[1].trim()
+    if (!guild) guild = tail[2]
+  }
+
+  return { spec: specStr, guild }
+}
+
+/** 群优先表里的 guildKey 多为 platform:guildId；仅填数字时按当前会话平台补前缀 */
+function normalizeGuildKeyForPriority(gk: string, session: Session): string {
+  const t = gk.trim()
+  if (!t) return t
+  if (!/^\d+$/.test(t)) return t
+  const p = String(session.platform || '').trim().toLowerCase()
+  return p ? `${p}:${t}` : t
 }
 
 async function computeMaiCommandUsageHint(command: any, session: Session): Promise<string> {
@@ -1401,6 +1419,25 @@ async function waitForUserReply(
   })
 }
 
+/** 处理 preview 校验结果：拦截错误、老 MDk* maiUid 自动迁移并同步内存中的 binding */
+async function applyVerifyPreviewBinding(
+  ctx: Context,
+  binding: UserBinding,
+  result: VerifyPreviewBindingResult,
+  logger: ReturnType<Context['logger']>,
+): Promise<
+  { blocked: true; message: string } | { blocked: false; migrationNotice?: string }
+> {
+  if (!result.ok) return { blocked: true, message: result.message }
+  if ('migratedToUid' in result) {
+    await ctx.database.set('maibot_bindings', { userId: binding.userId }, { maiUid: result.migratedToUid })
+    ;(binding as UserBinding).maiUid = result.migratedToUid
+    logger.info(`maiUid 老格式(MDk*) 已自动迁移 userId=${binding.userId}`)
+    return { blocked: false, migrationNotice: result.notice }
+  }
+  return { blocked: false }
+}
+
 /**
  * 获取二维码文本（qr_text）
  * 有有效缓存则直接用；缓存过期则直接问用户发送 SGID/链接
@@ -1426,12 +1463,10 @@ async function getQrText(
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
       try {
         const previewCached = await api.getPreview(config.machineInfo.clientId, binding.lastQrCode)
-        const vErr = verifyPreviewMatchesBinding(
-          binding,
-          previewCached,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-        if (!vErr) {
+        const vr = verifyPreviewMatchesBinding(binding, previewCached)
+        const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
+        if (!hv.blocked) {
+          if (hv.migrationNotice) await session.send(hv.migrationNotice)
           if (previewCached.UserName != null && !binding.boundPlayerName?.trim()) {
             await ctx.database.set('maibot_bindings', { userId: binding.userId }, {
               boundPlayerName: String(previewCached.UserName).trim(),
@@ -1549,15 +1584,13 @@ async function getQrText(
         return { qrText: '', error: '无效或过期的二维码' }
       }
       if (binding) {
-        const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-        if (vErr) {
-          await session.send(vErr)
-          return { qrText: '', error: vErr }
+        const vr = verifyPreviewMatchesBinding(binding, preview)
+        const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
+        if (hv.blocked) {
+          await session.send(hv.message)
+          return { qrText: '', error: hv.message }
         }
+        if (hv.migrationNotice) await session.send(hv.migrationNotice)
         const patch: Record<string, unknown> = {
           qrCode: qrText,
           lastQrCode: qrText,
@@ -2665,7 +2698,7 @@ export function apply(ctx: Context, config: Config) {
   /mai管理员取消群组优先 [群标识] — 取消群组优先；省略时在群内则针对当前群
   /mai管理员取消个人优先 <@或ID> — 清除个人优先记录
   /mai管理员设置个人优先 <@或ID> <spec> — spec：永久、7d、clear 等
-  /mai管理员设置群组优先 <spec> [-g 群标识] — 直接改群组优先；spec：永久、7d、clear；-g 省略且群内则当前群
+  /mai管理员设置群组优先 <spec> [-g 群标识] — spec 与 -g 可同一段输入（如 clear -g qq:群号）；纯数字 -g 会按当前平台补前缀；-g 省略且在群内则当前群
   /maibypass <@用户|用户ID> — 清除该用户当前全部指令冷却（别名 /mai管理员清除冷却）`
       }
 
@@ -4133,14 +4166,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-            if (vErr) {
-              return vErr
+            const vr = verifyPreviewMatchesBinding(binding, preview)
+            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
+            if (hv.blocked) {
+              return hv.message
             }
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
             const patch: Record<string, unknown> = {
               lastQrCode: qrCode,
               lastQrCodeTime: new Date(),
@@ -4348,14 +4379,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-            if (vErr) {
-              return vErr
+            const vr = verifyPreviewMatchesBinding(binding, preview)
+            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
+            if (hv.blocked) {
+              return hv.message
             }
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
             const patch: Record<string, unknown> = {
               lastQrCode: qrCode,
               lastQrCodeTime: new Date(),
@@ -4821,14 +4850,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-            if (vErr) {
-              return vErr
+            const vr = verifyPreviewMatchesBinding(binding, preview)
+            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
+            if (hv.blocked) {
+              return hv.message
             }
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
             const patch: Record<string, unknown> = {
               lastQrCode: qrCode,
               lastQrCodeTime: new Date(),
@@ -4982,14 +5009,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-            if (vErr) {
-              return vErr
+            const vr = verifyPreviewMatchesBinding(binding, preview)
+            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
+            if (hv.blocked) {
+              return hv.message
             }
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
             const patch: Record<string, unknown> = {
               lastQrCode: qrCode,
               lastQrCodeTime: new Date(),
@@ -5412,14 +5437,12 @@ export function apply(ctx: Context, config: Config) {
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
-            const vErr = verifyPreviewMatchesBinding(
-          binding,
-          preview,
-          resolveBindingNameMatchOptions(config.bindingPlayerNameMatch),
-        )
-            if (vErr) {
-              return vErr
+            const vr = verifyPreviewMatchesBinding(binding, preview)
+            const hv = await applyVerifyPreviewBinding(ctx, binding, vr, ctx.logger('maibot'))
+            if (hv.blocked) {
+              return hv.message
             }
+            if (hv.migrationNotice) await session.send(hv.migrationNotice)
             const patch: Record<string, unknown> = {
               lastQrCode: qrCode,
               lastQrCodeTime: new Date(),
@@ -7097,20 +7120,27 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command('mai管理员设置群组优先 <spec:text>', '直接设置群组优先（-g 指定群，默认当前群）')
     .userFields(['authority'])
+    .usage(
+      ' 示例：/mai管理员设置群组优先 clear -g qq:5911013814031454\n' +
+        '或：/mai管理员设置群组优先 -g qq:5911013814031454 永久\n' +
+        '（仅数字群号时请写 qq:群号；在群内执行可省略 -g）',
+    )
     .option('guild', '-g <guildKey:string> 群标识，如 qq:群号')
     .action(async ({ session, options }, spec) => {
       if (!session) return '❌ 无法获取会话信息'
       if ((session.user?.authority ?? 0) < authLevelForCardAdmin) {
         return `❌ 权限不足，需要 auth 等级 ${authLevelForCardAdmin} 以上`
       }
-      if (!spec?.trim()) {
+      const { spec: specOnly, guild: guildOpt } = splitGroupPrioritySpecAndGuild(spec, options?.guild)
+      if (!specOnly) {
         return '❌ 用法：/mai管理员设置群组优先 <永久|7d|clear> [-g 群标识]'
       }
-      const sp = parsePriorityAdminSpec(spec)
+      const sp = parsePriorityAdminSpec(specOnly)
       if (sp === null) {
         return '❌ 无效的 spec，示例：永久、7d、clear'
       }
-      const gk = (String(options?.guild ?? '').trim() || canonicalGuildPriorityKey(session) || '').trim()
+      let gk = (guildOpt.trim() || canonicalGuildPriorityKey(session) || '').trim()
+      gk = normalizeGuildKeyForPriority(gk, session)
       if (!gk) {
         return '❌ 请使用 -g 指定群标识（platform:guildId），或在群聊内执行。'
       }
