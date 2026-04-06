@@ -5,22 +5,32 @@ export interface ApiConfig {
   timeout?: number
   retryCount?: number
   retryDelay?: number
+  /** team：自建服务 `/api/public`；public：AWMC 网关 `/v1` + Bearer */
+  apiStyle?: 'team' | 'public'
+  /** apiStyle 为 public 时必填，对应网关 `Authorization: Bearer <令牌>` */
+  bearerToken?: string
 }
 
 export class MaiBotAPI {
   private client: AxiosInstance
   private retryCount: number
   private retryDelay: number
+  private apiStyle: 'team' | 'public'
 
   constructor(config: ApiConfig) {
     this.retryCount = config.retryCount ?? 5
     this.retryDelay = config.retryDelay ?? 1000
+    this.apiStyle = config.apiStyle ?? 'team'
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    }
+    if (this.apiStyle === 'public' && config.bearerToken) {
+      headers.Authorization = `Bearer ${config.bearerToken}`
+    }
     this.client = axios.create({
       baseURL: config.baseURL || 'http://localhost:5566',
       timeout: config.timeout || 30000,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
     })
     this.setupRetry()
   }
@@ -62,7 +72,8 @@ export class MaiBotAPI {
     serverTime?: number
     result?: string
   }> {
-    const response = await this.client.get('/api/public/mai_ping')
+    const path = this.apiStyle === 'public' ? '/v1/mai_ping' : '/api/public/mai_ping'
+    const response = await this.client.get(path)
     return response.data
   }
 
@@ -82,12 +93,12 @@ export class MaiBotAPI {
     DataVersion?: string
     RomVersion?: string
   }> {
-    const response = await this.client.get('/api/public/get_preview', {
-      params: {
-        client_id: clientId,
-        qr_text: qrText,
-      },
-    })
+    const path = this.apiStyle === 'public' ? '/v1/get_preview' : '/api/public/get_preview'
+    const params =
+      this.apiStyle === 'public'
+        ? { qr_text: qrText }
+        : { client_id: clientId, qr_text: qrText }
+    const response = await this.client.get(path, { params })
     return response.data
   }
 
@@ -110,15 +121,18 @@ export class MaiBotAPI {
     userID?: string
     token?: string
   }> {
-    const response = await this.client.post('/api/public/upload_b50', null, {
-      params: {
-        region_id: regionId,
-        client_id: clientId,
-        place_id: placeId,
-        qr_text: qrText,
-        fish_token: fishToken,
-      },
-    })
+    const path = this.apiStyle === 'public' ? '/v1/upload_b50' : '/api/public/upload_b50'
+    const params =
+      this.apiStyle === 'public'
+        ? { qr_text: qrText, fish_token: fishToken }
+        : {
+            region_id: regionId,
+            client_id: clientId,
+            place_id: placeId,
+            qr_text: qrText,
+            fish_token: fishToken,
+          }
+    const response = await this.client.post(path, null, { params })
     return response.data
   }
 
@@ -134,7 +148,9 @@ export class MaiBotAPI {
     task_id?: number
     task_status?: string
   }> {
-    const response = await this.client.get('/api/public/get_b50_task_status', {
+    const path =
+      this.apiStyle === 'public' ? '/v1/get_b50_task_status' : '/api/public/get_b50_task_status'
+    const response = await this.client.get(path, {
       params: { mai_uid: maiUid },
     })
     return response.data
@@ -156,7 +172,9 @@ export class MaiBotAPI {
     logout_status?: boolean | null
     done: boolean
   }> {
-    const response = await this.client.get('/api/public/get_b50_task_byid', {
+    const path =
+      this.apiStyle === 'public' ? '/v1/get_b50_task_byid' : '/api/public/get_b50_task_byid'
+    const response = await this.client.get(path, {
       params: { task_id: taskId },
       ...(timeout ? { timeout } : {}),
     })
@@ -182,15 +200,18 @@ export class MaiBotAPI {
     userID?: string
     token?: string
   }> {
-    const response = await this.client.post('/api/public/upload_lx_b50', null, {
-      params: {
-        region_id: regionId,
-        client_id: clientId,
-        place_id: placeId,
-        qr_text: qrText,
-        lxns_code: lxnsCode,
-      },
-    })
+    const path = this.apiStyle === 'public' ? '/v1/upload_lx_b50' : '/api/public/upload_lx_b50'
+    const params =
+      this.apiStyle === 'public'
+        ? { qr_text: qrText, lxns_code: lxnsCode }
+        : {
+            region_id: regionId,
+            client_id: clientId,
+            place_id: placeId,
+            qr_text: qrText,
+            lxns_code: lxnsCode,
+          }
+    const response = await this.client.post(path, null, { params })
     return response.data
   }
 
@@ -206,7 +227,11 @@ export class MaiBotAPI {
     task_id?: number
     task_status?: string
   }> {
-    const response = await this.client.get('/api/public/get_lx_b50_task_status', {
+    const path =
+      this.apiStyle === 'public'
+        ? '/v1/get_lx_b50_task_status'
+        : '/api/public/get_lx_b50_task_status'
+    const response = await this.client.get(path, {
       params: { mai_uid: maiUid },
     })
     return response.data
@@ -228,7 +253,11 @@ export class MaiBotAPI {
     logout_status?: boolean | null
     done: boolean
   }> {
-    const response = await this.client.get('/api/public/get_lx_b50_task_byid', {
+    const path =
+      this.apiStyle === 'public'
+        ? '/v1/get_lx_b50_task_byid'
+        : '/api/public/get_lx_b50_task_byid'
+    const response = await this.client.get(path, {
       params: { task_id: taskId },
       ...(timeout ? { timeout } : {}),
     })
@@ -368,14 +397,17 @@ export class MaiBotAPI {
       stock: number
     }>
   }> {
-    const response = await this.client.get('/api/public/get_charge', {
-      params: {
-        region_id: regionId,
-        client_id: clientId,
-        place_id: placeId,
-        qr_text: qrText,
-      },
-    })
+    const path = this.apiStyle === 'public' ? '/v1/get_charge' : '/api/public/get_charge'
+    const params =
+      this.apiStyle === 'public'
+        ? { qr_text: qrText }
+        : {
+            region_id: regionId,
+            client_id: clientId,
+            place_id: placeId,
+            qr_text: qrText,
+          }
+    const response = await this.client.get(path, { params })
     return response.data
   }
 

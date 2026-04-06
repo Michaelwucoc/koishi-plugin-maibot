@@ -43,11 +43,17 @@ export interface MachineInfo {
 
 export interface Config {
   apiBaseURL: string
+  /** team：自建/团队内部网关；public：AWMC 公共网关（/v1 + Bearer，见 awmc-api.md） */
+  apiMode?: 'team' | 'public'
+  /** apiMode 为 public 时必填，登录 https://api.awmc.cc 获取 gw_ / JWT 令牌 */
+  publicGatewayToken?: string
   apiTimeout?: number
   apiRetryCount?: number
   apiRetryDelay?: number
-  machineInfo: MachineInfo
-  turnstileToken: string
+  /** team 模式必填；public 模式可省略（仅用占位，不参与网关请求） */
+  machineInfo?: MachineInfo
+  /** team 模式必填；public 模式可省略 */
+  turnstileToken?: string
   maintenanceNotice?: {
     enabled: boolean
     startHour: number
@@ -104,7 +110,20 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  apiBaseURL: Schema.string().default('http://localhost:5566').description('API服务地址'),
+  apiMode: Schema.union([
+    Schema.const('public').description('AWMC 公共网关（按量计费，见 awmc-api.md）'),
+    Schema.const('team').description('团队内部或自建 API 服务'),
+  ])
+    .default('team')
+    .description(
+      'API 来源：public=公共网关（须填 publicGatewayToken，apiBaseURL 一般为 https://api.awmc.cc）；team=内部服务（须填 machineInfo、turnstileToken）。',
+    ),
+  publicGatewayToken: Schema.string()
+    .required(false)
+    .description('公共网关令牌（Bearer / gw_…，勿泄露）。申请 https://api.awmc.cc · 购买额度 https://store.awmc.cc'),
+  apiBaseURL: Schema.string()
+    .default('http://localhost:5566')
+    .description('API 根地址。public 模式一般为 https://api.awmc.cc；team 模式为自建服务地址'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
   apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
   apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
@@ -114,8 +133,12 @@ export const Config: Schema<Config> = Schema.object({
     placeId: Schema.number().required().description('场所ID'),
     placeName: Schema.string().required().description('场所名称'),
     regionName: Schema.string().required().description('区域名称'),
-  }).required().description('机台信息（必填）'),
-  turnstileToken: Schema.string().required().description('Turnstile Token（必填）'),
+  })
+    .required(false)
+    .description('机台信息（仅 apiMode 为 team 时必填；public 可留空）'),
+  turnstileToken: Schema.string()
+    .required(false)
+    .description('Turnstile Token（仅 apiMode 为 team 时必填；public 可留空）'),
   maintenanceNotice: Schema.object({
     enabled: Schema.boolean().default(true).description('是否启用维护时间提示与拦截'),
     startHour: Schema.number().default(4).description('维护开始时间（小时，0-23）'),
@@ -221,7 +244,9 @@ export const Config: Schema<Config> = Schema.object({
     minDaysBetweenBindChange: 30,
     shopUrl: '',
   }),
-})
+}).description(
+  '【公共 API】申请 https://api.awmc.cc · 购买额度 https://store.awmc.cc · 接口与计费说明见 https://wiki.awmc.cc/dev/awmc-api （仓库内 awmc-api.md 为摘要，默认网关 https://api.awmc.cc）。',
+)
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
 // Fracture_Hikaritsu
@@ -1462,7 +1487,7 @@ async function getQrText(
     
     if (cacheAge < cacheValidDuration && binding.lastQrCode.startsWith('SGWCMAID')) {
       try {
-        const previewCached = await api.getPreview(config.machineInfo.clientId, binding.lastQrCode)
+        const previewCached = await api.getPreview(config.machineInfo?.clientId ?? '', binding.lastQrCode)
         const vr = verifyPreviewMatchesBinding(binding, previewCached)
         const hv = await applyVerifyPreviewBinding(ctx, binding, vr, logger)
         if (!hv.blocked) {
@@ -1578,7 +1603,7 @@ async function getQrText(
     
     // 验证qrCode是否有效
     try {
-      const preview = await api.getPreview(config.machineInfo.clientId, qrText)
+      const preview = await api.getPreview(config.machineInfo?.clientId ?? '', qrText)
       if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
         await session.send('❌ 无效或过期的二维码，请重新发送')
         return { qrText: '', error: '无效或过期的二维码' }
@@ -1624,6 +1649,23 @@ function qrOrLoginFailureHint(): string {
 }
 
 export function apply(ctx: Context, config: Config) {
+  const apiModeResolved = config.apiMode ?? 'team'
+  const isPublicApi = apiModeResolved === 'public'
+  if (isPublicApi) {
+    if (!config.publicGatewayToken?.trim()) {
+      throw new Error(
+        '[maibot] 公共 API（apiMode: public）须配置 publicGatewayToken。申请：https://api.awmc.cc · 购买额度：https://store.awmc.cc',
+      )
+    }
+  } else {
+    if (!config.machineInfo?.clientId?.trim()) {
+      throw new Error('[maibot] 团队内部 API（apiMode: team）须完整配置 machineInfo')
+    }
+    if (!config.turnstileToken?.trim()) {
+      throw new Error('[maibot] 团队内部 API 须配置 turnstileToken')
+    }
+  }
+
   // 扩展数据库
   extendDatabase(ctx)
 
@@ -1670,8 +1712,13 @@ export function apply(ctx: Context, config: Config) {
     timeout: config.apiTimeout,
     retryCount: config.apiRetryCount,
     retryDelay: config.apiRetryDelay,
+    apiStyle: isPublicApi ? 'public' : 'team',
+    bearerToken: isPublicApi ? config.publicGatewayToken?.trim() : undefined,
   })
   const logger = ctx.logger('maibot')
+  logger.info(
+    `API 模式: ${isPublicApi ? 'public（AWMC 网关）' : 'team（自建服务）'}，根地址: ${config.apiBaseURL}`,
+  )
 
   function rebindShopUrl(): string {
     const fromPolicy = config.rebindPolicy?.shopUrl?.trim()
@@ -2108,9 +2155,16 @@ export function apply(ctx: Context, config: Config) {
   // 插件启动后异步加载一次
   void loadAlertFeatureEnabled()
 
-  // 使用配置中的值
-  const machineInfo = config.machineInfo
-  const turnstileToken = config.turnstileToken
+  // 使用配置中的值（public 模式下 machineInfo 为占位，仅供类型兼容；网关请求不携带这些字段）
+  const machineInfo: MachineInfo =
+    config.machineInfo ?? {
+      clientId: '',
+      regionId: 0,
+      placeId: 0,
+      placeName: '',
+      regionName: '',
+    }
+  const turnstileToken = config.turnstileToken ?? ''
   const maintenanceNotice = config.maintenanceNotice
   const confirmTimeout = config.confirmTimeout ?? 10000
   const rebindTimeout = config.rebindTimeout ?? 60000  // 默认60秒
@@ -2549,7 +2603,7 @@ export function apply(ctx: Context, config: Config) {
       const userAuthority = (session.user as any)?.authority ?? 0
       const canProxy = userAuthority >= authLevelForProxy
 
-      let helpText = `📖 舞萌DX机器人指令帮助
+      let helpText = `📖 舞萌DX机器人指令帮助${isPublicApi ? '（公共 API 模式）' : ''}
 
 🔐 账号管理：
   /mai绑定 - 绑定舞萌DX账号（支持SGID文本或公众号提供的网页地址）
@@ -2597,42 +2651,42 @@ export function apply(ctx: Context, config: Config) {
       // 只有在使用 --advanced 参数时才显示高级功能（发票、收藏品、舞里程等）
       const showAdvanced = options?.advanced
       
-      if (showAdvanced) {
-        helpText += `
+      if (showAdvanced && !isPublicApi) {
+          helpText += `
 
 🎫 票券管理：
   /mai发票 [倍数] - 为账号发放功能票（2-6倍，默认2倍）
   /mai清票 - 清空账号的所有功能票`
 
-        if (canProxy) {
-          helpText += `
+          if (canProxy) {
+            helpText += `
   /mai发票 [倍数] [@用户] - 为他人发放功能票（需要auth等级${authLevelForProxy}以上）
   /mai清票 [@用户] - 清空他人的功能票（需要auth等级${authLevelForProxy}以上）`
-        }
+          }
 
-        helpText += `
+          helpText += `
 
 🎮 游戏功能：
   /mai舞里程 <里程数> - 为账号发放舞里程（必须是1000的倍数）`
 
-        if (canProxy) {
-          helpText += `
+          if (canProxy) {
+            helpText += `
   /mai舞里程 <里程数> [@用户] - 为他人发放舞里程（需要auth等级${authLevelForProxy}以上）`
-        }
+          }
 
-        helpText += `
+          helpText += `
 
 🎁 收藏品管理：
   /mai获取收藏品 [SGID或@用户] - 获取收藏品（可选首参传 SGID/链接 或代操 @用户；支持缓存，/mai发收藏品 为别名）
   /mai清收藏品 - 清空收藏品（交互式选择类别和ID）
   /mai修改版本号 [SGID或@用户] - 修改版本号（可选首参传 SGID/链接 或代操 @用户；支持缓存）`
 
-        if (canProxy) {
-          helpText += `
+          if (canProxy) {
+            helpText += `
   /mai获取收藏品 [@用户] - 为他人获取收藏品（需要auth等级${authLevelForProxy}以上）
   /mai清收藏品 [@用户] - 清空他人的收藏品（需要auth等级${authLevelForProxy}以上）
   /mai修改版本号 [@用户] - 为他人修改版本号（需要auth等级${authLevelForProxy}以上）`
-        }
+          }
       }
 
       helpText += `
@@ -2653,8 +2707,8 @@ export function apply(ctx: Context, config: Config) {
   /maialert set <用户ID> [on|off] - 设置他人的播报状态（需要auth等级${authLevelForProxy}以上）`
       }
 
-      // 隐藏锁定和保护模式功能（如果hideLockAndProtection为true）
-      if (!hideLockAndProtection) {
+      // 隐藏锁定和保护模式功能（如果hideLockAndProtection为true）；公共 API 下亦不展示（相关机台接口不可用）
+      if (!hideLockAndProtection && !isPublicApi) {
         helpText += `
 
 🔒 账号锁定：
@@ -2718,6 +2772,12 @@ export function apply(ctx: Context, config: Config) {
       helpText += `
   - 部分指令支持 -bypass 参数绕过确认
   - 使用 /mai状态 --expired 可查看过期票券`
+
+      if (isPublicApi) {
+        helpText += `
+
+ℹ️ 当前为公共 API 模式：详情调用请前往 https://wiki.awmc.cc/dev/awmc-api 。官方交流群1072033605。`
+      }
 
       return helpText
     })
@@ -2973,8 +3033,7 @@ export function apply(ctx: Context, config: Config) {
         // 在调用API前加入队列
         await waitForQueue(session)
 
-        // 使用新API获取用户信息（需要client_id）
-        const machineInfo = config.machineInfo
+        // 使用新API获取用户信息（team 模式需 client_id；public 网关仅 qr_text）
         let previewResult
         try {
           previewResult = await api.getPreview(machineInfo.clientId, qrCode)
@@ -3854,6 +3913,7 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
+  if (!isPublicApi) {
   /**
    * 发票（2-6倍票）
    * 用法: /mai发票 [倍数] [@用户id]，默认2
@@ -4014,6 +4074,8 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
+  }
+
   /**
    * 舞里程发放 / 签到
    * 用法: /mai舞里程 <里程数>
@@ -4162,7 +4224,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4375,7 +4437,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4753,6 +4815,7 @@ export function apply(ctx: Context, config: Config) {
 
   // 查询B50任务状态功能已暂时取消
 
+  if (!isPublicApi) {
   /**
    * 获取收藏品
    * 用法: /mai获取收藏品 或 /mai获取收藏品 <SGID或链接> 或 /mai发收藏品
@@ -4846,7 +4909,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
-            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -4880,7 +4943,6 @@ export function apply(ctx: Context, config: Config) {
         await session.send('请求已提交，请等待服务器响应。（通常约 2–3 分钟）')
 
         // 使用 API 获取收藏品（需要 qr_text）
-        const machineInfo = config.machineInfo
         let result
         let usedCache = qrTextResult.fromCache === true
         try {
@@ -5005,7 +5067,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult: { qrText: string; error?: string; fromCache?: boolean }
         if (qrCode) {
           try {
-            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -5037,7 +5099,7 @@ export function apply(ctx: Context, config: Config) {
         let currentRom = ''
         let currentData = ''
         try {
-          const preview = await api.getPreview(config.machineInfo.clientId, qrTextResult.qrText)
+          const preview = await api.getPreview(machineInfo.clientId, qrTextResult.qrText)
           if (preview.RomVersion) currentRom = preview.RomVersion
           if (preview.DataVersion) currentData = preview.DataVersion
         } catch {
@@ -5077,7 +5139,6 @@ export function apply(ctx: Context, config: Config) {
         await waitForQueue(session)
         await session.send('请求已提交，请等待服务器响应。（通常需要约 2–3 分钟）')
 
-        const machineInfo = config.machineInfo
         let result
         try {
           result = await api.editVer(
@@ -5113,6 +5174,8 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 修改版本号失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
+
+  }
 
   /**
    * 清收藏品
@@ -5433,7 +5496,7 @@ export function apply(ctx: Context, config: Config) {
         let qrTextResult
         if (qrCode) {
           try {
-            const preview = await api.getPreview(config.machineInfo.clientId, qrCode)
+            const preview = await api.getPreview(machineInfo.clientId, qrCode)
             if (preview.UserID === -1 || (typeof preview.UserID === 'string' && preview.UserID === '-1')) {
               return '❌ 无效或过期的二维码，请重新发送'
             }
@@ -5588,6 +5651,7 @@ export function apply(ctx: Context, config: Config) {
 
   // 查询落雪B50任务状态功能已暂时取消
 
+  if (!isPublicApi) {
   /**
    * 查询选项文件（OPT）
    * 用法: /mai查询opt <title_ver>
@@ -5652,6 +5716,8 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 查询失败: ${getSafeErrorMessage(error, session)}\n\n${maintenanceMessage}`
       }
     })
+
+  }
 
   // 提醒功能配置
   const alertMessages = config.alertMessages || {

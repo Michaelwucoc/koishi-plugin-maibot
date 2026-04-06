@@ -1,23 +1,27 @@
 # koishi-plugin-maibot
 
-# 大家好。
-舞萌DX游戏高级操作插件 for Koishi
+舞萌 DX 相关功能的 Koishi 插件（绑定、状态、B50 上传、票券查询等）。
+
+## 公共 API 与文档链接
+
+- **申请 API / 令牌**：[https://api.awmc.cc](https://api.awmc.cc)
+- **购买额度**：[https://store.awmc.cc](https://store.awmc.cc)
+- **开放接口与计费说明（在线）**：[https://wiki.awmc.cc/dev/awmc-api](https://wiki.awmc.cc/dev/awmc-api) · 仓库内 [`awmc-api.md`](./awmc-api.md) 为摘要（默认网关 `https://api.awmc.cc`）
+
+使用公共网关时，在插件配置中将 **apiMode** 设为 `public`，填写 **publicGatewayToken**，并将 **apiBaseURL** 设为 `https://api.awmc.cc`（或提供方给出的网关根地址）。无需配置 **machineInfo**、**turnstileToken**。若接口返回 **403**，多为账户 Token 余额不足，请到 [store.awmc.cc](https://store.awmc.cc) 充值后再试。
+
+更完整的安装步骤、进阶功能与排错说明请见 **项目 Wiki**（GitHub 仓库主页文档区）。
 
 ## 功能特性
 
 - ✅ 用户绑定（通过 SGWCMAID 二维码）
 - ✅ 用户解绑
-- ✅ 状态查询（实时获取账号信息，自动更新用户名和Rating）
-- ✅ 水鱼Token绑定/解绑
-- ✅ B50上传到水鱼（支持实时任务状态播报）
-- ✅ 落雪代码绑定/解绑
-- ✅ B50上传到落雪（支持实时任务状态播报）
-- ✅ B50任务状态查询（水鱼/落雪）
-- ✅ 收藏品管理（获取收藏品/清收藏品，支持交互式选择类别、ID 与数量）
-- ✅ 功能票管理（发票/清票）
-- ✅ 账号状态提醒（自动检测登录状态变化并群内通知）
-- ✅ 用户ID隐藏显示（防止盗号）
-- ✅ 完整的 API 调用封装
+- ✅ 状态查询（含票券查询等，取决于所选 API 模式）
+- ✅ 水鱼 Token 绑定/解绑与 B50 上传
+- ✅ 落雪代码绑定/解绑与 B50 上传
+- ✅ B50 任务状态轮询与提示
+- ✅ 按配置可选：发票、收藏品、改版本号等（仅 **团队内部 / 自建 API** 模式）
+- ✅ 账号状态提醒、用户 ID 掩码、操作日志等
 - ✅ 数据库存储（SQLite/MySQL/PostgreSQL）
 
 ## 安装
@@ -26,141 +30,78 @@
 npm install koishi-plugin-maibot
 ```
 
-## 配置
+## 配置概要
 
-在 `koishi.yml` 中配置：
+在 `koishi.yml` 中（字段以控制台表单为准）：
+
+**公共网关示例：**
 
 ```yaml
 plugins:
   maibot:
-    apiBaseURL: http://localhost:5566  # 你的API服务地址
-    apiTimeout: 30000  # 可选，默认30秒
-    machineInfo:  # 必填，机台信息
-      clientId: 你的客户端ID
-      regionId: 你的区域ID
-      placeId: 你的场所ID
-      placeName: 你的场所名称
-      regionName: 你的区域名称
-    turnstileToken: 你的Turnstile Token  # 必填
-    alertMessages:  # 可选，账号状态提醒消息配置
-      loginMessage: '{playerid}{at} 你的账号已上线。'  # 上线消息（支持占位符：{playerid} 玩家名，{at} @用户）
-      logoutMessage: '{playerid}{at} 你的账号已下线。'  # 下线消息
+    apiMode: public
+    apiBaseURL: https://api.awmc.cc
+    publicGatewayToken: <在 api.awmc.cc 获取的令牌>
 ```
 
-**注意**：`machineInfo` 和 `turnstileToken` 为必填配置，需要在配置文件中填写。
+**自建 / 团队内部服务示例：**
+
+```yaml
+plugins:
+  maibot:
+    apiMode: team
+    apiBaseURL: http://你的服务:端口
+    machineInfo:
+      clientId: ...
+      regionId: ...
+      placeId: ...
+      placeName: ...
+      regionName: ...
+    turnstileToken: ...
+```
+
+未显式填写 **apiMode** 时默认为 `team`，与旧版配置兼容；仅当你明确使用公共网关时才设为 `public`。
 
 ### 跨平台绑定（推荐）
 
-如需在多个平台（QQ/Discord/Telegram 等）共享同一份绑定数据，建议同时启用 Koishi 官方 `bind` 插件。  
-本插件会优先使用 bind 统一后的用户 ID 保存绑定信息，并兼容历史的平台原始 ID 数据。
+如需在多个平台（QQ/Discord/Telegram 等）共享同一份绑定数据，建议同时启用 Koishi 官方 `bind` 插件。本插件会优先使用 bind 统一后的用户 ID，并兼容历史的平台原始 ID。
 
 ### 群白名单跨平台配置
 
 `whitelist.targets` 支持 `platform:guildId` 格式（例如 `qq:1072033605`、`discord:1234567890`），也支持仅填写 `guildId`（兼容旧配置）。
 
-## 使用
+## 使用（节选）
 
 ### 绑定账号
+
 ```
 /mai绑定 SGWCMAIDxxxxxxxxxxxxx
 ```
 
-### 查询状态（自动更新用户名和Rating）
+### 查询状态
+
 ```
 /mai状态
 ```
 
-### 解绑账号
+### 帮助
+
 ```
-/mai解绑
+/mai
+/mai帮助
+/mai帮助 --advanced
 ```
 
-### 绑定水鱼Token
-```
-/mai绑定水鱼 <token>
-```
+公共 API 模式下，`--advanced` 会说明哪些功能仅在 `team` 模式下可用。
 
-### 解绑水鱼Token
-```
-/mai解绑水鱼
-```
+更多子命令见游戏内帮助或 Wiki。
 
-### 上传B50到水鱼
-```
-/mai上传B50
-```
+## API 说明
 
-### 查询B50任务状态（水鱼）
-```
-/mai查询B50
-```
+本插件通过 HTTP 调用后端网关：
 
-### 绑定落雪代码
-```
-/mai绑定落雪 <lxns_code>
-```
-
-### 解绑落雪代码
-```
-/mai解绑落雪
-```
-
-### 上传B50到落雪
-```
-/mai上传落雪b50          # 使用绑定的代码
-/mai上传落雪b50 <code>   # 使用临时代码
-```
-
-### 查询落雪B50任务状态
-```
-/mai查询落雪B50
-```
-
-### 获取收藏品
-```
-/mai获取收藏品
-```
-或使用别名 `/mai发收藏品`。交互式选择收藏品类别、ID 与数量（支持头像框、称号、头像、乐曲、解锁 Master 等类型）。
-
-### 清收藏品
-```
-/mai清收藏品
-```
-交互式选择收藏品类别和ID进行清空
-
-### 发票（2-6倍）
-```
-/mai发票 [倍数]          # 默认2倍
-```
-
-### 清票
-```
-/mai清票
-```
-
-### 账号状态提醒
-```
-/maialert [on|off]              # 开关自己的播报功能
-/maialert set <userId> [on|off] # 管理员设置他人的播报状态（需要auth等级3以上）
-```
-
-功能说明：
-- 默认关闭，需要用户主动开启
-- 每1分钟自动检查一次登录状态
-- 当账号从离线变为在线时，会在群内发送上线提醒
-- 当账号从在线变为离线时，会在群内发送下线提醒
-- 仅在状态变化时发送，避免刷屏
-- 支持自定义消息格式（在配置文件中设置）
-
-## API 要求
-
-本插件需要配合 [anti15-api](https://github.com/your-repo/anti15-api) 使用。
-
-API 服务需要提供以下接口：
-- `POST /api/qr2userid/<qr_text>` - 二维码转用户ID
-- `GET /api/preview?mai_uid=<encrypted_uid>` - 用户状态预览
-
-更多 API 文档请参考 API README。
+- **apiMode: public** 时，使用网关的 **`/v1/...`** 路径，请求头携带 `Authorization: Bearer <令牌>`，详见 [Wiki 文档](https://wiki.awmc.cc/dev/awmc-api) 或 [`awmc-api.md`](./awmc-api.md)。
+- **apiMode: team** 时，使用自建服务上既有路径（如 `/api/public/...` 等），与历史部署一致。
 
 ## 许可证
 
