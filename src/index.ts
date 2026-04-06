@@ -43,7 +43,7 @@ export interface MachineInfo {
 
 export interface Config {
   apiBaseURL: string
-  /** team：自建/团队内部网关；public：AWMC 公共网关（/v1 + Bearer，见 awmc-api.md） */
+  /** team：自建/团队内部网关；public：AWMC 公共网关（/v1 + Bearer，见 wiki） */
   apiMode?: 'team' | 'public'
   /** apiMode 为 public 时必填，登录 https://api.awmc.cc 获取 gw_ / JWT 令牌 */
   publicGatewayToken?: string
@@ -111,19 +111,19 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   apiMode: Schema.union([
-    Schema.const('public').description('AWMC 公共网关（按量计费，见 awmc-api.md）'),
+    Schema.const('public').description('AWMC 公共网关（按量计费，见API平台。）'),
     Schema.const('team').description('团队内部或自建 API 服务'),
   ])
     .default('team')
     .description(
-      'API 来源：public=公共网关（须填 publicGatewayToken，apiBaseURL 一般为 https://api.awmc.cc）；team=内部服务（须填 machineInfo、turnstileToken）。',
+      'API 来源：public=公共网关（须填 publicGatewayToken，apiBaseURL 一般为 https://api.awmc.cc ）；team=内部服务（须填 machineInfo、turnstileToken）。',
     ),
   publicGatewayToken: Schema.string()
     .required(false)
     .description('公共网关令牌（Bearer / gw_…，勿泄露）。申请 https://api.awmc.cc · 购买额度 https://store.awmc.cc'),
   apiBaseURL: Schema.string()
     .default('http://localhost:5566')
-    .description('API 根地址。public 模式一般为 https://api.awmc.cc；team 模式为自建服务地址'),
+    .description('API 根地址。public 模式一般为 https://api.awmc.cc ；team 模式为自建服务地址'),
   apiTimeout: Schema.number().default(30000).description('API请求超时时间（毫秒）'),
   apiRetryCount: Schema.number().default(5).description('API请求重试次数（仅在 ECONNRESET 或 504 时生效）'),
   apiRetryDelay: Schema.number().default(1000).description('API请求重试间隔（毫秒）'),
@@ -245,13 +245,15 @@ export const Config: Schema<Config> = Schema.object({
     shopUrl: '',
   }),
 }).description(
-  '【公共 API】申请 https://api.awmc.cc · 购买额度 https://store.awmc.cc · 接口与计费说明见 https://wiki.awmc.cc/dev/awmc-api （仓库内 awmc-api.md 为摘要，默认网关 https://api.awmc.cc）。',
+  '【公共 API】申请 https://api.awmc.cc',
 )
 
 // 我认识了很多朋友 以下是我认识的好朋友们！
-// Fracture_Hikaritsu
 // MisakaNo
 // Tome Chen
+// BGCat
+// and a lot...
+
 
 /**
  * 票券ID到中文名称的映射
