@@ -343,13 +343,13 @@ export class MaiBotAPI {
 
   /**
    * 获取功能票
-   * POST /api/private/get_ticket
-   * 需要: region_id, client_id, place_id, ticket_id, qr_text
+   * team: POST /api/private/get_ticket（Query: region_id, client_id, place_id, ticket_id, qr_text）
+   * public: POST /v1/get_ticket（Query: ticket_id, qr_text）
    */
   async getTicket(
-    regionId: number,
-    clientId: string,
-    placeId: number,
+    regionId: number | undefined,
+    clientId: string | undefined,
+    placeId: number | undefined,
     ticketId: number,
     qrText: string
   ): Promise<{
@@ -358,15 +358,18 @@ export class MaiBotAPI {
     LogoutStatus: boolean
     TicketStatus: boolean
   }> {
-    const response = await this.client.post('/api/private/get_ticket', null, {
-      params: {
-        region_id: regionId,
-        client_id: clientId,
-        place_id: placeId,
-        ticket_id: ticketId,
-        qr_text: qrText,
-      },
-    })
+    const path = this.apiStyle === 'public' ? '/v1/get_ticket' : '/api/private/get_ticket'
+    const params =
+      this.apiStyle === 'public'
+        ? { ticket_id: ticketId, qr_text: qrText }
+        : {
+            region_id: regionId,
+            client_id: clientId,
+            place_id: placeId,
+            ticket_id: ticketId,
+            qr_text: qrText,
+          }
+    const response = await this.client.post(path, null, { params })
     return response.data
   }
 

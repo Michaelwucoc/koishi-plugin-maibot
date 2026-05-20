@@ -4044,9 +4044,9 @@ export function apply(ctx: Context, config: Config) {
         let usedCache = qrTextResult.fromCache === true
         try {
           ticketResult = await api.getTicket(
-            machineInfo.regionId,
-            machineInfo.clientId,
-            machineInfo.placeId,
+            isPublicApi ? undefined : machineInfo.regionId,
+            isPublicApi ? undefined : machineInfo.clientId,
+            isPublicApi ? undefined : machineInfo.placeId,
             multiple,
             qrTextResult.qrText
           )
@@ -4061,9 +4061,9 @@ export function apply(ctx: Context, config: Config) {
             // 在调用API前加入队列
             await waitForQueue(session)
             ticketResult = await api.getTicket(
-              machineInfo.regionId,
-              machineInfo.clientId,
-              machineInfo.placeId,
+              isPublicApi ? undefined : machineInfo.regionId,
+              isPublicApi ? undefined : machineInfo.clientId,
+              isPublicApi ? undefined : machineInfo.placeId,
               multiple,
               retryQrText.qrText
             )
